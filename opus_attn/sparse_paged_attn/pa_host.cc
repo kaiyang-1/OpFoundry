@@ -414,8 +414,7 @@ int run_pa_case(int H, int N, int D, int total_pages, int total_tokens,
     kargs.stride_kv_page = D;
     kargs.softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-    const int num_h_tiles = ceil_div(H, PATraits::Q_TILE_SIZE);
-    const int num_h_blocks = ceil_div(num_h_tiles, PATraits::NUM_WARPS);
+    const int num_h_blocks = ceil_div(H, PATraits::Q_TILE_SIZE * PATraits::T_M);
     dim3 grid(N, num_h_blocks, 1);
     dim3 block(PATraits::BLOCK_SIZE);
 
@@ -522,10 +521,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (dtype == "bf16") {
-        return run_pa_case<pa_traits<16, 32, 512, 8, bf16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv, "bf16");
+        return run_pa_case<pa_traits<16, 64, 512, 4, bf16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv, "bf16");
     }
     if (dtype == "fp16") {
-        return run_pa_case<pa_traits<16, 32, 512, 8, fp16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv, "fp16");
+        return run_pa_case<pa_traits<16, 64, 512, 4, fp16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv, "fp16");
     }
 
     std::cerr << "-dtype must be bf16 or fp16, got " << dtype << "\n";

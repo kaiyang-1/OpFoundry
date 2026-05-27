@@ -46,8 +46,8 @@ struct pa_traits {
     using D_ACC  = float;
 
     // MFMA wave layout
-    static constexpr int T_M = NUM_WARPS; // waves along M
-    static constexpr int T_N = 1;         // waves along N
+    static constexpr int T_M = 1;         // waves along M
+    static constexpr int T_N = NUM_WARPS; // waves along N
     static constexpr int T_K = 1;         // waves along K
 
     // MFMA base tile
@@ -60,14 +60,14 @@ struct pa_traits {
     static constexpr int NUM_D_SLICES = D_TILE_SIZE / SLICE_D;
     static_assert(D_TILE_SIZE % SLICE_D == 0);
 
-    // GEMM0: S[Q_TILE x KV_TILE] = Q[Q_TILE x SLICE_D] @ K^T[SLICE_D x KV_TILE]
+    // GEMM0: S = Q @ K^T
     static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
-    static constexpr int GEMM0_E_N = KV_TILE_SIZE / W_N;
-    static constexpr int GEMM0_E_K = SLICE_D / W_K;
+    static constexpr int GEMM0_E_N = KV_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM0_E_K = D_TILE_SIZE / W_K;
 
-    // GEMM1: O[Q_TILE x SLICE_D] = P[Q_TILE x KV_TILE] @ V[KV_TILE x SLICE_D]
+    // GEMM1: O = P @ V
     static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
-    static constexpr int GEMM1_E_N = SLICE_D / W_N;
+    static constexpr int GEMM1_E_N = D_TILE_SIZE / (W_N * T_N);
     static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
 
     // Vector lengths for global load/store

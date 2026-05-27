@@ -6,8 +6,8 @@
 
 #ifndef __HIP_DEVICE_COMPILE__
 template<typename Traits> __global__ void pa_prefill_kernel(pa_kargs kargs) {}
-template __global__ void pa_prefill_kernel<pa_traits<16, 32, 512, 8, fp16_t>>(pa_kargs);
+template __global__ void pa_prefill_kernel<pa_traits<16, 64, 512, 4, fp16_t>>(pa_kargs);
 #else
 #include "pa_prefill_kernel_template.hpp"
-template __global__ void pa_prefill_kernel<pa_traits<16, 32, 512, 8, fp16_t>>(pa_kargs);
+template __global__ void pa_prefill_kernel<pa_traits<16, 64, 512, 4, fp16_t>>(pa_kargs);
 #endif
