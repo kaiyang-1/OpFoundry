@@ -380,8 +380,8 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_kargs kargs,
         l_row += attn_row_sum<T>(v_s, s_l, warp_id, lane_id);
         scale_output_tile<T>(v_o, rescale_m);
 
-        v_p_warps[warp_id] = cast<D_ATTN>(v_s);
-        store<s_len>(s_p, v_p_warps[warp_id], warp_id * T::W_M * T::W_N + lane_id * s_len);
+        auto v_p_seg = cast<D_ATTN>(v_s);
+        store<s_len>(s_p, v_p_seg, warp_id * T::W_M * T::W_N + lane_id * s_len);
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
         static_for<T::NUM_WARPS>([&](auto i) {
@@ -410,7 +410,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_kernel(pa_ka
     const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE;
     const int qo_gmem_offset = q_token_idx * kargs.stride_qo_n + h_block_start * kargs.stride_qo_h;
 
-    __shared__ char smem_kv[2 * T::smem_kv_tile_elems * sizeof(D_ATTN)]; // double-buffered shared memory for KV tiles
+    __shared__ char smem_kv[T::smem_kv_tile_elems * sizeof(D_ATTN)]; // for KV tiles
     __shared__ char smem_ml[2 * T::T_N * T::W_M * sizeof(D_ACC)];  // for inter-warp reduction
     __shared__ char smem_p[T::T_N * T::W_M * T::W_N * sizeof(D_ATTN)]; // for combining P across warps before PV compute
 
