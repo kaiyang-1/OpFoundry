@@ -73,6 +73,7 @@ struct pa_traits {
     // Vector lengths for global load/store
     static constexpr int VEC_Q    = 8;
     static constexpr int VEC_KV   = 8;
+    static constexpr int VEC_P    = 4;
     static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O    = 4;
 
@@ -89,10 +90,6 @@ struct pa_traits {
     static constexpr int kv_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
     static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
-
-    static constexpr size_t smem_size_bytes() {
-        return 4 * smem_kv_tile_elems * sizeof(D_ATTN);
-    }
 };
 
 __host__ __device__ inline int ceil_div(int a, int b) {

@@ -165,8 +165,12 @@ void benchmark_pa_kernel(const pa_kargs& kargs, dim3 grid, dim3 block,
     const double flops = (4.0 * kargs.H * indices_prefix_sum * kargs.D);
     const double tflops = flops / (avg_time * 1e-3) / 1e12;
 
-    printf("PA Prefill Kernel Performance: avg_time=%.3f ms, %.2f TFlops\n",
-           avg_time, tflops);
+    const size_t qo_bytes = 2ull * kargs.N * kargs.H * kargs.D * sizeof(typename Traits::D_ATTN);
+    const size_t kv_bytes = (size_t)indices_prefix_sum * kargs.D * sizeof(typename Traits::D_ATTN);
+    const double tbps = double(qo_bytes + kv_bytes) / (avg_time * 1e-3) / 1e12;
+
+    printf("PA Prefill Kernel Performance: avg_time=%.3f ms, %.2f TFlops, %.2f TB/s\n",
+           avg_time, tflops, tbps);
 }
 
 // Validate PA GPU results against CPU reference
@@ -184,7 +188,7 @@ bool validate_pa_results(const DType* ref, const DType* gpu,
                 const float ref_val = static_cast<float>(ref[offset + d]);
                 const float gpu_val = static_cast<float>(gpu[offset + d]);
                 const float diff = std::abs(gpu_val - ref_val);
-                if (diff > threshold) {
+                if (std::isnan(gpu_val) || std::isinf(gpu_val) || diff > threshold) {
                     total_errors++;
                     all_valid = false;
                     printf("  mismatch [n=%d,h=%d,d=%d] ref=%.6f gpu=%.6f diff=%.6f\n",
@@ -418,8 +422,8 @@ int run_pa_case(int H, int N, int D, int total_pages, int total_tokens,
     dim3 grid(N, num_h_blocks, 1);
     dim3 block(PATraits::BLOCK_SIZE);
 
-    printf("PA kernel launch config: grid=(%d,%d,%d), block=%d (NUM_WARPS=%d), smem=%zu bytes (K/V tiles)\n",
-           grid.x, grid.y, grid.z, (int)block.x, PATraits::NUM_WARPS, PATraits::smem_size_bytes());
+    printf("PA kernel launch config: grid=(%d,%d,%d), block=%d (NUM_WARPS=%d)\n",
+           grid.x, grid.y, grid.z, (int)block.x, PATraits::NUM_WARPS);
 
     pa_launch<PATraits>(kargs, grid, block);
     CHECK_HIP_KERNEL_LAUNCH();
