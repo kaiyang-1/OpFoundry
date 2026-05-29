@@ -11,19 +11,26 @@
 #include <cstdlib>
 #include <cmath>
 #include <cassert>
-#include <string>
 #include <omp.h>
 
 #include "pa_defs.h"
 
-// Declared in per-dtype kernel instantiation TUs.
+// Declared in per-variant/per-dtype kernel instantiation TUs.
 template<class Traits>
-__global__ void pa_prefill_kernel(pa_kargs kargs);
+__global__ void pa_prefill_16mx1_16nx4_kernel(pa_kargs kargs);
+template<class Traits>
+__global__ void pa_prefill_16mx8_32nx1_kernel(pa_kargs kargs);
 
-// Common launch wrapper
-template<class Traits>
-inline void pa_launch(const pa_kargs& kargs, dim3 grid, dim3 block) {
-    pa_prefill_kernel<Traits><<<grid, block>>>(kargs);
+// Launch wrappers — overloaded on the trait type so each selects its own kernel.
+template<int Q, int KV, int D, int NW, class DT>
+inline void pa_launch(pa_16mx1_16nx4_traits<Q, KV, D, NW, DT>,
+                      const pa_kargs& kargs, dim3 grid, dim3 block) {
+    pa_prefill_16mx1_16nx4_kernel<pa_16mx1_16nx4_traits<Q, KV, D, NW, DT>><<<grid, block>>>(kargs);
+}
+template<int Q, int KV, int D, int NW, class DT>
+inline void pa_launch(pa_16mx8_32nx1_traits<Q, KV, D, NW, DT>,
+                      const pa_kargs& kargs, dim3 grid, dim3 block) {
+    pa_prefill_16mx8_32nx1_kernel<pa_16mx8_32nx1_traits<Q, KV, D, NW, DT>><<<grid, block>>>(kargs);
 }
 
 #define CHECK_HIP(call)                                                                                   \
@@ -137,7 +144,7 @@ template<class Traits>
 void benchmark_pa_kernel(const pa_kargs& kargs, dim3 grid, dim3 block,
                           int indices_prefix_sum, int warmup = 100, int iterations = 50) {
     for (int i = 0; i < warmup; ++i) {
-        pa_launch<Traits>(kargs, grid, block);
+        pa_launch(Traits{}, kargs, grid, block);
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipDeviceSynchronize());
@@ -148,7 +155,7 @@ void benchmark_pa_kernel(const pa_kargs& kargs, dim3 grid, dim3 block,
 
     CHECK_HIP(hipEventRecord(start));
     for (int i = 0; i < iterations; ++i) {
-        pa_launch<Traits>(kargs, grid, block);
+        pa_launch(Traits{}, kargs, grid, block);
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipEventRecord(stop));
@@ -165,8 +172,12 @@ void benchmark_pa_kernel(const pa_kargs& kargs, dim3 grid, dim3 block,
     const double flops = (4.0 * kargs.H * indices_prefix_sum * kargs.D);
     const double tflops = flops / (avg_time * 1e-3) / 1e12;
 
-    printf("PA Prefill Kernel Performance: avg_time=%.3f ms, %.2f TFlops\n",
-           avg_time, tflops);
+    const size_t qo_bytes = 2ull * kargs.N * kargs.H * kargs.D * sizeof(typename Traits::D_ATTN);
+    const size_t kv_bytes = (size_t)indices_prefix_sum * kargs.D * sizeof(typename Traits::D_ATTN);
+    const double tbps = double(qo_bytes + kv_bytes) / (avg_time * 1e-3) / 1e12;
+
+    printf("PA Prefill Kernel Performance: avg_time=%.3f ms, %.2f TFlops, %.2f TB/s\n",
+           avg_time, tflops, tbps);
 }
 
 // Validate PA GPU results against CPU reference
@@ -184,7 +195,7 @@ bool validate_pa_results(const DType* ref, const DType* gpu,
                 const float ref_val = static_cast<float>(ref[offset + d]);
                 const float gpu_val = static_cast<float>(gpu[offset + d]);
                 const float diff = std::abs(gpu_val - ref_val);
-                if (diff > threshold) {
+                if (std::isnan(gpu_val) || std::isinf(gpu_val) || diff > threshold) {
                     total_errors++;
                     all_valid = false;
                     printf("  mismatch [n=%d,h=%d,d=%d] ref=%.6f gpu=%.6f diff=%.6f\n",
@@ -312,7 +323,7 @@ void pa_attention_ref(
 
 template<class PATraits>
 int run_pa_case(int H, int N, int D, int total_pages, int total_tokens,
-                bool verify, bool dense_kv, const char* dtype_name) {
+                bool verify, bool dense_kv) {
     using DType = typename PATraits::D_ATTN;
 
     if (D != PATraits::D_TILE_SIZE) {
@@ -320,8 +331,8 @@ int run_pa_case(int H, int N, int D, int total_pages, int total_tokens,
         return 1;
     }
 
-    printf("PA Prefill Attention: dtype=%s, H_Q=%d, N=%d, D=%d, total_pages=%d, total_tokens=%d\n",
-           dtype_name, H, N, D, total_pages, total_tokens);
+    printf("PA Prefill Attention: H_Q=%d, N=%d, D=%d, total_pages=%d, total_tokens=%d\n",
+           H, N, D, total_pages, total_tokens);
 
     // Allocate host memory
     const size_t q_size = (size_t)N * H * D;
@@ -414,15 +425,14 @@ int run_pa_case(int H, int N, int D, int total_pages, int total_tokens,
     kargs.stride_kv_page = D;
     kargs.softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-    const int num_h_tiles = ceil_div(H, PATraits::Q_TILE_SIZE);
-    const int num_h_blocks = ceil_div(num_h_tiles, PATraits::NUM_WARPS);
+    const int num_h_blocks = ceil_div(H, PATraits::Q_TILE_SIZE * PATraits::T_M);
     dim3 grid(N, num_h_blocks, 1);
     dim3 block(PATraits::BLOCK_SIZE);
 
     printf("PA kernel launch config: grid=(%d,%d,%d), block=%d (NUM_WARPS=%d), smem=%zu bytes (K/V tiles)\n",
            grid.x, grid.y, grid.z, (int)block.x, PATraits::NUM_WARPS, PATraits::smem_size_bytes());
 
-    pa_launch<PATraits>(kargs, grid, block);
+    pa_launch(PATraits{}, kargs, grid, block);
     CHECK_HIP_KERNEL_LAUNCH();
 
     int rc = 0;
@@ -465,7 +475,6 @@ int main(int argc, char** argv) {
     int D = 512;   // head dimension
     int total_pages = -1; // rows in unified_kv; default N after parsing
     int total_tokens = -1; // rows in the per-fwd extend KV tensor; default N
-    std::string dtype = "bf16";
 
     // Parse command line arguments. Supports: -n 16384 and -n=16384.
     bool verify = false;
@@ -491,20 +500,11 @@ int main(int argc, char** argv) {
             }
             return false;
         };
-        auto try_parse_string = [&](std::string& target, const char* flag) {
-            if ((val = parse_val(arg, flag))) {
-                if (val == reinterpret_cast<const char*>(1)) { if (i + 1 < argc) target = argv[++i]; }
-                else target = val;
-                return true;
-            }
-            return false;
-        };
         if (try_parse(H, "-h_q")) continue;
         if (try_parse(N, "-n")) continue;
         if (try_parse(D, "-d")) continue;
         if (try_parse(total_pages, "-total_pages")) continue;
         if (try_parse(total_tokens, "-total_tokens")) continue;
-        if (try_parse_string(dtype, "-dtype")) continue;
     }
     if (total_pages < 0) {
         total_pages = N;
@@ -521,13 +521,9 @@ int main(int argc, char** argv) {
         std::cerr << "-d must be 512, got " << D << "\n";
         return 1;
     }
-    if (dtype == "bf16") {
-        return run_pa_case<pa_traits<16, 32, 512, 8, bf16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv, "bf16");
-    }
-    if (dtype == "fp16") {
-        return run_pa_case<pa_traits<16, 32, 512, 8, fp16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv, "fp16");
-    }
-
-    std::cerr << "-dtype must be bf16 or fp16, got " << dtype << "\n";
-    return 1;
+    // Dispatch by query-head count: h_q <= 32 favors the 16mx1_16nx4 layout,
+    // otherwise the 16mx8_32nx1 layout. Both are correct for any H > 0.
+    return H <= 32
+        ? run_pa_case<pa_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv)
+        : run_pa_case<pa_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv);
 }

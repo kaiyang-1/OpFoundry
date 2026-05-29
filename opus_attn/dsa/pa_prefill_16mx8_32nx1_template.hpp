@@ -9,6 +9,8 @@
 
 using opus::operator""_I;
 
+namespace pa_16mx8_32nx1 {
+
 constexpr int MFMA_MASK    = 0x08;
 constexpr int VALU_MASK    = 0x02;
 constexpr int SALU_MASK    = 0x04;
@@ -1020,10 +1022,13 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
     }
 }
 
+} // namespace pa_16mx8_32nx1
+
 // ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_kernel(pa_kargs kargs) {
     using namespace opus;
+    using namespace pa_16mx8_32nx1;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
