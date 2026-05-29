@@ -259,18 +259,6 @@ __device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
     opus::static_for<o_len>([&](auto i) { v_o[i.value] *= scale;});
 }
 
-template<typename V>
-__device__ inline void pin_output_tile(V& v_o) {
-    using chunk_t = opus::vector_t<float, 8>;
-    constexpr int num_chunks = opus::vector_traits<V>::size() / opus::vector_traits<chunk_t>::size();
-    static_assert(opus::vector_traits<V>::size() % opus::vector_traits<chunk_t>::size() == 0);
-    auto* chunks = reinterpret_cast<chunk_t*>(&v_o);
-    #pragma unroll
-    for (int i = 0; i < num_chunks; i++) {
-        asm volatile("" : "+v"(chunks[i]) ::);
-    }
-}
-
 template<typename T, typename V>
 __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_tile_idx, typename T::D_ACC neg_inf, int warp_id, int lane_id) {
     constexpr int elems_per_wave_tile = (T::W_M * T::W_N) / T::WARP_SIZE;
@@ -390,6 +378,7 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_kargs kargs,
 
         v_v = tr_load<T::VEC_TR_V>(s_kv, u_rv);
         s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
         v_o = mma1(v_p, v_v, v_o);
     }
 }
