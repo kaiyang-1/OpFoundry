@@ -380,8 +380,9 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_kargs kargs,
 
         v_v = tr_load<T::VEC_TR_V>(s_kv, u_rv);
         s_waitcnt_lgkmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
         v_o = mma1(v_p, v_v, v_o);
+        __builtin_amdgcn_s_barrier();
     }
 }
 
@@ -389,7 +390,7 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_kargs kargs,
 
 // ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx1_16nx4_kernel(pa_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_kernel(pa_kargs kargs) {
     using namespace opus;
     using namespace pa_16mx1_16nx4;
     using T = opus::remove_cvref_t<Traits>;
