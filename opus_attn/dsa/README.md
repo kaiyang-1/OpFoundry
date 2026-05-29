@@ -90,8 +90,8 @@ wave layouts. The host picks one at runtime by query-head count: `H_Q <= 32` fav
 
 | Variant | Trait | `T_M` × `T_N` | `KV_TILE` | `NUM_WARPS` | `BLOCK_SIZE` | Used when |
 | --- | --- | --- | --- | --- | --- | --- |
-| `16mx1_16nx4` | `pa_traits_16mx1_16nx4<16, 64, 512, 4, bf16_t>` | `1 × NUM_WARPS` | `64` | `4` | `256` | `H_Q <= 32` |
-| `16mx8_32nx1` | `pa_traits_16mx8_32nx1<16, 32, 512, 8, bf16_t>` | `NUM_WARPS × 1` | `32` | `8` | `512` | `H_Q > 32` |
+| `16mx1_16nx4` | `pa_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t>` | `1 × NUM_WARPS` | `64` | `4` | `256` | `H_Q <= 32` |
+| `16mx8_32nx1` | `pa_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t>` | `NUM_WARPS × 1` | `32` | `8` | `512` | `H_Q > 32` |
 
 Common trait parameters for both: `Q_TILE_SIZE = 16` (query-head tile per wave),
 `D_TILE_SIZE = 512` (head dimension), `WARP_SIZE = 64`.

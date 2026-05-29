@@ -33,7 +33,7 @@ template<int Q_TILE_SIZE_ = 16,
          int D_TILE_SIZE_ = 512,
          int NUM_WARPS_ = 4,
          typename D_ATTN_ = bf16_t>
-struct pa_traits_16mx1_16nx4 {
+struct pa_16mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
@@ -107,7 +107,7 @@ template<int Q_TILE_SIZE_ = 16,
          int D_TILE_SIZE_ = 512,
          int NUM_WARPS_ = 8,
          typename D_ATTN_ = bf16_t>
-struct pa_traits_16mx8_32nx1 {
+struct pa_16mx8_32nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;

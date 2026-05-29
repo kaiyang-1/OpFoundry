@@ -23,14 +23,14 @@ __global__ void pa_prefill_16mx8_32nx1_kernel(pa_kargs kargs);
 
 // Launch wrappers — overloaded on the trait type so each selects its own kernel.
 template<int Q, int KV, int D, int NW, class DT>
-inline void pa_launch(pa_traits_16mx1_16nx4<Q, KV, D, NW, DT>,
+inline void pa_launch(pa_16mx1_16nx4_traits<Q, KV, D, NW, DT>,
                       const pa_kargs& kargs, dim3 grid, dim3 block) {
-    pa_prefill_16mx1_16nx4_kernel<pa_traits_16mx1_16nx4<Q, KV, D, NW, DT>><<<grid, block>>>(kargs);
+    pa_prefill_16mx1_16nx4_kernel<pa_16mx1_16nx4_traits<Q, KV, D, NW, DT>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int D, int NW, class DT>
-inline void pa_launch(pa_traits_16mx8_32nx1<Q, KV, D, NW, DT>,
+inline void pa_launch(pa_16mx8_32nx1_traits<Q, KV, D, NW, DT>,
                       const pa_kargs& kargs, dim3 grid, dim3 block) {
-    pa_prefill_16mx8_32nx1_kernel<pa_traits_16mx8_32nx1<Q, KV, D, NW, DT>><<<grid, block>>>(kargs);
+    pa_prefill_16mx8_32nx1_kernel<pa_16mx8_32nx1_traits<Q, KV, D, NW, DT>><<<grid, block>>>(kargs);
 }
 
 #define CHECK_HIP(call)                                                                                   \
@@ -524,6 +524,6 @@ int main(int argc, char** argv) {
     // Dispatch by query-head count: h_q <= 32 favors the 16mx1_16nx4 layout,
     // otherwise the 16mx8_32nx1 layout. Both are correct for any H > 0.
     return H <= 32
-        ? run_pa_case<pa_traits_16mx1_16nx4<16, 64, 512, 4, bf16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv)
-        : run_pa_case<pa_traits_16mx8_32nx1<16, 32, 512, 8, bf16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv);
+        ? run_pa_case<pa_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv)
+        : run_pa_case<pa_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv);
 }
