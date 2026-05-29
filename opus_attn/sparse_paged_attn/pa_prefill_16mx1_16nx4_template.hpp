@@ -9,6 +9,8 @@
 
 using opus::operator""_I;
 
+namespace pa_16mx1_16nx4 {
+
 // Create layout for loading Q matrix from global memory
 template<class T>
 __device__ inline auto make_layout_q(int lane_id, int stride_q_h) {
@@ -383,10 +385,13 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_kargs kargs,
     }
 }
 
+} // namespace pa_16mx1_16nx4
+
 // ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_kernel(pa_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx1_16nx4_kernel(pa_kargs kargs) {
     using namespace opus;
+    using namespace pa_16mx1_16nx4;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
