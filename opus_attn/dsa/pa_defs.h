@@ -3,6 +3,9 @@
 
 using bf16_t = __bf16;
 using fp16_t = __fp16;
+// 8-bit float storage types, aliased to match opus's dtype registration.
+using fp8_t  = _BitInt(8);
+using bf8_t  = unsigned _BitInt(8);
 
 // Kernel arguments for PA prefill attention
 struct pa_kargs {
@@ -55,11 +58,6 @@ struct pa_16mx1_16nx4_traits {
     static constexpr int W_M = 16;
     static constexpr int W_N = 16;
     static constexpr int W_K = 32;
-
-    // D slicing: D=512 iterates D in SLICE_D=32 chunks
-    static constexpr int SLICE_D = 32;
-    static constexpr int NUM_D_SLICES = D_TILE_SIZE / SLICE_D;
-    static_assert(D_TILE_SIZE % SLICE_D == 0);
 
     // GEMM0: S = Q @ K^T
     static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
@@ -167,6 +165,79 @@ struct pa_16mx8_32nx1_traits {
 
     static constexpr size_t smem_size_bytes() {
         return 4 * smem_kv_tile_elems * sizeof(D_ATTN);
+    }
+};
+
+// Configuration traits for the FP8 16mx1_16nx4 PA kernel variant.
+template<int Q_TILE_SIZE_ = 16,
+         int KV_TILE_SIZE_ = 64,
+         int D_TILE_SIZE_ = 640,
+         int NUM_WARPS_ = 4,
+         typename D_NOPE_ = fp8_t,
+         typename D_ROPE_ = bf16_t>
+struct pa_16mx1_16nx4_fp8_traits {
+    static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
+    static constexpr int NUM_WARPS = NUM_WARPS_;
+
+    static constexpr int WARP_SIZE = 64; // AMD wavefront size
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+
+    // Packed DSA hdim split
+    static constexpr int D_NOPE_SIZE = 448;  // NoPE fp8 elements
+    static constexpr int D_ROPE_SIZE = 64;   // RoPE bf16 elements
+
+    // Data types: NoPE fp8 + RoPE bf16; accumulation fp32.
+    using D_NOPE = D_NOPE_;
+    using D_ROPE = D_ROPE_;
+    using D_ATTN = D_NOPE_;
+    using D_ACC  = float;
+
+    // MFMA wave layout (identical to the bf16 16mx1_16nx4 variant)
+    static constexpr int T_M = 1;         // waves along M
+    static constexpr int T_N = NUM_WARPS; // waves along N
+    static constexpr int T_K = 1;         // waves along K
+
+    // MFMA base tile: 16x16x128 fp8 (scaled f8f6f4 on gfx950)
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 128;
+
+    // GEMM0: S = Q @ K^T
+    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM0_E_N = KV_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM0_E_K = D_TILE_SIZE / W_K;
+
+    // GEMM1: O = P @ V
+    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM1_E_N = D_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
+
+    // Vector lengths for global load/store
+    static constexpr int VEC_Q    = 16;
+    static constexpr int VEC_KV   = 16;
+    static constexpr int VEC_P    = 4;
+    static constexpr int VEC_TR_V = 4;
+    static constexpr int VEC_O    = 4;
+
+    // Minimal compact pixels for async copy for one wave (RESERVED)
+    static constexpr int D_128B_SIZE = 128 / sizeof(D_ATTN);
+    static_assert(VEC_KV == 16 / sizeof(D_ATTN));
+    static constexpr int smem_linear_wave = WARP_SIZE * 16 / sizeof(D_ATTN);
+    static constexpr int smem_n_per_wave = smem_linear_wave / D_128B_SIZE;
+    static constexpr int smem_n_rpt = KV_TILE_SIZE / smem_n_per_wave;
+    static constexpr int smem_d_rpt = D_TILE_SIZE / D_128B_SIZE;
+    static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
+    static constexpr int smem_kv_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
+
+    static constexpr int kv_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
+
+    // Shared memory: kernel uses three static buffers (KV tile, m/l, P). RESERVED sizing.
+    static constexpr size_t smem_size_bytes() {
+        return smem_kv_tile_elems * sizeof(D_ATTN)
+             + 2 * T_N * W_M * sizeof(D_ACC)
+             + T_N * W_M * W_N * sizeof(D_ATTN);
     }
 };
 

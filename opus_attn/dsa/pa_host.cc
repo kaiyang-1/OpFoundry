@@ -1,4 +1,5 @@
 // Host-only: benchmark harness, CPU reference, main()
+#include <hip/hip_fp8.h>
 #include <opus/hip_minimal.hpp>
 #include <algorithm>
 #include <random>
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cassert>
+#include <type_traits>
 #include <omp.h>
 
 #include "pa_defs.h"
@@ -20,6 +22,8 @@ template<class Traits>
 __global__ void pa_prefill_16mx1_16nx4_kernel(pa_kargs kargs);
 template<class Traits>
 __global__ void pa_prefill_16mx8_32nx1_kernel(pa_kargs kargs);
+template<class Traits>
+__global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_kargs kargs);
 
 // Launch wrappers — overloaded on the trait type so each selects its own kernel.
 template<int Q, int KV, int D, int NW, class DT>
@@ -31,6 +35,11 @@ template<int Q, int KV, int D, int NW, class DT>
 inline void pa_launch(pa_16mx8_32nx1_traits<Q, KV, D, NW, DT>,
                       const pa_kargs& kargs, dim3 grid, dim3 block) {
     pa_prefill_16mx8_32nx1_kernel<pa_16mx8_32nx1_traits<Q, KV, D, NW, DT>><<<grid, block>>>(kargs);
+}
+template<int Q, int KV, int D, int NW, class NOPE, class ROPE>
+inline void pa_launch(pa_16mx1_16nx4_fp8_traits<Q, KV, D, NW, NOPE, ROPE>,
+                      const pa_kargs& kargs, dim3 grid, dim3 block) {
+    pa_prefill_16mx1_16nx4_fp8_kernel<pa_16mx1_16nx4_fp8_traits<Q, KV, D, NW, NOPE, ROPE>><<<grid, block>>>(kargs);
 }
 
 #define CHECK_HIP(call)                                                                                   \
@@ -55,6 +64,41 @@ void rand_vector(T* ptr, size_t size, float min_val = 0.0f, float max_val = 1.0f
         #pragma omp for
         for (size_t i = 0; i < size; i++) {
             ptr[i] = static_cast<T>(dis(gen));
+        }
+    }
+}
+
+// Initialize a packed DeepSeek sparse-attention (DSA) fp8 tensor. Each row spans
+// PATraits::D_TILE_SIZE bytes laid out as:
+//   [ NoPE fp8 (D_NOPE_SIZE) | fp8 block scales (D_NOPE_SIZE/32) | fp8 zero-pad | RoPE bf16 (D_ROPE_SIZE) ]
+// NoPE/RoPE filled with random values (via HIP fp8 / bf16 casts), scales set to 1.0.
+template<class PATraits>
+void init_fp8_dsa_tensor(typename PATraits::D_ATTN* ptr, size_t rows) {
+    using D_ROPE = typename PATraits::D_ROPE;
+    constexpr int ROW        = PATraits::D_TILE_SIZE;            // total bytes/row (e.g. 640)
+    constexpr int NOPE       = PATraits::D_NOPE_SIZE;            // NoPE fp8 elements (448)
+    constexpr int SCALE      = NOPE / 32;                        // fp8 scales, one per 32-elem block (14)
+    constexpr int ROPE       = PATraits::D_ROPE_SIZE;            // RoPE bf16 elements (64)
+    constexpr int ROPE_BYTES = ROPE * (int)sizeof(D_ROPE);      // 128
+    constexpr int ZERO       = ROW - NOPE - SCALE - ROPE_BYTES; // fp8 zero pad (50)
+    constexpr int ROPE_OFF   = NOPE + SCALE + ZERO;             // byte offset of RoPE (512)
+    static_assert(ZERO >= 0, "DSA row layout does not fit in D_TILE_SIZE bytes");
+
+    #pragma omp parallel
+    {
+        std::random_device rd;
+        std::mt19937 gen(rd() + omp_get_thread_num());
+        std::uniform_real_distribution<float> dis(-2.0f, 2.0f);
+        #pragma omp for
+        for (size_t r = 0; r < rows; r++) {
+            unsigned char* base = reinterpret_cast<unsigned char*>(ptr) + r * ROW;
+            auto* nope = reinterpret_cast<__hip_fp8_e4m3*>(base);
+            for (int i = 0; i < NOPE; i++) nope[i] = static_cast<__hip_fp8_e4m3>(dis(gen));
+            auto* scale = reinterpret_cast<__hip_fp8_e4m3*>(base + NOPE);
+            for (int i = 0; i < SCALE; i++) scale[i] = static_cast<__hip_fp8_e4m3>(1.0f);
+            for (int i = 0; i < ZERO; i++) base[NOPE + SCALE + i] = 0;
+            auto* rope = reinterpret_cast<D_ROPE*>(base + ROPE_OFF);
+            for (int i = 0; i < ROPE; i++) rope[i] = static_cast<D_ROPE>(dis(gen));
         }
     }
 }
@@ -322,14 +366,13 @@ void pa_attention_ref(
 // ─── main ───────────────────────────────────────────────────────────────────
 
 template<class PATraits>
-int run_pa_case(int H, int N, int D, int total_pages, int total_tokens,
+int run_pa_case(int H, int N, int total_pages, int total_tokens,
                 bool verify, bool dense_kv) {
     using DType = typename PATraits::D_ATTN;
+    constexpr bool is_fp8 = std::is_same_v<DType, fp8_t> || std::is_same_v<DType, bf8_t>;
 
-    if (D != PATraits::D_TILE_SIZE) {
-        std::cerr << "This kernel only supports head dimension D=" << PATraits::D_TILE_SIZE << ", got D=" << D << "\n";
-        return 1;
-    }
+    // Per-row size in D_ATTN units.
+    constexpr int D = PATraits::D_TILE_SIZE;
 
     printf("PA Prefill Attention: H_Q=%d, N=%d, D=%d, total_pages=%d, total_tokens=%d\n",
            H, N, D, total_pages, total_tokens);
@@ -350,10 +393,18 @@ int run_pa_case(int H, int N, int D, int total_pages, int total_tokens,
     std::vector<int> host_kv_indices_extend;
 
     // Initialize with random data
-    rand_vector(host_q.get(), q_size, -2.f, 2.f);
-    rand_vector(host_unified_kv.get(), unified_kv_size, -2.f, 2.f);
-    rand_vector(host_kv.get(), kv_size, -2.f, 2.f);
-    rand_vector(host_attn_sink.get(), H, -2.f, 2.f);
+    if constexpr (is_fp8) {
+        // Fill the packed DSA rows (NoPE fp8 + scales + zero-pad + RoPE bf16).
+        init_fp8_dsa_tensor<PATraits>(host_q.get(), (size_t)N * H);
+        init_fp8_dsa_tensor<PATraits>(host_unified_kv.get(), (size_t)total_pages);
+        init_fp8_dsa_tensor<PATraits>(host_kv.get(), (size_t)total_tokens);
+        rand_vector(host_attn_sink.get(), H, -2.f, 2.f);
+    } else {
+        rand_vector(host_q.get(), q_size, -2.f, 2.f);
+        rand_vector(host_unified_kv.get(), unified_kv_size, -2.f, 2.f);
+        rand_vector(host_kv.get(), kv_size, -2.f, 2.f);
+        rand_vector(host_attn_sink.get(), H, -2.f, 2.f);
+    }
     if (dense_kv) {
         init_dense_kv_indices(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages);
         init_dense_kv_indices(host_kv_indptr_extend, host_kv_indices_extend, N, total_tokens);
@@ -437,16 +488,23 @@ int run_pa_case(int H, int N, int D, int total_pages, int total_tokens,
 
     int rc = 0;
     if (verify) {
-        printf("\nValidating GPU results against CPU reference...\n");
-        CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, q_size * sizeof(DType), hipMemcpyDeviceToHost));
-        pa_attention_ref<DType>(host_q.get(), host_unified_kv.get(), host_kv.get(), host_attn_sink.get(), host_o_ref.get(),
-                                host_kv_indptr_prefix.data(), host_kv_indices_prefix.data(),
-                                host_kv_indptr_extend.data(), host_kv_indices_extend.data(),
-                                N, H, D);
+        if constexpr (is_fp8) {
+            // RESERVED: an fp8 CPU reference (and matching quant/dequant) is not yet
+            // implemented; the kernel body is a stub. Skip validation for now.
+            printf("\n[fp8] CPU reference / validation not yet implemented — skipping "
+                   "(kernel body is a reserved stub).\n");
+        } else {
+            printf("\nValidating GPU results against CPU reference...\n");
+            CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, q_size * sizeof(DType), hipMemcpyDeviceToHost));
+            pa_attention_ref<DType>(host_q.get(), host_unified_kv.get(), host_kv.get(), host_attn_sink.get(), host_o_ref.get(),
+                                    host_kv_indptr_prefix.data(), host_kv_indices_prefix.data(),
+                                    host_kv_indptr_extend.data(), host_kv_indices_extend.data(),
+                                    N, H, D);
 
-        bool all_valid = validate_pa_results<DType>(host_o_ref.get(), host_o_gpu.get(), N, H, D);
-        printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
-        if (!all_valid) rc = 1;
+            bool all_valid = validate_pa_results<DType>(host_o_ref.get(), host_o_gpu.get(), N, H, D);
+            printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
+            if (!all_valid) rc = 1;
+        }
     }
 
     if (!rc) {
@@ -472,13 +530,13 @@ int run_pa_case(int H, int N, int D, int total_pages, int total_tokens,
 int main(int argc, char** argv) {
     int H = 128;   // query heads
     int N = 1024;  // sequence length
-    int D = 512;   // head dimension
     int total_pages = -1; // rows in unified_kv; default N after parsing
     int total_tokens = -1; // rows in the per-fwd extend KV tensor; default N
 
     // Parse command line arguments. Supports: -n 16384 and -n=16384.
     bool verify = false;
     bool dense_kv = false;
+    bool use_fp8 = false;
     auto parse_val = [](const char* arg, const char* flag) -> const char* {
         size_t len = std::strlen(flag);
         if (std::strncmp(arg, flag, len) == 0) {
@@ -492,6 +550,18 @@ int main(int argc, char** argv) {
         const char* val;
         if (std::strcmp(arg, "--verify") == 0) { verify = true; continue; }
         if (std::strcmp(arg, "--dense") == 0) { dense_kv = true; continue; }
+        if ((val = parse_val(arg, "-dtype"))) {
+            const char* dtype_str = (val == reinterpret_cast<const char*>(1))
+                                        ? (i + 1 < argc ? argv[++i] : "")
+                                        : val;
+            if (std::strcmp(dtype_str, "fp8") == 0) { use_fp8 = true; }
+            else if (std::strcmp(dtype_str, "bf16") == 0) { use_fp8 = false; }
+            else {
+                std::cerr << "-dtype must be 'bf16' or 'fp8', got '" << dtype_str << "'\n";
+                return 1;
+            }
+            continue;
+        }
         auto try_parse = [&](int& target, const char* flag) {
             if ((val = parse_val(arg, flag))) {
                 if (val == reinterpret_cast<const char*>(1)) { if (i + 1 < argc) target = std::atoi(argv[++i]); }
@@ -502,7 +572,6 @@ int main(int argc, char** argv) {
         };
         if (try_parse(H, "-h_q")) continue;
         if (try_parse(N, "-n")) continue;
-        if (try_parse(D, "-d")) continue;
         if (try_parse(total_pages, "-total_pages")) continue;
         if (try_parse(total_tokens, "-total_tokens")) continue;
     }
@@ -513,17 +582,17 @@ int main(int argc, char** argv) {
         total_tokens = N;
     }
 
-    if (H <= 0 || N <= 0 || D <= 0 || total_pages <= 0 || total_tokens <= 0) {
-        std::cerr << "Invalid parameters. H_Q,N,D,total_pages,total_tokens must be positive.\n";
+    if (H <= 0 || N <= 0 || total_pages <= 0 || total_tokens <= 0) {
+        std::cerr << "Invalid parameters. H_Q,N,total_pages,total_tokens must be positive.\n";
         return 1;
     }
-    if (D != 512) {
-        std::cerr << "-d must be 512, got " << D << "\n";
-        return 1;
+
+    if (use_fp8) {
+        return run_pa_case<pa_16mx1_16nx4_fp8_traits<16, 64, 640, 4, fp8_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
     }
     // Dispatch by query-head count: h_q <= 32 favors the 16mx1_16nx4 layout,
     // otherwise the 16mx8_32nx1 layout. Both are correct for any H > 0.
     return H <= 32
-        ? run_pa_case<pa_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv)
-        : run_pa_case<pa_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv);
+        ? run_pa_case<pa_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
+        : run_pa_case<pa_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
 }
