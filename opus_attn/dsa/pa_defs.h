@@ -185,8 +185,10 @@ struct pa_16mx1_16nx4_fp8_traits {
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
 
     // Packed DSA hdim split
-    static constexpr int D_NOPE_SIZE = 448;  // NoPE fp8 elements
-    static constexpr int D_ROPE_SIZE = 64;   // RoPE bf16 elements
+    static constexpr int D_NOPE_SIZE = 448;        // NoPE fp8 elements
+    static constexpr int D_NOPE_PADDED_SIZE = 512; // NoPE padded to multiple of 128
+    static constexpr int D_ROPE_SIZE = 64;         // RoPE bf16 elements
+    static constexpr int D_SIZE = D_NOPE_SIZE + D_ROPE_SIZE; // Total head dimension size (512)
 
     // Data types: NoPE fp8 + RoPE bf16; accumulation fp32.
     using D_NOPE = D_NOPE_;
@@ -207,16 +209,19 @@ struct pa_16mx1_16nx4_fp8_traits {
     // GEMM0: S = Q @ K^T
     static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
     static constexpr int GEMM0_E_N = KV_TILE_SIZE / (W_N * T_N);
-    static constexpr int GEMM0_E_K = D_TILE_SIZE / W_K;
+    static constexpr int GEMM0_NOPE_E_K = D_NOPE_PADDED_SIZE / W_K;
+    static constexpr int GEMM0_ROPE_E_K = D_ROPE_SIZE / W_K;
 
     // GEMM1: O = P @ V
     static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
-    static constexpr int GEMM1_E_N = D_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM1_E_N = D_SIZE / (W_N * T_N);
     static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
 
     // Vector lengths for global load/store
-    static constexpr int VEC_Q    = 16;
-    static constexpr int VEC_KV   = 16;
+    static constexpr int VEC_Q_NOPE  = 16;
+    static constexpr int VEC_Q_ROPE  = 8;
+    static constexpr int VEC_KV_NOPE = 16;
+    static constexpr int VEC_KV_ROPE = 8;
     static constexpr int VEC_P    = 4;
     static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O    = 4;
