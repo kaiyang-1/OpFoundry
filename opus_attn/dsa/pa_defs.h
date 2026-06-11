@@ -86,10 +86,6 @@ struct pa_16mx1_16nx4_traits {
     static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
     static constexpr int smem_kv_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
 
-    static constexpr int kv_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
-    static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
-    static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
-
     // Shared memory: kernel uses three static buffers (KV tile, m/l, P).
     static constexpr size_t smem_size_bytes() {
         return smem_kv_tile_elems * sizeof(D_ATTN)
@@ -188,7 +184,7 @@ struct pa_16mx1_16nx4_fp8_traits {
     static constexpr int D_NOPE_SIZE = 448;        // NoPE fp8 elements
     static constexpr int D_NOPE_PADDED_SIZE = 512; // NoPE padded to multiple of 128
     static constexpr int D_ROPE_SIZE = 64;         // RoPE bf16 elements
-    static constexpr int D_SIZE = D_NOPE_SIZE + D_ROPE_SIZE; // Total head dimension size (512)
+    static constexpr int D_HEAD_SIZE = D_NOPE_SIZE + D_ROPE_SIZE; // Total head dimension size (512)
 
     // Data types: NoPE fp8 + RoPE bf16; accumulation fp32.
     using D_NOPE = D_NOPE_;
@@ -201,21 +197,23 @@ struct pa_16mx1_16nx4_fp8_traits {
     static constexpr int T_N = NUM_WARPS; // waves along N
     static constexpr int T_K = 1;         // waves along K
 
-    // MFMA base tile: 16x16x128 fp8 (scaled f8f6f4 on gfx950)
+    // MFMA base tile: NoPE uses fp8 16x16x128 (scaled f8f6f4 on gfx950);
+    // RoPE (bf16 QK^T) and PV (bf16) use 16x16x32.
     static constexpr int W_M = 16;
     static constexpr int W_N = 16;
-    static constexpr int W_K = 128;
+    static constexpr int W_K_NOPE = 128;
+    static constexpr int W_K_ROPE = 32;
 
     // GEMM0: S = Q @ K^T
     static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
     static constexpr int GEMM0_E_N = KV_TILE_SIZE / (W_N * T_N);
-    static constexpr int GEMM0_NOPE_E_K = D_NOPE_PADDED_SIZE / W_K;
-    static constexpr int GEMM0_ROPE_E_K = D_ROPE_SIZE / W_K;
+    static constexpr int GEMM0_NOPE_E_K = D_NOPE_PADDED_SIZE / W_K_NOPE;
+    static constexpr int GEMM0_ROPE_E_K = D_ROPE_SIZE / W_K_ROPE;
 
     // GEMM1: O = P @ V
     static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
-    static constexpr int GEMM1_E_N = D_SIZE / (W_N * T_N);
-    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
+    static constexpr int GEMM1_E_N = D_HEAD_SIZE / (W_N * T_N);
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K_ROPE;
 
     // Vector lengths for global load/store
     static constexpr int VEC_Q_NOPE  = 16;
@@ -226,23 +224,11 @@ struct pa_16mx1_16nx4_fp8_traits {
     static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O    = 4;
 
-    // Minimal compact pixels for async copy for one wave (RESERVED)
-    static constexpr int D_128B_SIZE = 128 / sizeof(D_ATTN);
-    static_assert(VEC_KV == 16 / sizeof(D_ATTN));
-    static constexpr int smem_linear_wave = WARP_SIZE * 16 / sizeof(D_ATTN);
-    static constexpr int smem_n_per_wave = smem_linear_wave / D_128B_SIZE;
-    static constexpr int smem_n_rpt = KV_TILE_SIZE / smem_n_per_wave;
-    static constexpr int smem_d_rpt = D_TILE_SIZE / D_128B_SIZE;
-    static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
-    static constexpr int smem_kv_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
-
-    static constexpr int kv_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
-
     // Shared memory: kernel uses three static buffers (KV tile, m/l, P). RESERVED sizing.
     static constexpr size_t smem_size_bytes() {
-        return smem_kv_tile_elems * sizeof(D_ATTN)
+        return KV_TILE_SIZE * D_HEAD_SIZE * sizeof(D_ROPE)
              + 2 * T_N * W_M * sizeof(D_ACC)
-             + T_N * W_M * W_N * sizeof(D_ATTN);
+             + T_N * W_M * W_N * sizeof(D_ROPE);
     }
 };
 

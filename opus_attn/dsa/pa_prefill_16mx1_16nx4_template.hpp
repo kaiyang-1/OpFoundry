@@ -438,7 +438,6 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row);
-        
     }
 
     // ──── Extend segment ────

@@ -1,18 +1,19 @@
 #include <opus/opus.hpp>
 #include "pa_defs.h"
+#include <bit>
+#include <cstdint>
 
 using opus::operator""_I;
 
 namespace pa_16mx1_16nx4_fp8 {
 
-// Create layout for loading Q matrix from global memory
 template<class T>
-__device__ inline auto make_layout_q(int lane_id, int stride_q_h) {
+__device__ inline auto make_layout_q(int lane_id) {
     constexpr auto q_block_shape = opus::make_tuple(
         opus::number<T::GEMM0_E_M>{},
         opus::number<T::W_M>{},
-        opus::number<T::D_TILE_SIZE / T::W_K>{},
-        opus::number<T::W_M * T::W_K / T::WARP_SIZE / T::VEC_Q_NOPE>{},
+        opus::number<T::D_TILE_SIZE / T::W_K_NOPE>{},
+        opus::number<T::W_M * T::W_K_NOPE / T::WARP_SIZE / T::VEC_Q_NOPE>{},
         opus::number<T::WARP_SIZE / T::W_M>{},
         opus::number<T::VEC_Q_NOPE>{});
 
@@ -22,12 +23,12 @@ __device__ inline auto make_layout_q(int lane_id, int stride_q_h) {
 
     return opus::make_layout(
         q_block_shape,
-        opus::unfold_x_stride(q_block_dim, q_block_shape, opus::tuple{stride_q_h, 1_I}),
+        opus::unfold_x_stride(q_block_dim, q_block_shape, opus::tuple{opus::number<T::D_TILE_SIZE>{}, 1_I}),
         opus::unfold_p_coord(q_block_dim, opus::tuple{lane_id % T::W_M, lane_id / T::W_M}));
 }
 
 template<class T>
-__device__ inline auto make_layout_q_mxscl(int lane_id, int stride_q_h) {
+__device__ inline auto make_layout_q_mxscl(int lane_id) {
     constexpr auto q_block_shape = opus::make_tuple(
         opus::number<T::W_M>{},
         opus::number<T::VEC_Q_NOPE>{});
@@ -38,22 +39,264 @@ __device__ inline auto make_layout_q_mxscl(int lane_id, int stride_q_h) {
 
     return opus::make_layout(
         q_block_shape,
-        opus::unfold_x_stride(q_block_dim, q_block_shape, opus::tuple{stride_q_h, 1_I}),
+        opus::unfold_x_stride(q_block_dim, q_block_shape, opus::tuple{opus::number<T::D_TILE_SIZE>{}, 1_I}),
         opus::unfold_p_coord(q_block_dim, opus::tuple{lane_id % T::W_M}));
 }
 
-template<class Traits, class VQ, class VO>
-__device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(pa_kargs kargs,
-                                                    const void* kv_ptr, int kv_rows,
-                                                    const int* kv_indices, int page_idx_begin,
-                                                    int valid_kv_len, int num_kv_tiles,
-                                                    char* smem_kv, char* smem_ml, char* smem_p,
-                                                    VQ& v_q, VO& v_o,
-                                                    typename Traits::D_ACC& m_row,
-                                                    typename Traits::D_ACC& l_row) {
-    (void)kargs; (void)kv_ptr; (void)kv_rows; (void)kv_indices; (void)page_idx_begin;
-    (void)valid_kv_len; (void)num_kv_tiles; (void)smem_kv; (void)smem_ml; (void)smem_p;
-    (void)v_q; (void)v_o; (void)m_row; (void)l_row;
+template<class T>
+__device__ inline auto make_layout_k(int lane_id) {
+    constexpr auto k_block_shape = opus::make_tuple(
+        opus::number<T::D_TILE_SIZE / T::W_K_NOPE>{},
+        opus::number<T::W_N * T::W_K_NOPE / T::WARP_SIZE / T::VEC_KV_NOPE>{},
+        opus::number<T::WARP_SIZE / T::W_N>{},
+        opus::number<T::VEC_KV_NOPE>{});
+    
+    constexpr auto k_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout(
+        k_block_shape,
+        opus::unfold_x_stride(k_block_dim, k_block_shape, opus::tuple{1_I}),
+        opus::unfold_p_coord(k_block_dim, opus::tuple{lane_id / T::W_N}));
+}
+
+template<class T>
+__device__ inline auto make_layout_kv_indices(int warp_id, int lane_id) {
+    constexpr auto kv_indices_shape = opus::make_tuple(
+        opus::number<T::T_N>{},
+        opus::number<T::W_N>{},
+        1_I);
+    
+    constexpr auto kv_indices_dim = opus::make_tuple(
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout(
+        kv_indices_shape,
+        opus::unfold_x_stride(kv_indices_dim, kv_indices_shape, opus::tuple{1_I}),
+        opus::unfold_p_coord(kv_indices_dim, opus::tuple{warp_id, lane_id % T::W_N}));
+}
+
+template<typename T, typename V, typename S>
+__device__ inline typename T::D_ACC attn_row_max(const V& v_s, S& s_m, int warp_id, int lane_id) {
+    using D_ACC = typename T::D_ACC;
+    constexpr opus::index_t s_len = opus::vector_traits<V>::size();
+    D_ACC row_max = -1e30f;
+    opus::static_for<s_len>([&](auto i) {
+        row_max = max(row_max, v_s[i.value]);
+    });
+    // swap lanes 32 apart (i <-> i+32).
+    opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
+    row_max = max(std::bit_cast<float>(res32.x), std::bit_cast<float>(res32.y));
+    // swap lanes 16 apart (i <-> i+16).
+    opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
+    row_max = max(std::bit_cast<float>(res16.x), std::bit_cast<float>(res16.y));
+
+    // cross-warp reduction using shared memory
+    int row_idx = lane_id % T::W_M;
+    store(s_m, row_max, row_idx * T::T_N + (warp_id % T::T_N));
+    s_waitcnt_lgkmcnt(0_I);
+    __builtin_amdgcn_s_barrier();
+    auto max_warps = opus::load<T::T_N>(s_m, row_idx * T::T_N);
+    opus::static_for<T::T_N>([&](auto i) {
+        row_max = max(row_max, max_warps[i.value]);
+    });
+    return row_max;
+}
+
+template<typename T, typename V>
+__device__ inline void attn_sub_row(V& v_s, typename T::D_ACC row_max) {
+    constexpr opus::index_t s_len = opus::vector_traits<V>::size();
+    opus::static_for<s_len>([&](auto i) {
+        v_s[i.value] -= row_max;
+    });
+}
+
+template<typename T, opus::index_t Offset, opus::index_t Count, typename V>
+__device__ inline void attn_exp2_slice(V& v_s) {
+    opus::static_for<Count>([&](auto i) {
+        constexpr opus::index_t idx = Offset + i.value;
+        v_s[idx] = __builtin_amdgcn_exp2f(v_s[idx]);
+    });
+}
+
+template<typename T, typename V, typename S>
+__device__ inline typename T::D_ACC attn_row_sum(const V& v_s, S& s_l, int warp_id, int lane_id) {
+    using D_ACC = typename T::D_ACC;
+    constexpr opus::index_t s_len = opus::vector_traits<V>::size();
+    D_ACC row_sum = 0.0f;
+    opus::static_for<s_len>([&](auto i) {
+        row_sum += v_s[i.value];
+    });
+    // swap lanes 32 apart (i <-> i+32).
+    opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
+    row_sum = std::bit_cast<float>(res32.x) + std::bit_cast<float>(res32.y);
+    // swap lanes 16 apart (i <-> i+16).
+    opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
+    row_sum = std::bit_cast<float>(res16.x) + std::bit_cast<float>(res16.y);
+
+    // cross-warp reduction using shared memory
+    int row_idx = lane_id % T::W_M;
+    store(s_l, row_sum, row_idx * T::T_N + (warp_id % T::T_N));
+    s_waitcnt_lgkmcnt(0_I);
+    __builtin_amdgcn_s_barrier();
+    auto sum_warps = opus::load<T::T_N>(s_l, row_idx * T::T_N);
+    row_sum = 0.0f;
+    opus::static_for<T::T_N>([&](auto i) {
+        row_sum += sum_warps[i.value];
+    });
+    return row_sum;
+}
+
+template<typename T, typename V>
+__device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
+    constexpr opus::index_t o_len = opus::vector_traits<V>::size();
+    opus::static_for<o_len>([&](auto i) { v_o[i.value] *= scale;});
+}
+
+template<typename T, typename V>
+__device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_tile_idx, typename T::D_ACC neg_inf, int warp_id, int lane_id) {
+    constexpr int elems_per_wave_tile = (T::W_M * T::W_N) / T::WARP_SIZE;
+    constexpr int c_pack = 4;
+    constexpr int c_rept = elems_per_wave_tile / c_pack;
+    constexpr int c_rept_stride = (T::WARP_SIZE / T::W_M) * c_pack;
+
+    int last_valid_kv_pos = valid_kv_len - 1;
+    int k_start_pos = kv_tile_idx * T::KV_TILE_SIZE + (warp_id % T::T_N) * T::GEMM0_E_N * T::W_N;
+    int lane_group = lane_id / T::W_M;
+
+    opus::static_for<T::GEMM0_E_N>([&](auto i_n) {
+        constexpr int base_idx = i_n.value * elems_per_wave_tile;
+        const int k_pos = k_start_pos + i_n.value * T::W_N + lane_group * c_pack;
+        const int rel = last_valid_kv_pos - k_pos;
+
+        opus::static_for<c_rept>([&](auto i_rept) {
+            constexpr int rept_base_idx = base_idx + i_rept.value * c_pack;
+            constexpr int thr_base = i_rept.value * c_rept_stride;
+            opus::static_for<c_pack>([&](auto i_e) {
+                constexpr int idx = rept_base_idx + i_e.value;
+                constexpr int thr = thr_base + i_e.value;
+                v_s[idx] = (rel < thr) ? neg_inf : v_s[idx];
+            });
+        });
+    });
+}
+
+template<class Traits, class VQN, class VQR, class VQS, class VO>
+__device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
+        pa_kargs kargs, const void* kv_ptr, int kv_rows, const int* kv_indices,
+        int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+        char* smem_kv, char* smem_ml, char* smem_p,
+        VQN& v_q_nope, VQR& v_q_rope, VQS& v_q_mxscl, VO& v_o,
+        typename Traits::D_ACC& m_row, typename Traits::D_ACC& l_row,
+        float temperature_scale) {
+    using namespace opus;
+    using T = opus::remove_cvref_t<Traits>;
+    using D_NOPE = typename T::D_NOPE;
+    using D_ROPE = typename T::D_ROPE;
+    using D_ACC = typename T::D_ACC;
+
+    int lane_id = thread_id_x() % T::WARP_SIZE;
+    asm volatile("" : "+v"(lane_id));  // break CSE
+    int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+
+    auto g_k          = make_gmem(reinterpret_cast<const D_NOPE*>(kv_ptr), kv_rows * kargs.stride_kv_page * sizeof(D_NOPE));
+    auto g_kv_indices = make_gmem(kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
+
+    // Cross-warp reduction / P-exchange scratch (m & l in fp32, P broadcast in bf16).
+    auto s_m = make_smem(reinterpret_cast<D_ACC*>(smem_ml));
+    auto s_l = make_smem(reinterpret_cast<D_ACC*>(smem_ml) + T::T_N * T::W_M);
+    auto s_p = make_smem(reinterpret_cast<D_ROPE*>(smem_p));
+
+    // Tiled MMA operators: NoPE QK^T (MXFP8), RoPE QK^T (bf16), PV (bf16).
+    auto mma0_nope = make_tiled_mma<D_NOPE, D_NOPE, D_ACC>(
+        seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_NOPE_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K_NOPE>{},
+        mfma_adaptor_swap_ab{});
+    auto mma0_rope = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
+        seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_ROPE_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K_ROPE>{},
+        mfma_adaptor_swap_ab{});
+    auto mma1 = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
+        seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K_ROPE>{},
+        mfma_adaptor_swap_ab{});
+
+    auto u_k          = make_layout_k<T>(lane_id);
+    auto u_kv_indices = make_layout_kv_indices<T>(warp_id, lane_id);
+
+    typename decltype(mma0_nope)::vtype_c v_s;
+    typename decltype(mma1)::vtype_a      v_p;
+    typename decltype(mma1)::vtype_b      v_v;
+
+    constexpr index_t s_len = vector_traits<typename decltype(mma0_nope)::vtype_c>::size();
+    auto v_p_warps = reinterpret_cast<vector_t<D_ROPE, s_len>*>(&v_p);
+
+    auto load_kv_page    = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
+    auto kv_token_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_page; };
+
+    const D_ACC neg_inf = -opus::numeric_limits<D_ACC>::infinity();
+    auto mask_oob_scores = [&](auto& s, int tile_idx) {
+        if ((tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len) {
+            attn_mask_oob_kv_tile<T>(s, valid_kv_len, tile_idx, neg_inf, warp_id, lane_id);
+        }
+    };
+
+    for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
+        // ──── Load K tile (NoPE fp8 + RoPE bf16 + MX scales) ────
+        const int kv_page = load_kv_page(tile_idx);
+        auto v_k = load<T::VEC_KV_NOPE>(g_k, u_k + kv_token_offset(kv_page));
+
+        // Split the packed K row into NoPE (fp8) and RoPE (bf16), mirroring v_q.
+        constexpr index_t k_len      = vector_traits<decltype(v_k)>::size();
+        constexpr index_t k_nope_len = k_len * T::D_NOPE_PADDED_SIZE / T::D_TILE_SIZE;
+        auto v_k_nope = slice(v_k, number<k_nope_len>{});
+        auto v_k_rope_fp8 = slice(v_k, number<k_nope_len>{}, number<k_len>{});
+        auto& v_k_rope = reinterpret_cast<vector_t<D_ROPE, (k_len - k_nope_len) * sizeof(D_NOPE) / sizeof(D_ROPE)>&>(v_k_rope_fp8);
+
+        auto v_k_mxscl = load<T::VEC_KV_NOPE>(g_k, kv_token_offset(kv_page) + T::D_NOPE_SIZE);
+        constexpr index_t k_mxscl_len  = vector_traits<decltype(v_k_mxscl)>::size();  // 16 (padded scale count)
+        constexpr index_t k_mxscl_vals = T::D_NOPE_SIZE / 32;                         // 14 real scales
+        static_for([&](auto i) { v_k_mxscl[i.value] = static_cast<D_NOPE>(0); }, number<k_mxscl_vals>{}, number<k_mxscl_len>{});
+
+        // ──── GEMM0: S = Q·Kᵀ  (NoPE MXFP8 + RoPE bf16) ────
+        // Pack the 16 E8M0 block scales as 4 dwords; lane L feeds block (ek*4 + L/16) in byte0.
+        const int kblk = lane_id / T::W_M;  // 0..3: 32-wide block index inside each 128-MFMA (= L/16)
+        auto& q_scl_w = reinterpret_cast<const vector_t<u32_t, T::GEMM0_NOPE_E_K>&>(v_q_mxscl);
+        auto& k_scl_w = reinterpret_cast<const vector_t<u32_t, T::GEMM0_NOPE_E_K>&>(v_k_mxscl);
+
+        clear(v_s);
+        static_for<T::GEMM0_NOPE_E_K>([&](auto ek) {
+            const int scale_q = (q_scl_w[ek.value] >> (8 * kblk)) & 0xFF;  // E8M0 for block ek*4+kblk
+            const int scale_k = (k_scl_w[ek.value] >> (8 * kblk)) & 0xFF;
+            v_s = mma0_nope.step_k(ek, v_q_nope, v_k_nope, v_s, scale_q, scale_k);
+        });
+        v_s = mma0_rope(v_q_rope, v_k_rope, v_s);
+        scale_output_tile<T>(v_s, temperature_scale);
+        mask_oob_scores(v_s, tile_idx);
+
+        // ──── Cross-warp online softmax ────
+        D_ACC row_max   = max(m_row, attn_row_max<T>(v_s, s_m, warp_id, lane_id));
+        D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+        m_row = row_max;
+        attn_sub_row<T>(v_s, row_max);
+        attn_exp2_slice<T, 0, s_len>(v_s);
+        l_row *= rescale_m;
+        l_row += attn_row_sum<T>(v_s, s_l, warp_id, lane_id);
+        scale_output_tile<T>(v_o, rescale_m);
+
+        // ──── Broadcast P across warps ────
+        auto v_p_seg = cast<D_ROPE>(v_s);
+        store<s_len>(s_p, v_p_seg, warp_id * T::W_M * T::W_N + lane_id * s_len);
+        s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
+        static_for<T::NUM_WARPS>([&](auto i) {
+            v_p_warps[i.value] = load<s_len>(s_p, i.value * T::W_M * T::W_N + lane_id * s_len);
+        });
+
+    }
 }
 
 } // namespace pa_16mx1_16nx4_fp8
@@ -75,9 +318,16 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE;
     const int qo_gmem_offset = q_token_idx * kargs.stride_qo_n + h_block_start * kargs.stride_qo_h;
 
-    auto g_q = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.q_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_NOPE));
-    auto u_q = make_layout_q<T>(lane_id, kargs.stride_qo_h);
+    __shared__ char smem_kv[T::KV_TILE_SIZE * T::D_HEAD_SIZE * sizeof(D_ROPE)]; // for KV tiles
+    __shared__ char smem_ml[2 * T::T_N * T::W_M * sizeof(D_ACC)];  // for inter-warp reduction
+    __shared__ char smem_p[T::T_N * T::W_M * T::W_N * sizeof(D_ROPE)]; // for combining P across warps before PV compute
 
+    constexpr float LOG2_E = 1.44269504089f;
+    const float temperature_scale = kargs.softmax_scale * LOG2_E;
+
+    // Load Q tile from global memory to registers
+    auto g_q = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.q_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_NOPE));
+    auto u_q = make_layout_q<T>(lane_id);
     auto v_q = load<T::VEC_Q_NOPE>(g_q, u_q);
 
     // NoPE tile (fp8)
@@ -93,9 +343,45 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     auto v_q_rope = slice(reinterpret_cast<vector_t<D_ROPE, q_rope_all>&>(v_q), number<q_rope_all - q_rope_len>{}, number<q_rope_all>{});
 
     // NoPE mx scales (fp8 E8M0, one per 32-elem K block)
-    auto u_q_mxscl = make_layout_q_mxscl<T>(lane_id, kargs.stride_qo_h);
+    auto u_q_mxscl = make_layout_q_mxscl<T>(lane_id);
     auto v_q_mxscl = load<T::VEC_Q_NOPE>(g_q, u_q_mxscl + T::D_NOPE_SIZE);
     constexpr index_t q_mxscl_len  = vector_traits<decltype(v_q_mxscl)>::size();  // 16 (padded scale count)
     constexpr index_t q_mxscl_vals = T::D_NOPE_SIZE / 32;                         // 14 real scales
     static_for([&](auto i) { v_q_mxscl[i.value] = static_cast<D_NOPE>(0); }, number<q_mxscl_vals>{}, number<q_mxscl_len>{});
+
+    // Output accumulator and online-softmax state.
+    vector_t<D_ACC, T::Q_TILE_SIZE * T::D_HEAD_SIZE / (T::T_N * T::WARP_SIZE)> v_o;
+    clear(v_o);
+    D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
+    D_ACC l_row = 0.0f;
+
+    // ──── Prefix segment ────
+    {
+        const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
+        const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
+        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+
+        pa_prefill_16mx1_16nx4_fp8_pipeline<Traits>(
+            kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix,
+            page_idx_begin, valid_kv_len, num_kv_tiles,
+            smem_kv, smem_ml, smem_p,
+            v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row,
+            temperature_scale);
+    }
+
+    // ──── Extend segment ────
+    {
+        const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
+        const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
+        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+
+        pa_prefill_16mx1_16nx4_fp8_pipeline<Traits>(
+            kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend,
+            page_idx_begin, valid_kv_len, num_kv_tiles,
+            smem_kv, smem_ml, smem_p,
+            v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row,
+            temperature_scale);
+    }
 }
