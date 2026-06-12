@@ -35,11 +35,13 @@ template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
          int D_TILE_SIZE_ = 512,
          int NUM_WARPS_ = 4,
-         typename D_ATTN_ = bf16_t>
+         typename D_ATTN_ = bf16_t,
+         typename D_OUT_ = bf16_t>
 struct pa_16mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
+    static constexpr int D_HEAD_SIZE = D_TILE_SIZE;
     static constexpr int NUM_WARPS = NUM_WARPS_;
 
     static constexpr int WARP_SIZE = 64; // AMD wavefront size
@@ -47,6 +49,7 @@ struct pa_16mx1_16nx4_traits {
 
     // Data types: Q/K/V/O share one attention dtype; accumulation fp32
     using D_ATTN = D_ATTN_;
+    using D_OUT  = D_OUT_;
     using D_ACC  = float;
 
     // MFMA wave layout
@@ -100,11 +103,13 @@ template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 32,
          int D_TILE_SIZE_ = 512,
          int NUM_WARPS_ = 8,
-         typename D_ATTN_ = bf16_t>
+         typename D_ATTN_ = bf16_t,
+         typename D_OUT_ = bf16_t>
 struct pa_16mx8_32nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
+    static constexpr int D_HEAD_SIZE = D_TILE_SIZE;
     static constexpr int NUM_WARPS = NUM_WARPS_;
 
     static constexpr int WARP_SIZE = 64; // AMD wavefront size
@@ -112,6 +117,7 @@ struct pa_16mx8_32nx1_traits {
 
     // Data types: Q/K/V/O share one attention dtype; accumulation fp32
     using D_ATTN = D_ATTN_;
+    using D_OUT  = D_OUT_;
     using D_ACC  = float;
 
     // MFMA wave layout
@@ -170,7 +176,8 @@ template<int Q_TILE_SIZE_ = 16,
          int D_TILE_SIZE_ = 640,
          int NUM_WARPS_ = 4,
          typename D_NOPE_ = fp8_t,
-         typename D_ROPE_ = bf16_t>
+         typename D_ROPE_ = bf16_t,
+         typename D_OUT_ = bf16_t>
 struct pa_16mx1_16nx4_fp8_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
@@ -190,6 +197,7 @@ struct pa_16mx1_16nx4_fp8_traits {
     using D_NOPE = D_NOPE_;
     using D_ROPE = D_ROPE_;
     using D_ATTN = D_NOPE_;
+    using D_OUT  = D_OUT_;
     using D_ACC  = float;
 
     // MFMA wave layout (identical to the bf16 16mx1_16nx4 variant)
