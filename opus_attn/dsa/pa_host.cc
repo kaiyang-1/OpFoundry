@@ -498,8 +498,10 @@ int run_pa_case(int H, int N, int total_pages, int total_tokens,
     kargs.D = D;
     kargs.total_pages = total_pages;
     kargs.total_tokens = total_tokens;
-    kargs.stride_qo_n = H * D;
-    kargs.stride_qo_h = D;
+    kargs.stride_q_n = H * D;
+    kargs.stride_q_h = D;
+    kargs.stride_o_n = H * D_HEAD;
+    kargs.stride_o_h = D_HEAD;
     kargs.stride_kv_page = D;
     kargs.softmax_scale = 1.0f / std::sqrt(static_cast<float>(PATraits::D_HEAD_SIZE));
 

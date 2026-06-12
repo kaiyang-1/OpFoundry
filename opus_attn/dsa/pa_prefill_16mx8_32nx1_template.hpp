@@ -1040,13 +1040,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     const int h_block_start = h_block_idx * T::NUM_WARPS * T::Q_TILE_SIZE;
-    const int qo_gmem_offset = q_token_idx * kargs.stride_qo_n + h_block_start * kargs.stride_qo_h;
+    const int q_gmem_offset = q_token_idx * kargs.stride_q_n + h_block_start * kargs.stride_q_h;
 
     __shared__ char smem_kv_buf[T::smem_size_bytes()];
 
     // Load Q once (shared across both segments)
-    auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.q_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_ATTN));
-    auto u_q = make_layout_q<T>(warp_id, lane_id, kargs.stride_qo_h);
+    auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.q_ptr) + q_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_h * sizeof(D_ATTN));
+    auto u_q = make_layout_q<T>(warp_id, lane_id, kargs.stride_q_h);
 
     vector_t<D_ATTN, T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_q;
     vector_t<D_ACC,  T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_o;
@@ -1112,12 +1112,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     scale_output_tile<T>(v_o, o_scale);
 
     using D_OUT = typename T::D_OUT;
-    auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_OUT));
+    const int o_gmem_offset = q_token_idx * kargs.stride_o_n + h_block_start * kargs.stride_o_h;
+    auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
     // Recompute lane/warp decomposition to prevent CSE with Q-load layout
     int lane_id_o = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id_o));
     int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
-    auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_qo_h);
+    auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
     auto v_o_out = cast<D_OUT>(v_o);
     store<T::VEC_O>(g_o, v_o_out, u_o);
 }

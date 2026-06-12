@@ -23,8 +23,10 @@ struct pa_kargs {
     int D;
     int total_pages;
     int total_tokens;
-    int stride_qo_n;
-    int stride_qo_h;
+    int stride_q_n;
+    int stride_q_h;
+    int stride_o_n;
+    int stride_o_h;
     int stride_kv_page;
     float softmax_scale;
 };
