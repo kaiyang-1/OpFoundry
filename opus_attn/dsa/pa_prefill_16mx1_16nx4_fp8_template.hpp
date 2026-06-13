@@ -75,7 +75,7 @@ __device__ inline auto make_layout_sk_nope(int warp_id, int lane_id) {
     
     return opus::make_layout(
         sk_nope_shape,
-        opus::unfold_x_stride(sk_nope_dim, sk_nope_shape, opus::tuple{opus::number<T::D_HEAD_SIZE>{}, 1_I}),
+        opus::unfold_x_stride(sk_nope_dim, sk_nope_shape, opus::tuple{opus::number<T::SMEM_KV_ROW>{}, 1_I}),
         opus::unfold_p_coord(sk_nope_dim, opus::tuple{warp_id, lane_id % T::W_N, lane_id / T::W_N}));
 }
 
@@ -94,7 +94,7 @@ __device__ inline auto make_layout_sk_rope(int warp_id, int lane_id) {
     
     return opus::make_layout(
         sk_rope_shape,
-        opus::unfold_x_stride(sk_rope_dim, sk_rope_shape, opus::tuple{opus::number<T::D_HEAD_SIZE>{}, 1_I}),
+        opus::unfold_x_stride(sk_rope_dim, sk_rope_shape, opus::tuple{opus::number<T::SMEM_KV_ROW>{}, 1_I}),
         opus::unfold_p_coord(sk_rope_dim, opus::tuple{warp_id, lane_id % T::W_N, lane_id / T::W_N}));
 }
 
@@ -129,7 +129,7 @@ __device__ inline auto make_layout_rv(int warp_id, int lane_id) {
 
     return opus::make_layout(
         rv_block_shape,
-        opus::unfold_x_stride(rv_block_dim, rv_block_shape, opus::tuple{opus::number<grp_n * lane_lo * T::VEC_TR_V>{}, opus::number<T::D_HEAD_SIZE>{}, 1_I}),
+        opus::unfold_x_stride(rv_block_dim, rv_block_shape, opus::tuple{opus::number<grp_n * lane_lo * T::VEC_TR_V>{}, opus::number<T::SMEM_KV_ROW>{}, 1_I}),
         opus::unfold_p_coord(rv_block_dim, opus::tuple{warp_id, grp_id / grp_n, lane_in_grp / lane_lo, grp_id % grp_n, lane_in_grp % lane_lo}));
 }
 
@@ -276,19 +276,23 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
     });
 }
 
-// Reorder the padded block-scale vector from block order [0,1,...,15] to [0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15] 
+// Reorder the padded block-scale vector from block order [0,1,...,15] to [0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15].
 template<class T, class V>
-__device__ inline V reorder_mxscl_for_opsel(const V& v) {
+__device__ inline void reorder_mxscl_for_opsel(V& v) {
     constexpr int E_K  = T::GEMM0_NOPE_E_K;   // MFMA K-steps                 (= 4)
     constexpr int NBLK = T::W_K_NOPE / 32;    // blocks per MFMA = lane-groups (= 4)
     static_assert(E_K * NBLK == 16 && NBLK == 4, "reorder assumes a 4x4 (16-entry) E8M0 scale tile");
-    V r;
-    opus::static_for<E_K * NBLK>([&](auto n) {
-        constexpr int g  = n.value / E_K;     // lane-group
-        constexpr int ek = n.value % E_K;     // MFMA step
-        r[n.value] = v[ek * NBLK + g];
-    });
-    return r;
+    auto& m = reinterpret_cast<opus::vector_t<opus::u32_t, 4>&>(v);
+    // Stage 1: interleave bytes within each row-pair (d0,d1) and (d2,d3).
+    const opus::u32_t t0 = __builtin_amdgcn_perm(m[1], m[0], 0x05010400u);  // {d0.0,d1.0,d0.1,d1.1}
+    const opus::u32_t t1 = __builtin_amdgcn_perm(m[1], m[0], 0x07030602u);  // {d0.2,d1.2,d0.3,d1.3}
+    const opus::u32_t t2 = __builtin_amdgcn_perm(m[3], m[2], 0x05010400u);  // {d2.0,d3.0,d2.1,d3.1}
+    const opus::u32_t t3 = __builtin_amdgcn_perm(m[3], m[2], 0x07030602u);  // {d2.2,d3.2,d2.3,d3.3}
+    // Stage 2: merge the pair-results into the transposed columns.
+    m[0] = __builtin_amdgcn_perm(t2, t0, 0x05040100u);   // {d0.0,d1.0,d2.0,d3.0}
+    m[1] = __builtin_amdgcn_perm(t2, t0, 0x07060302u);   // {d0.1,d1.1,d2.1,d3.1}
+    m[2] = __builtin_amdgcn_perm(t3, t1, 0x05040100u);   // {d0.2,d1.2,d2.2,d3.2}
+    m[3] = __builtin_amdgcn_perm(t3, t1, 0x07060302u);   // {d0.3,d1.3,d2.3,d3.3}
 }
 
 template<class Traits, class VQN, class VQR, class VQS, class VO>
@@ -378,7 +382,7 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
         constexpr index_t k_mxscl_len  = vector_traits<decltype(v_k_mxscl)>::size();  // 16 (padded scale count)
         constexpr index_t k_mxscl_vals = T::D_NOPE_SIZE / 32;                         // 14 real scales
         static_for([&](auto i) { v_k_mxscl[i.value] = static_cast<D_NOPE>(0); }, number<k_mxscl_vals>{}, number<k_mxscl_len>{});
-        v_k_mxscl = reorder_mxscl_for_opsel<T>(v_k_mxscl);
+        reorder_mxscl_for_opsel<T>(v_k_mxscl);
 
         // ──── GEMM0: S = Q·Kᵀ  (NoPE MXFP8) ────
         const int kblk = lane_id / T::W_M;  // lane-group g = L/W_M (0..3)
@@ -466,7 +470,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE;
     const int q_gmem_offset = q_token_idx * kargs.stride_q_n + h_block_start * kargs.stride_q_h;
 
-    __shared__ char smem_kv[T::KV_TILE_SIZE * T::D_HEAD_SIZE * sizeof(D_ROPE)]; // for KV tiles
+    __shared__ char smem_kv[T::KV_TILE_SIZE * T::SMEM_KV_ROW * sizeof(D_ROPE)]; // for KV tiles
     __shared__ char smem_ml[2 * T::T_N * T::W_M * sizeof(D_ACC)];  // for inter-warp reduction
     __shared__ char smem_p[T::T_N * T::W_M * T::W_N * sizeof(D_ROPE)]; // for combining P across warps before PV compute
 
@@ -496,7 +500,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     constexpr index_t q_mxscl_len  = vector_traits<decltype(v_q_mxscl)>::size();  // 16 (padded scale count)
     constexpr index_t q_mxscl_vals = T::D_NOPE_SIZE / 32;                         // 14 real scales
     static_for([&](auto i) { v_q_mxscl[i.value] = static_cast<D_NOPE>(0); }, number<q_mxscl_vals>{}, number<q_mxscl_len>{});
-    v_q_mxscl = reorder_mxscl_for_opsel<T>(v_q_mxscl);
+    reorder_mxscl_for_opsel<T>(v_q_mxscl);
 
     // Output accumulator and online-softmax state.
     vector_t<D_ACC, T::Q_TILE_SIZE * T::D_HEAD_SIZE / (T::T_N * T::WARP_SIZE)> v_o;

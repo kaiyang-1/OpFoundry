@@ -234,9 +234,13 @@ struct pa_16mx1_16nx4_fp8_traits {
     static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O    = 4;
 
+    // Per-token row stride for the bf16 KV tile staged in LDS.
+    static constexpr int SMEM_KV_PAD = 8;
+    static constexpr int SMEM_KV_ROW = D_HEAD_SIZE + SMEM_KV_PAD;
+
     // Shared memory: kernel uses three static buffers (KV tile, m/l, P). RESERVED sizing.
     static constexpr size_t smem_size_bytes() {
-        return KV_TILE_SIZE * D_HEAD_SIZE * sizeof(D_ROPE)
+        return KV_TILE_SIZE * SMEM_KV_ROW * sizeof(D_ROPE)
              + 2 * T_N * W_M * sizeof(D_ACC)
              + T_N * W_M * W_N * sizeof(D_ROPE);
     }
