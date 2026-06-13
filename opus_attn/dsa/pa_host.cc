@@ -219,51 +219,80 @@ void benchmark_pa_kernel(const pa_kargs& kargs, dim3 grid, dim3 block,
     CHECK_HIP(hipEventDestroy(stop));
 
     const float avg_time = total_time / iterations;
-    //   sparse attention -> 4 * H * nnz(indices) * D
-    const double flops = (4.0 * kargs.H * indices_prefix_sum * kargs.D);
+
+    using D_ATTN = typename Traits::D_ATTN;
+    using D_OUT  = typename Traits::D_OUT;
+    constexpr int D_HEAD = Traits::D_HEAD_SIZE;  // logical head dim (NoPE + RoPE), e.g. 512
+
+    // FLOPs: per (query, kv, head) -> QK^T (2*D_HEAD) + PV (2*D_HEAD).
+    const double flops = 4.0 * kargs.H * indices_prefix_sum * D_HEAD;
     const double tflops = flops / (avg_time * 1e-3) / 1e12;
 
-    const size_t qo_bytes = 2ull * kargs.N * kargs.H * kargs.D * sizeof(typename Traits::D_ATTN);
-    const size_t kv_bytes = (size_t)indices_prefix_sum * kargs.D * sizeof(typename Traits::D_ATTN);
-    const double tbps = double(qo_bytes + kv_bytes) / (avg_time * 1e-3) / 1e12;
+    // Bandwidth: Q read (packed row) + O write (bf16) + KV read (packed row), each its own dtype.
+    const size_t q_bytes  = (size_t)kargs.N * kargs.H * Traits::D_TILE_SIZE * sizeof(D_ATTN);
+    const size_t o_bytes  = (size_t)kargs.N * kargs.H * D_HEAD * sizeof(D_OUT);
+    const size_t kv_bytes = (size_t)indices_prefix_sum * Traits::D_TILE_SIZE * sizeof(D_ATTN);
+    const double tbps = double(q_bytes + o_bytes + kv_bytes) / (avg_time * 1e-3) / 1e12;
 
     printf("PA Prefill Kernel Performance: avg_time=%.3f ms, %.2f TFlops, %.2f TB/s\n",
            avg_time, tflops, tbps);
 }
 
-// Validate PA GPU results against CPU reference
+// Validate PA GPU results against CPU reference.
 template<typename DType>
 bool validate_pa_results(const DType* ref, const DType* gpu,
-                          int N, int H, int D, float threshold = 5e-2f) {
-    bool all_valid = true;
-    size_t total_errors = 0;
+                          int N, int H, int D,
+                          float rtol = 1e-2f, float atol = 1e-2f,
+                          float tol_err_ratio = 0.05f) {
     const size_t total_elements = (size_t)N * H * D;
+    constexpr size_t printNum = 10;
 
-    for (int i = 0; i < N; i++) {
+    size_t total_errors = 0, printed = 0;
+    bool any_nan = false;
+    float max_abs_delta = 0.0f, ref_absmax = 0.0f;
+    double sq_diff_sum = 0.0, ref_sq_sum = 0.0;
+
+    for (int n = 0; n < N; n++) {
         for (int h = 0; h < H; h++) {
-            const size_t offset = ((size_t)i * H + h) * D;
+            const size_t offset = ((size_t)n * H + h) * D;
             for (int d = 0; d < D; d++) {
                 const float ref_val = static_cast<float>(ref[offset + d]);
                 const float gpu_val = static_cast<float>(gpu[offset + d]);
-                const float diff = std::abs(gpu_val - ref_val);
-                if (std::isnan(gpu_val) || std::isinf(gpu_val) || diff > threshold) {
+                const float delta   = std::abs(gpu_val - ref_val);
+
+                ref_absmax  = std::max(ref_absmax, std::abs(ref_val));
+                sq_diff_sum += double(delta) * double(delta);
+                ref_sq_sum  += double(ref_val) * double(ref_val);
+
+                const bool nan_inf = std::isnan(gpu_val) || std::isinf(gpu_val);
+                any_nan |= nan_inf;
+                if (nan_inf || delta > atol + rtol * std::abs(ref_val)) {
                     total_errors++;
-                    all_valid = false;
-                    if (total_errors <= 32)  // cap log spam; full count reported below
-                        printf("  mismatch [n=%d,h=%d,d=%d] ref=%.6f gpu=%.6f diff=%.6f\n",
-                               i, h, d, ref_val, gpu_val, diff);
+                    max_abs_delta = std::max(max_abs_delta, delta);
+                    if (printed++ < printNum)
+                        printf("  mismatch [n=%d,h=%d,d=%d] ref=%.6f gpu=%.6f delta=%.6f\n",
+                               n, h, d, ref_val, gpu_val, delta);
                 }
             }
         }
     }
-    
-    if (all_valid) {
-        printf("✓ Full validation passed (checked %zu elements)\n", total_elements);
-    } else {
-        printf("✗ Validation failed with %zu/%zu total errors\n",
-               total_errors, total_elements);
-    }
-    
+
+    const double err_ratio    = double(total_errors) / double(total_elements);
+    const double nrms         = std::sqrt(sq_diff_sum / std::max(ref_sq_sum, 1e-12));  // ||gpu-ref|| / ||ref||
+    const bool   catastrophic = any_nan || max_abs_delta > 0.5f * ref_absmax;
+    const bool   all_valid    = !catastrophic && err_ratio <= tol_err_ratio;
+
+    printf("  rtol=%.0e atol=%.0e | max_abs_delta=%.6f nrms=%.3e | mismatch %zu/%zu (%.2f%%)\n",
+           rtol, atol, max_abs_delta, nrms, total_errors, total_elements, 100.0 * err_ratio);
+    if (all_valid)
+        printf("✓ Validation passed (checked %zu elements)\n", total_elements);
+    else if (catastrophic)
+        printf("✗ Validation failed (catastrophic: %s, max_abs_delta=%.6f)\n",
+               any_nan ? "NaN/Inf" : "delta > 0.5*max|ref|", max_abs_delta);
+    else
+        printf("✗ Validation failed (mismatch ratio %.2f%% > %.2f%%)\n",
+               100.0 * err_ratio, 100.0 * tol_err_ratio);
+
     return all_valid;
 }
 

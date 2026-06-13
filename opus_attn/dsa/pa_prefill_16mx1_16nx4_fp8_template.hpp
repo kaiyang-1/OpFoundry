@@ -414,7 +414,7 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
         v_s = mma0_rope(v_q_rope, v_k_rope, v_s);
 
         // ──── Stage bf16 KV into smem ────
-        store<T::VEC_KV_ROPE>(s_kv, v_k_nope_bf16, u_sk_nope);
+        store<T::VEC_KV_NOPE>(s_kv, v_k_nope_bf16, u_sk_nope);
         store<T::VEC_KV_ROPE>(s_kv, v_k_rope, u_sk_rope + T::D_NOPE_SIZE);
 
         // ──── Cross-warp online softmax ────
