@@ -401,9 +401,13 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
         }
     };
 
+    // Prefetch the first tile's page index
+    int kv_page = load_kv_page(0);
+    s_waitcnt_vmcnt(0_I);
+
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         // ──── Load K tile (NoPE fp8 + RoPE bf16 + MX scales) ────
-        const int kv_page = load_kv_page(tile_idx);
+        const int next_kv_page = load_kv_page(tile_idx + 1);
         auto v_k_nope = load<T::VEC_KV_NOPE>(g_k_nope, u_rk_nope + kv_nope_offset(kv_page));
         auto v_k_rope = load<T::VEC_KV_ROPE>(g_k_rope, u_rk_rope + kv_rope_offset(kv_page));
 
@@ -481,6 +485,8 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
         __builtin_amdgcn_sched_barrier(0);
         v_o = mma1(v_p, v_v, v_o);
         __builtin_amdgcn_s_barrier();
+
+        kv_page = next_kv_page;
     }
 }
 

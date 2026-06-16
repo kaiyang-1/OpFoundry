@@ -349,12 +349,15 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_kargs kargs,
         }
     };
 
+    auto kv_page = load_kv_page(0);
+
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
-        const auto kv_page = load_kv_page(tile_idx);
+        s_waitcnt_vmcnt(0_I);
         async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
         async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv + T::NUM_WARPS * T::smem_d_rpt * (T::smem_linear_wave + T::smem_padding_32B));
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
+        kv_page = load_kv_page(tile_idx + 1);
 
         v_k = load<T::VEC_KV>(s_kv, u_rk);
         s_waitcnt_lgkmcnt(0_I);
