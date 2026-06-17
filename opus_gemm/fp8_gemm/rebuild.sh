@@ -4,7 +4,7 @@ SRC=gemm_a8w8_8wave.cc
 OUT=gemm_a8w8_8wave.exe
 TOP=`pwd`
 BUILD="$TOP/build/"
-OPUS_INCLUDE_DIR=/path/to/aiter/csrc/include
+OPUS_INCLUDE_DIR="${OPUS_INCLUDE_DIR:-/path/to/aiter/csrc/include}"
 
 rm -rf $BUILD ; mkdir $BUILD ; cd $BUILD
 
