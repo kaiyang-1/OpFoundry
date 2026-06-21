@@ -349,12 +349,15 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_kargs kargs,
         }
     };
 
+    auto kv_page = load_kv_page(0);
+
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
-        const auto kv_page = load_kv_page(tile_idx);
+        s_waitcnt_vmcnt(0_I);
         async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
         async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv + T::NUM_WARPS * T::smem_d_rpt * (T::smem_linear_wave + T::smem_padding_32B));
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
+        kv_page = load_kv_page(tile_idx + 1);
 
         v_k = load<T::VEC_KV>(s_kv, u_rk);
         s_waitcnt_lgkmcnt(0_I);
@@ -438,7 +441,6 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row);
-        
     }
 
     // ──── Extend segment ────
@@ -461,9 +463,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
 
-    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.out_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_ATTN));
+    using D_OUT = typename T::D_OUT;
+    auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_OUT));
     int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_qo_h);
-    auto v_o_attn = cast<D_ATTN>(v_o);
-    store<T::VEC_O>(g_o, v_o_attn, u_o);
+    auto v_o_out = cast<D_OUT>(v_o);
+    store<T::VEC_O>(g_o, v_o_out, u_o);
 }
