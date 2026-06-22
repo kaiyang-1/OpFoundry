@@ -19,10 +19,10 @@
 template<class Traits>
 __global__ void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_v32_fp8_kargs kargs);
 
-template<int Q, int KV, int D, int NW, class NOPE, class ROPE, class DO>
-inline void dsa_v32_launch(dsa_v32_16mx8_32nx1_fp8_traits<Q, KV, D, NW, NOPE, ROPE, DO>,
+template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
+inline void dsa_v32_launch(dsa_v32_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>,
                            const dsa_v32_fp8_kargs& kargs, dim3 grid, dim3 block) {
-    dsa_v32_decode_16mx8_32nx1_fp8_kernel<dsa_v32_16mx8_32nx1_fp8_traits<Q, KV, D, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
+    dsa_v32_decode_16mx8_32nx1_fp8_kernel<dsa_v32_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 
 #define CHECK_HIP(call)                                                                                   \
@@ -541,5 +541,5 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    return run_dsa_v32_case<dsa_v32_16mx8_32nx1_fp8_traits<16, 32, 640, 8, fp8_t, bf16_t, bf16_t>>(H, N, total_tokens, verify, dense_kv);
+    return run_dsa_v32_case<dsa_v32_16mx8_32nx1_fp8_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(H, N, total_tokens, verify, dense_kv);
 }

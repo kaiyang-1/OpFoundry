@@ -35,9 +35,9 @@ struct dsa_v32_fp8_kargs {
     float softmax_scale;
 };
 
+// Compile-time config: tile sizes, MFMA wave shapes, and derived smem layout.
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 32,
-         int D_TILE_SIZE_ = 640,
          int NUM_WARPS_ = 8,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
@@ -45,7 +45,6 @@ template<int Q_TILE_SIZE_ = 16,
 struct dsa_v32_16mx8_32nx1_fp8_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
-    static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
 
     static constexpr int WARP_SIZE = 64;
@@ -58,7 +57,6 @@ struct dsa_v32_16mx8_32nx1_fp8_traits {
 
     using D_NOPE = D_NOPE_;
     using D_ROPE = D_ROPE_;
-    using D_ATTN = D_NOPE_;
     using D_OUT  = D_OUT_;
     using D_ACC  = float;
 
@@ -87,10 +85,10 @@ struct dsa_v32_16mx8_32nx1_fp8_traits {
     static constexpr int VEC_Q_ROPE  = 8;
     static constexpr int VEC_KV_NOPE = 16;
     static constexpr int VEC_KV_ROPE = 8;
-    static constexpr int VEC_P    = 4;
     static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O    = 4;
 
+    // Smem K/V staging buffer sizes (padded to avoid bank conflicts).
     static constexpr int D_128B_NOPE_SIZE = 128 / sizeof(D_NOPE);
     static constexpr int dwordx4_size = 16;
     static constexpr int smem_linear_wave_nope = WARP_SIZE * dwordx4_size / sizeof(D_NOPE);
