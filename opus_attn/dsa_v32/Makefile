@@ -6,12 +6,12 @@ COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -fopenmp -O3 -Wall --offload
 KERNEL_FLAGS = -ffast-math -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage -save-temps=obj
 
 BUILD = build
-OUT   = $(BUILD)/pa_prefill.exe
+OUT   = $(BUILD)/dsa_v32_decode.exe
 
-KERNEL_SRCS = pa_prefill_16mx8_32nx1_fp8_kernel.cc
-HOST_SRC    = pa_host.cc
+KERNEL_SRCS = dsa_v32_decode_16mx8_32nx1_fp8_kernel.cc
+HOST_SRC    = dsa_v32_host.cc
 KERNEL_OBJS = $(patsubst %.cc,$(BUILD)/%.o,$(KERNEL_SRCS))
-HOST_OBJ    = $(BUILD)/pa_host.o
+HOST_OBJ    = $(BUILD)/dsa_v32_host.o
 
 .PHONY: all clean benchmark
 
@@ -22,11 +22,11 @@ $(BUILD):
 
 # Kernel objects (heavy — device+host passes, parallelizable via make -j)
 # -D__HIPCC_RTC__ skips implicit __clang_hip_runtime_wrapper.h on host pass (~250ms saved)
-$(BUILD)/%.o: %.cc pa_prefill_16mx8_32nx1_fp8_template.hpp pa_defs.h | $(BUILD)
+$(BUILD)/%.o: %.cc dsa_v32_decode_16mx8_32nx1_fp8_template.hpp dsa_v32_defs.h | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) -c -o $@
 
 # Host object (no -D__HIPCC_RTC__ — needs full HIP runtime for <<<>>> syntax)
-$(HOST_OBJ): $(HOST_SRC) pa_defs.h | $(BUILD)
+$(HOST_OBJ): $(HOST_SRC) dsa_v32_defs.h | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) -c -o $@
 
 # Link
