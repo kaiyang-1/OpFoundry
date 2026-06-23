@@ -28,9 +28,8 @@ static constexpr int DSA_V32_COMBINE_HEADS_PER_BLOCK = 8;
 template<class Traits>
 inline void dsa_v32_launch_pipeline(Traits, const dsa_v32_fp8_kargs& kargs,
                                     dim3 grid_main, dim3 block_main, bool run_metadata = true) {
-    if (run_metadata) {
-        get_mla_metadata_kernel<Traits><<<dim3(1), dim3(Traits::WARP_SIZE)>>>(kargs);
-    }
+    if (run_metadata)
+        get_mla_metadata_kernel<Traits><<<dim3(1), dim3(Traits::WARP_SIZE), (2 * kargs.B + 1) * (int)sizeof(int)>>>(kargs);
     dsa_v32_decode_16mx8_32nx1_fp8_kernel<Traits><<<grid_main, block_main>>>(kargs);
     const int n_head_blocks = ceil_div(kargs.H, DSA_V32_COMBINE_HEADS_PER_BLOCK);
     dim3 grid_combine(kargs.B, n_head_blocks, 1);
@@ -178,7 +177,7 @@ template<class Traits, class KArgs>
 void benchmark_dsa_v32_kernel(const KArgs& kargs, dim3 grid, dim3 block,
                               int indices_prefix_sum, int warmup = 100, int iterations = 50) {
 
-    get_mla_metadata_kernel<Traits><<<dim3(1), dim3(Traits::WARP_SIZE)>>>(kargs);
+    get_mla_metadata_kernel<Traits><<<dim3(1), dim3(Traits::WARP_SIZE), (2 * kargs.B + 1) * (int)sizeof(int)>>>(kargs);
     CHECK_HIP_KERNEL_LAUNCH();
     CHECK_HIP(hipDeviceSynchronize());
 
