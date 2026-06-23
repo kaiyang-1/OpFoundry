@@ -7,6 +7,20 @@ using fp16_t = __fp16;
 using fp8_t  = _BitInt(8);
 using bf8_t  = unsigned _BitInt(8);
 
+static constexpr int DSA_V32_NUM_CU = 256;
+static constexpr int DSA_V32_NUM_PARTS = DSA_V32_NUM_CU;
+static constexpr int DSA_V32_FIXED_OVERHEAD = 5;
+static constexpr int DSA_V32_MAX_SPLITS = 128;
+
+struct alignas(16) DsaSchedMeta {
+    int begin_req_idx;
+    int end_req_idx;
+    int begin_tile_idx;
+    int end_tile_idx;
+    int begin_split_idx;
+    int _pad[3];
+};
+
 struct dsa_v32_fp8_kargs {
     const void* __restrict__ q_nope_ptr;
     const void* __restrict__ q_scale_ptr;
@@ -17,16 +31,22 @@ struct dsa_v32_fp8_kargs {
     void* __restrict__ out_ptr;
     const int* __restrict__ kv_indptr;
     const int* __restrict__ kv_indices;
-    int N;
+
+    const DsaSchedMeta* __restrict__ sched_meta;
+    const int* __restrict__ num_splits;
+    void* __restrict__ o_accum;
+    void* __restrict__ lse_accum;
+    int num_parts;
+    int B;
     int H;
     int total_tokens;
-    int stride_q_nope_n;
+    int stride_q_nope_b;
     int stride_q_nope_h;
-    int stride_q_scale_n;
+    int stride_q_scale_b;
     int stride_q_scale_h;
-    int stride_q_rope_n;
+    int stride_q_rope_b;
     int stride_q_rope_h;
-    int stride_o_n;
+    int stride_o_b;
     int stride_o_h;
     int stride_kv_nope_page;
     int stride_kv_scale_page;
@@ -34,7 +54,6 @@ struct dsa_v32_fp8_kargs {
     float softmax_scale;
 };
 
-// Compile-time config: tile sizes, MFMA wave shapes, and derived smem layout.
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 32,
          int NUM_WARPS_ = 8,
@@ -52,7 +71,7 @@ struct dsa_v32_16mx8_32nx1_fp8_traits {
     static constexpr int D_NOPE_SIZE = 512;
     static constexpr int D_ROPE_SIZE = 64;
     static constexpr int D_HEAD_SIZE = D_NOPE_SIZE + D_ROPE_SIZE;
-    static constexpr int D_SCALE_SIZE = D_NOPE_SIZE / 32; // 16
+    static constexpr int D_SCALE_SIZE = D_NOPE_SIZE / 32;
     static constexpr int D_SCALE_PADDED_SIZE = 32;
 
     using D_NOPE = D_NOPE_;
@@ -88,7 +107,6 @@ struct dsa_v32_16mx8_32nx1_fp8_traits {
     static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O    = 4;
 
-    // Smem K/V staging buffer sizes (padded to avoid bank conflicts).
     static constexpr int D_128B_NOPE_SIZE = 128 / sizeof(D_NOPE);
     static constexpr int dwordx4_size = 16;
     static constexpr int smem_linear_wave_nope = WARP_SIZE * dwordx4_size / sizeof(D_NOPE);
@@ -96,7 +114,7 @@ struct dsa_v32_16mx8_32nx1_fp8_traits {
     static constexpr int smem_n_rpt = KV_TILE_SIZE / smem_n_per_wave;
     static constexpr int smem_d_rpt_nope = D_NOPE_SIZE / D_128B_NOPE_SIZE;
     static constexpr int smem_padding_32B_nope = 32 / sizeof(D_NOPE);
-    static constexpr size_t smem_k_nope_bytes = smem_n_rpt * smem_d_rpt_nope * (smem_linear_wave_nope + smem_padding_32B_nope) * sizeof(D_NOPE); 
+    static constexpr size_t smem_k_nope_bytes = smem_n_rpt * smem_d_rpt_nope * (smem_linear_wave_nope + smem_padding_32B_nope) * sizeof(D_NOPE);
 
     static constexpr int D_128B_ROPE_SIZE = 128 / sizeof(D_ROPE);
     static constexpr int smem_linear_wave_rope = WARP_SIZE * dwordx4_size / sizeof(D_ROPE);

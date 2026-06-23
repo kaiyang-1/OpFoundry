@@ -7,22 +7,35 @@
 #include <numeric>
 #include <memory>
 #include <vector>
+#include <bit>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
 #include <cassert>
-#include <type_traits>
 #include <omp.h>
 
-#include "dsa_v32_defs.h"
+#include "defs.h"
 
 template<class Traits>
 __global__ void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_v32_fp8_kargs kargs);
+template<class Traits>
+__global__ void get_mla_metadata_kernel(dsa_v32_fp8_kargs kargs);
+template<class Traits, int HEADS_PER_BLOCK = 8>
+__global__ void mla_combine_kernel(dsa_v32_fp8_kargs kargs);
 
-template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
-inline void dsa_v32_launch(dsa_v32_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>,
-                           const dsa_v32_fp8_kargs& kargs, dim3 grid, dim3 block) {
-    dsa_v32_decode_16mx8_32nx1_fp8_kernel<dsa_v32_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
+static constexpr int DSA_V32_COMBINE_HEADS_PER_BLOCK = 8;
+
+template<class Traits>
+inline void dsa_v32_launch_pipeline(Traits, const dsa_v32_fp8_kargs& kargs,
+                                    dim3 grid_main, dim3 block_main, bool run_metadata = true) {
+    if (run_metadata) {
+        get_mla_metadata_kernel<Traits><<<dim3(1), dim3(Traits::WARP_SIZE)>>>(kargs);
+    }
+    dsa_v32_decode_16mx8_32nx1_fp8_kernel<Traits><<<grid_main, block_main>>>(kargs);
+    const int n_head_blocks = ceil_div(kargs.H, DSA_V32_COMBINE_HEADS_PER_BLOCK);
+    dim3 grid_combine(kargs.B, n_head_blocks, 1);
+    dim3 block_combine(DSA_V32_COMBINE_HEADS_PER_BLOCK * Traits::WARP_SIZE);
+    mla_combine_kernel<Traits><<<grid_combine, block_combine>>>(kargs);
 }
 
 #define CHECK_HIP(call)                                                                                   \
@@ -72,7 +85,7 @@ void init_fp8_dsa_split(typename PATraits::D_NOPE* nope_ptr,
             uint8_t* scale = scale_ptr + r * SCALE;
             for (int i = 0; i < SCALE; i++) {
                 float s = std::exp2(scale_dis(gen));
-                uint32_t bits; std::memcpy(&bits, &s, sizeof(bits));
+                const uint32_t bits = std::bit_cast<uint32_t>(s);
                 scale[i] = static_cast<uint8_t>((bits >> 23) & 0xFF);
             }
             D_ROPE* rope = rope_ptr + r * ROPE;
@@ -83,15 +96,15 @@ void init_fp8_dsa_split(typename PATraits::D_NOPE* nope_ptr,
 
 void init_sparse_kv_indices(std::vector<int>& kv_indptr,
                             std::vector<int>& kv_indices,
-                            int N,
+                            int B,
                             int total_pages,
                             int kv_tile_size,
                             uint32_t seed = 1234) {
-    assert(N >= 0);
+    assert(B >= 0);
     assert(total_pages > 0);
     assert(kv_tile_size > 0);
 
-    kv_indptr.assign(N + 1, 0);
+    kv_indptr.assign(B + 1, 0);
     kv_indices.clear();
 
     std::mt19937 gen(seed);
@@ -114,7 +127,7 @@ void init_sparse_kv_indices(std::vector<int>& kv_indptr,
     };
     std::uniform_int_distribution<int> random_len(0, total_pages);
 
-    for (int q = 0; q < N; ++q) {
+    for (int q = 0; q < B; ++q) {
         int nnz = 0;
         if (q < static_cast<int>(boundary_lengths.size())) {
             nnz = clamp_len(boundary_lengths[q]);
@@ -130,7 +143,7 @@ void init_sparse_kv_indices(std::vector<int>& kv_indptr,
 
     assert(kv_indptr.front() == 0);
     assert(kv_indptr.back() == static_cast<int>(kv_indices.size()));
-    for (int q = 0; q < N; ++q) {
+    for (int q = 0; q < B; ++q) {
         assert(kv_indptr[q] <= kv_indptr[q + 1]);
         for (int p = kv_indptr[q]; p < kv_indptr[q + 1]; ++p) {
             assert(kv_indices[p] >= 0 && kv_indices[p] < total_pages);
@@ -140,20 +153,20 @@ void init_sparse_kv_indices(std::vector<int>& kv_indptr,
 
 void init_dense_kv_indices(std::vector<int>& kv_indptr,
                            std::vector<int>& kv_indices,
-                           int N,
+                           int B,
                            int total_pages) {
-    assert(N >= 0);
+    assert(B >= 0);
     assert(total_pages > 0);
-    const size_t total_indices = static_cast<size_t>(N) * total_pages;
+    const size_t total_indices = static_cast<size_t>(B) * total_pages;
     assert(total_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
 
-    kv_indptr.resize(N + 1);
+    kv_indptr.resize(B + 1);
     kv_indices.resize(total_indices);
 
-    for (int q = 0; q <= N; ++q) {
+    for (int q = 0; q <= B; ++q) {
         kv_indptr[q] = static_cast<int>(static_cast<size_t>(q) * total_pages);
     }
-    for (int q = 0; q < N; ++q) {
+    for (int q = 0; q < B; ++q) {
         const size_t row_begin = static_cast<size_t>(q) * total_pages;
         for (int page = 0; page < total_pages; ++page) {
             kv_indices[row_begin + page] = page;
@@ -164,8 +177,13 @@ void init_dense_kv_indices(std::vector<int>& kv_indptr,
 template<class Traits, class KArgs>
 void benchmark_dsa_v32_kernel(const KArgs& kargs, dim3 grid, dim3 block,
                               int indices_prefix_sum, int warmup = 100, int iterations = 50) {
+
+    get_mla_metadata_kernel<Traits><<<dim3(1), dim3(Traits::WARP_SIZE)>>>(kargs);
+    CHECK_HIP_KERNEL_LAUNCH();
+    CHECK_HIP(hipDeviceSynchronize());
+
     for (int i = 0; i < warmup; ++i) {
-        dsa_v32_launch(Traits{}, kargs, grid, block);
+        dsa_v32_launch_pipeline(Traits{}, kargs, grid, block, false);
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipDeviceSynchronize());
@@ -176,7 +194,7 @@ void benchmark_dsa_v32_kernel(const KArgs& kargs, dim3 grid, dim3 block,
 
     CHECK_HIP(hipEventRecord(start));
     for (int i = 0; i < iterations; ++i) {
-        dsa_v32_launch(Traits{}, kargs, grid, block);
+        dsa_v32_launch_pipeline(Traits{}, kargs, grid, block, false);
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipEventRecord(stop));
@@ -202,8 +220,8 @@ void benchmark_dsa_v32_kernel(const KArgs& kargs, dim3 grid, dim3 block,
     constexpr size_t row_bytes = Traits::D_NOPE_SIZE * sizeof(D_NOPE)
                                + Traits::D_SCALE_SIZE * sizeof(uint8_t)
                                + Traits::D_ROPE_SIZE * sizeof(D_ROPE);
-    const size_t q_bytes  = (size_t)kargs.N * kargs.H * row_bytes;
-    const size_t o_bytes  = (size_t)kargs.N * kargs.H * D_V * sizeof(D_OUT);
+    const size_t q_bytes  = (size_t)kargs.B * kargs.H * row_bytes;
+    const size_t o_bytes  = (size_t)kargs.B * kargs.H * D_V * sizeof(D_OUT);
     const size_t kv_bytes = (size_t)indices_prefix_sum * row_bytes;
     const double tbps = double(q_bytes + o_bytes + kv_bytes) / (avg_time * 1e-3) / 1e12;
 
@@ -213,10 +231,10 @@ void benchmark_dsa_v32_kernel(const KArgs& kargs, dim3 grid, dim3 block,
 
 template<typename DType>
 bool validate_dsa_v32_results(const DType* ref, const DType* gpu,
-                          int N, int H, int D,
+                          int B, int H, int D,
                           float rtol = 1e-2f, float atol = 1e-2f,
                           float tol_err_ratio = 0.05f) {
-    const size_t total_elements = (size_t)N * H * D;
+    const size_t total_elements = (size_t)B * H * D;
     constexpr size_t printNum = 10;
 
     size_t total_errors = 0, printed = 0;
@@ -224,7 +242,7 @@ bool validate_dsa_v32_results(const DType* ref, const DType* gpu,
     float max_abs_delta = 0.0f, ref_absmax = 0.0f;
     double sq_diff_sum = 0.0, ref_sq_sum = 0.0;
 
-    for (int n = 0; n < N; n++) {
+    for (int n = 0; n < B; n++) {
         for (int h = 0; h < H; h++) {
             const size_t offset = ((size_t)n * H + h) * D;
             for (int d = 0; d < D; d++) {
@@ -314,7 +332,7 @@ void dsa_v32_attention_ref_fp8(
     const typename PATraits::D_NOPE* KV_nope, const uint8_t* KV_scale, const typename PATraits::D_ROPE* KV_rope,
     typename PATraits::D_OUT* O,
     const int* kv_indptr, const int* kv_indices,
-    int N, int H)
+    int B, int H)
 {
     using O_t = typename PATraits::D_OUT;
     constexpr int D_HEAD = PATraits::D_NOPE_SIZE;
@@ -327,7 +345,7 @@ void dsa_v32_attention_ref_fp8(
 
     #pragma omp parallel for collapse(2)
     for (int h = 0; h < H; h++) {
-        for (int i = 0; i < N; i++) {
+        for (int i = 0; i < B; i++) {
             const int kv_begin = kv_indptr[i];
             const int num_rows = kv_indptr[i + 1] - kv_begin;
 
@@ -354,25 +372,24 @@ void dsa_v32_attention_ref_fp8(
     }
 }
 
-
 template<class PATraits>
-int run_dsa_v32_case(int H, int N, int total_tokens,
+int run_dsa_v32_case(int H, int B, int total_tokens,
                 bool verify, bool dense_kv) {
     using OType = typename PATraits::D_OUT;
-    printf("DSA v3.2 Decode Attention: H_Q=%d, N=%d, D=%d, NoPE=fp8, RoPE=bf16, total_tokens=%d\n",
-           H, N, PATraits::D_NOPE_SIZE, total_tokens);
+    printf("DSA v3.2 Decode Attention: H_Q=%d, B=%d, D_QK=%d, D_V=%d, NoPE=fp8, RoPE=bf16, total_tokens=%d\n",
+           H, B, PATraits::D_HEAD_SIZE, PATraits::D_NOPE_SIZE, total_tokens);
 
     constexpr int D_HEAD = PATraits::D_NOPE_SIZE;
-    const size_t o_size = (size_t)N * H * D_HEAD;
+    const size_t o_size = (size_t)B * H * D_HEAD;
 
     auto host_o_ref = std::make_unique<OType[]>(o_size);
     auto host_o_gpu = std::make_unique<OType[]>(o_size);
 
     std::vector<int> host_kv_indptr, host_kv_indices;
     if (dense_kv) {
-        init_dense_kv_indices(host_kv_indptr, host_kv_indices, N, total_tokens);
+        init_dense_kv_indices(host_kv_indptr, host_kv_indices, B, total_tokens);
     } else {
-        init_sparse_kv_indices(host_kv_indptr, host_kv_indices, N, total_tokens, PATraits::KV_TILE_SIZE, 5678);
+        init_sparse_kv_indices(host_kv_indptr, host_kv_indices, B, total_tokens, PATraits::KV_TILE_SIZE, 5678);
     }
     const size_t total_kv_indices = host_kv_indices.size();
     assert(total_kv_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
@@ -382,7 +399,6 @@ int run_dsa_v32_case(int H, int N, int total_tokens,
     int *dev_kv_indptr, *dev_kv_indices;
     const size_t kv_indices_alloc_size = std::max<size_t>(host_kv_indices.size(), 1);
     CHECK_HIP(hipMalloc(&dev_o, o_size * sizeof(OType)));
-    CHECK_HIP(hipMemset(dev_o, 0, o_size * sizeof(OType)));
     CHECK_HIP(hipMalloc(&dev_kv_indptr, host_kv_indptr.size() * sizeof(int)));
     CHECK_HIP(hipMalloc(&dev_kv_indices, kv_indices_alloc_size * sizeof(int)));
     CHECK_HIP(hipMemcpy(dev_kv_indptr, host_kv_indptr.data(), host_kv_indptr.size() * sizeof(int), hipMemcpyHostToDevice));
@@ -390,19 +406,28 @@ int run_dsa_v32_case(int H, int N, int total_tokens,
         CHECK_HIP(hipMemcpy(dev_kv_indices, host_kv_indices.data(), host_kv_indices.size() * sizeof(int), hipMemcpyHostToDevice));
 
     const int num_h_blocks = ceil_div(H, PATraits::Q_TILE_SIZE * PATraits::T_M);
-    dim3 grid(N, num_h_blocks, 1);
+    const int num_parts = DSA_V32_NUM_PARTS;
+    dim3 grid(num_parts, num_h_blocks, 1);
     dim3 block(PATraits::BLOCK_SIZE);
-    printf("DSA v3.2 kernel launch config: grid=(%d,%d,%d), block=%d (NUM_WARPS=%d)\n",
-           grid.x, grid.y, grid.z, (int)block.x, PATraits::NUM_WARPS);
+    printf("DSA v3.2 split-KV launch config: main grid=(%d,%d,%d) block=%d, num_parts=%d (NUM_WARPS=%d)\n",
+           grid.x, grid.y, grid.z, (int)block.x, num_parts, PATraits::NUM_WARPS);
+
+    const int total_splits = B + num_parts;
+    DsaSchedMeta* dev_sched_meta; int* dev_num_splits;
+    float *dev_o_accum, *dev_lse_accum;
+    CHECK_HIP(hipMalloc(&dev_sched_meta, num_parts * sizeof(DsaSchedMeta)));
+    CHECK_HIP(hipMalloc(&dev_num_splits, (B + 1) * sizeof(int)));
+    CHECK_HIP(hipMalloc(&dev_o_accum, (size_t)total_splits * H * PATraits::D_NOPE_SIZE * sizeof(float)));
+    CHECK_HIP(hipMalloc(&dev_lse_accum, (size_t)total_splits * H * sizeof(float)));
 
     int rc = 0;
     auto verify_and_bench = [&](const auto& kargs) {
-        dsa_v32_launch(PATraits{}, kargs, grid, block);
+        dsa_v32_launch_pipeline(PATraits{}, kargs, grid, block, true);
         CHECK_HIP_KERNEL_LAUNCH();
         if (verify) {
             printf("\nValidating GPU results against CPU reference...\n");
             CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, o_size * sizeof(OType), hipMemcpyDeviceToHost));
-            bool all_valid = validate_dsa_v32_results<OType>(host_o_ref.get(), host_o_gpu.get(), N, H, D_HEAD);
+            bool all_valid = validate_dsa_v32_results<OType>(host_o_ref.get(), host_o_gpu.get(), B, H, D_HEAD);
             printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
             if (!all_valid) rc = 1;
         }
@@ -418,9 +443,9 @@ int run_dsa_v32_case(int H, int N, int total_tokens,
     constexpr int NOPE = PATraits::D_NOPE_SIZE;
     constexpr int SCALE = PATraits::D_SCALE_SIZE;
     constexpr int ROPE = PATraits::D_ROPE_SIZE;
-    const size_t q_nope_size = (size_t)N * H * NOPE, q_rope_size = (size_t)N * H * ROPE;
+    const size_t q_nope_size = (size_t)B * H * NOPE, q_rope_size = (size_t)B * H * ROPE;
     const size_t kv_nope_size = (size_t)total_tokens * NOPE, kv_rope_size = (size_t)total_tokens * ROPE;
-    const size_t q_scale_size = (size_t)N * H * SCALE, kv_scale_size = (size_t)total_tokens * SCALE;
+    const size_t q_scale_size = (size_t)B * H * SCALE, kv_scale_size = (size_t)total_tokens * SCALE;
 
     auto host_q_nope = std::make_unique<D_NOPE[]>(q_nope_size);
     auto host_q_scale = std::make_unique<uint8_t[]>(q_scale_size);
@@ -428,7 +453,7 @@ int run_dsa_v32_case(int H, int N, int total_tokens,
     auto host_kv_nope = std::make_unique<D_NOPE[]>(kv_nope_size);
     auto host_kv_scale = std::make_unique<uint8_t[]>(kv_scale_size);
     auto host_kv_rope = std::make_unique<D_ROPE[]>(kv_rope_size);
-    init_fp8_dsa_split<PATraits>(host_q_nope.get(), host_q_scale.get(), host_q_rope.get(), (size_t)N * H);
+    init_fp8_dsa_split<PATraits>(host_q_nope.get(), host_q_scale.get(), host_q_rope.get(), (size_t)B * H);
     init_fp8_dsa_split<PATraits>(host_kv_nope.get(), host_kv_scale.get(), host_kv_rope.get(), (size_t)total_tokens);
 
     D_NOPE *dev_q_nope, *dev_kv_nope;
@@ -451,7 +476,7 @@ int run_dsa_v32_case(int H, int N, int total_tokens,
         dsa_v32_attention_ref_fp8<PATraits>(host_q_nope.get(), host_q_scale.get(), host_q_rope.get(),
                                             host_kv_nope.get(), host_kv_scale.get(), host_kv_rope.get(),
                                             host_o_ref.get(),
-                                            host_kv_indptr.data(), host_kv_indices.data(), N, H);
+                                            host_kv_indptr.data(), host_kv_indices.data(), B, H);
 
     dsa_v32_fp8_kargs kargs{};
     kargs.q_nope_ptr = dev_q_nope;
@@ -463,16 +488,21 @@ int run_dsa_v32_case(int H, int N, int total_tokens,
     kargs.out_ptr = dev_o;
     kargs.kv_indptr = dev_kv_indptr;
     kargs.kv_indices = dev_kv_indices;
-    kargs.N = N;
+    kargs.sched_meta = dev_sched_meta;
+    kargs.num_splits = dev_num_splits;
+    kargs.o_accum = dev_o_accum;
+    kargs.lse_accum = dev_lse_accum;
+    kargs.num_parts = num_parts;
+    kargs.B = B;
     kargs.H = H;
     kargs.total_tokens = total_tokens;
-    kargs.stride_q_nope_n = H * NOPE;
+    kargs.stride_q_nope_b = H * NOPE;
     kargs.stride_q_nope_h = NOPE;
-    kargs.stride_q_scale_n = H * SCALE;
+    kargs.stride_q_scale_b = H * SCALE;
     kargs.stride_q_scale_h = SCALE;
-    kargs.stride_q_rope_n = H * ROPE;
+    kargs.stride_q_rope_b = H * ROPE;
     kargs.stride_q_rope_h = ROPE;
-    kargs.stride_o_n = H * D_HEAD;
+    kargs.stride_o_b = H * D_HEAD;
     kargs.stride_o_h = D_HEAD;
     kargs.stride_kv_nope_page = NOPE;
     kargs.stride_kv_scale_page = SCALE;
@@ -484,6 +514,11 @@ int run_dsa_v32_case(int H, int N, int total_tokens,
     CHECK_HIP(hipFree(dev_q_nope));   CHECK_HIP(hipFree(dev_q_rope));   CHECK_HIP(hipFree(dev_q_scale));
     CHECK_HIP(hipFree(dev_kv_nope));  CHECK_HIP(hipFree(dev_kv_rope));  CHECK_HIP(hipFree(dev_kv_scale));
 
+    CHECK_HIP(hipFree(dev_sched_meta));
+    CHECK_HIP(hipFree(dev_num_splits));
+    CHECK_HIP(hipFree(dev_o_accum));
+    CHECK_HIP(hipFree(dev_lse_accum));
+
     CHECK_HIP(hipFree(dev_o));
     CHECK_HIP(hipFree(dev_kv_indptr));
     CHECK_HIP(hipFree(dev_kv_indices));
@@ -493,7 +528,7 @@ int run_dsa_v32_case(int H, int N, int total_tokens,
 
 int main(int argc, char** argv) {
     int H = 128;
-    int N = 1024;
+    int B = 128;
     int total_tokens = -1;
 
     bool verify = false;
@@ -520,17 +555,17 @@ int main(int argc, char** argv) {
             return false;
         };
         if (try_parse(H, "-h_q")) continue;
-        if (try_parse(N, "-n")) continue;
+        if (try_parse(B, "-b")) continue;
         if (try_parse(total_tokens, "-total_tokens")) continue;
     }
     if (total_tokens < 0) {
-        total_tokens = N;
+        total_tokens = B;
     }
 
-    if (H <= 0 || N <= 0 || total_tokens <= 0) {
-        std::cerr << "Invalid parameters. H_Q,N,total_tokens must be positive.\n";
+    if (H <= 0 || B <= 0 || total_tokens <= 0) {
+        std::cerr << "Invalid parameters. H_Q,B,total_tokens must be positive.\n";
         return 1;
     }
 
-    return run_dsa_v32_case<dsa_v32_16mx8_32nx1_fp8_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(H, N, total_tokens, verify, dense_kv);
+    return run_dsa_v32_case<dsa_v32_16mx8_32nx1_fp8_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(H, B, total_tokens, verify, dense_kv);
 }

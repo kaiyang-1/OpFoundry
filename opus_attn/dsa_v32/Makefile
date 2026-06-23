@@ -8,10 +8,10 @@ KERNEL_FLAGS = -ffast-math -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage
 BUILD = build
 OUT   = $(BUILD)/dsa_v32_decode.exe
 
-KERNEL_SRCS = dsa_v32_decode_16mx8_32nx1_fp8_kernel.cc
-HOST_SRC    = dsa_v32_host.cc
+KERNEL_SRCS = get_mla_metadata.cc dsa_v32_splitkv_kernel.cc mla_combine.cc
+HOST_SRC    = host.cc
 KERNEL_OBJS = $(patsubst %.cc,$(BUILD)/%.o,$(KERNEL_SRCS))
-HOST_OBJ    = $(BUILD)/dsa_v32_host.o
+HOST_OBJ    = $(BUILD)/host.o
 
 .PHONY: all clean benchmark
 
@@ -20,16 +20,16 @@ all: $(OUT)
 $(BUILD):
 	mkdir -p $(BUILD)
 
-# Kernel objects (heavy — device+host passes, parallelizable via make -j)
-# -D__HIPCC_RTC__ skips implicit __clang_hip_runtime_wrapper.h on host pass (~250ms saved)
-$(BUILD)/%.o: %.cc dsa_v32_decode_16mx8_32nx1_fp8_template.hpp dsa_v32_defs.h | $(BUILD)
+$(BUILD)/%.o: %.cc | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) -c -o $@
 
-# Host object (no -D__HIPCC_RTC__ — needs full HIP runtime for <<<>>> syntax)
-$(HOST_OBJ): $(HOST_SRC) dsa_v32_defs.h | $(BUILD)
+$(BUILD)/get_mla_metadata.o:       get_mla_metadata.hpp defs.h
+$(BUILD)/dsa_v32_splitkv_kernel.o: dsa_v32_splitkv.hpp  defs.h
+$(BUILD)/mla_combine.o:            mla_combine.hpp      defs.h
+
+$(HOST_OBJ): $(HOST_SRC) defs.h | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) -c -o $@
 
-# Link
 $(OUT): $(KERNEL_OBJS) $(HOST_OBJ)
 	$(HIPCC) $^ --offload-arch=$(ARCH) -fopenmp -o $@
 

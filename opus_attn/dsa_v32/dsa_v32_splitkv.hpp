@@ -1,7 +1,7 @@
 #pragma once
 
 #include <opus/opus.hpp>
-#include "dsa_v32_defs.h"
+#include "defs.h"
 #include <bit>
 #include <cstdint>
 
@@ -9,8 +9,6 @@ using opus::operator""_I;
 
 namespace dsa_v32_16mx8_32nx1_fp8 {
 
-// Coordinate layouts mapping each thread/lane to its Q/K/V elements across
-// gmem (g*), smem (s*) and registers (r*) for the two GEMMs.
 template<class T>
 __device__ inline auto make_layout_q_nope(int warp_id, int lane_id) {
     constexpr auto q_block_shape = opus::make_tuple(
@@ -80,7 +78,7 @@ __device__ inline auto make_layout_kv_indices(int warp_id, int lane_id) {
         opus::number<T::smem_n_per_wave>{},
         opus::number<T::smem_n_rpt>{},
         1_I);
-    
+
     constexpr auto kv_indices_dim = opus::make_tuple(
         opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
 
@@ -345,12 +343,12 @@ __device__ inline auto make_layout_rv(int lane_id) {
         opus::number<grp_n>{},
         opus::number<lane_lo>{},
         opus::number<T::VEC_TR_V>{});
-    
+
     constexpr auto rv_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}),
         opus::make_tuple(opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
         opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
-    
+
     int grp_id = lane_id / lane_per_grp;
     int lane_in_grp = lane_id % lane_per_grp;
 
@@ -395,7 +393,7 @@ __device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
     opus::static_for<s_len>([&](auto i) {
         row_max = max(row_max, v_s[i.value]);
     });
-    // Reduce the score row across the wave: fold lanes 32- then 16-apart.
+
     opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
     row_max = max(std::bit_cast<float>(res32.x), std::bit_cast<float>(res32.y));
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
@@ -426,7 +424,7 @@ __device__ inline typename T::D_ACC attn_row_sum(const V& v_s) {
     opus::static_for<s_len>([&](auto i) {
         row_sum += v_s[i.value];
     });
-    // Reduce the score row across the wave: fold lanes 32- then 16-apart.
+
     opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
     row_sum = std::bit_cast<float>(res32.x) + std::bit_cast<float>(res32.y);
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
@@ -449,7 +447,6 @@ __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr, opus::u32_t neg_
     );
 }
 
-// Set scores of out-of-bounds KV positions (beyond valid_kv_len) to -inf.
 template<typename T, typename V>
 __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_tile_idx, opus::u32_t neg_inf_v) {
     using D_ACC = typename T::D_ACC;
@@ -493,12 +490,9 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
     });
 }
 
-// Flash-attention accumulation over the KV tiles of one query: for each tile,
-// compute QK^T (NoPE fp8 + RoPE bf16), update the online softmax running
-// max/sum (m_row/l_row), then accumulate P*V into v_o.
 template<class Traits, class VQN, class VQR, class VO>
 __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
-                                               int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+                                               int page_idx_begin, int valid_kv_len, int tile_begin, int tile_end,
                                                char* smem_kv, char* smem_kv_scale,
                                                VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
                                                typename Traits::D_ACC& m_row, typename Traits::D_ACC& l_row,
@@ -627,8 +621,8 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
         }
     };
 
-    for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
-        // Stage this tile's K (NoPE + RoPE) from gmem into smem.
+    for (int tile_idx = tile_begin; tile_idx < tile_end; ++tile_idx) {
+
         const int kv_page = load_kv_page(tile_idx);
         async_load<T::VEC_KV_NOPE>(g_k_nope, s_k_nope.ptr, u_gk_nope + kv_nope_offset(kv_page), u_sk_nope);
         if (warp_id < 4) {
@@ -639,7 +633,6 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
-        // GEMM0: scores = Q*K^T, summing the fp8 NoPE and bf16 RoPE parts.
         auto v_k_mxscl = load<1>(s_k_mxscl, u_rk_mxscl);
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
@@ -647,7 +640,6 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
         compute_qk_nope(v_s, v_q_nope_slices, v_k_nope, scale_q, v_k_mxscl);
         compute_qk_rope(v_s, v_q_rope_slices, v_k_rope);
 
-        // Dequantize V (= NoPE K) from fp8 to bf16 using its e8m0 scale, into smem.
         auto v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
         const u32_t e8m0 = (reinterpret_cast<u32_t*>(&v_k_mxscl)[warp_id % T::GEMM0_E_N] >> (int(warp_id / T::GEMM0_E_N) * 8)) & 0xFFu;
         const float scale = std::bit_cast<float>(e8m0 << 23);
@@ -667,7 +659,6 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
         static_for<s_len>([&](auto i) { v_s[i.value] *= temperature_scale; });
         mask_oob_scores(v_s, tile_idx);
 
-        // Online softmax: rescale the running stats/output by the new row max.
         D_ACC row_max = max(m_row, attn_row_max<T>(v_s));
         D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
@@ -681,7 +672,6 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
-        // GEMM1: accumulate P*V (transpose-loading V slices from smem).
         v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv);
         v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
@@ -691,39 +681,32 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
     }
 }
 
-}
-
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_v32_fp8_kargs kargs) {
+__device__ void dsa_v32_decode_one_req(dsa_v32_fp8_kargs kargs, int batch_idx, int h_block_idx,
+                                       int tile_begin, int tile_end, int slot,
+                                       char* smem_kv, char* smem_kv_scale, float temperature_scale) {
     using namespace opus;
-    using namespace dsa_v32_16mx8_32nx1_fp8;
     using T = opus::remove_cvref_t<Traits>;
     using D_NOPE = typename T::D_NOPE;
     using D_ROPE = typename T::D_ROPE;
     using D_ACC = typename T::D_ACC;
-
-    const int q_token_idx = block_id_x();
-    const int h_block_idx = block_id_y();
+    using D_OUT = typename T::D_OUT;
 
     const int lane_id = thread_id_x() % T::WARP_SIZE;
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE;
-    const int q_nope_gmem_offset = q_token_idx * kargs.stride_q_nope_n + h_block_start * kargs.stride_q_nope_h;
-    const int q_rope_gmem_offset = q_token_idx * kargs.stride_q_rope_n + h_block_start * kargs.stride_q_rope_h;
-    const int q_scale_gmem_offset = q_token_idx * kargs.stride_q_scale_n + h_block_start * kargs.stride_q_scale_h;
+    const int q_nope_gmem_offset  = batch_idx * kargs.stride_q_nope_b  + h_block_start * kargs.stride_q_nope_h;
+    const int q_rope_gmem_offset  = batch_idx * kargs.stride_q_rope_b  + h_block_start * kargs.stride_q_rope_h;
+    const int q_scale_gmem_offset = batch_idx * kargs.stride_q_scale_b + h_block_start * kargs.stride_q_scale_h;
 
-    __shared__ char smem_kv[T::smem_size_bytes()];
-    __shared__ char smem_kv_scale[T::KV_TILE_SIZE * T::D_SCALE_PADDED_SIZE * sizeof(D_NOPE)];
-
-    constexpr float LOG2_E = 1.44269504089f;
-    const float temperature_scale = kargs.softmax_scale * LOG2_E;
+    const int page_idx_begin = kargs.kv_indptr[batch_idx];
+    const int valid_kv_len   = kargs.kv_indptr[batch_idx + 1] - page_idx_begin;
 
     auto g_q_nope = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.q_nope_ptr) + q_nope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_nope_h * sizeof(D_NOPE));
     auto g_q_rope = make_gmem(reinterpret_cast<const D_ROPE*>(kargs.q_rope_ptr) + q_rope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_rope_h * sizeof(D_ROPE));
     auto g_q_scale = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.q_scale_ptr) + q_scale_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_scale_h * sizeof(D_NOPE));
 
-    // Load this block's Q (NoPE fp8 + scale, RoPE bf16) into registers.
     auto u_q_nope = make_layout_q_nope<T>(warp_id, lane_id);
     auto v_q_nope = load<T::VEC_Q_NOPE>(g_q_nope, u_q_nope);
 
@@ -739,26 +722,75 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_16mx8_32
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
 
-    {
-        const int page_idx_begin = kargs.kv_indptr[q_token_idx];
-        const int valid_kv_len   = kargs.kv_indptr[q_token_idx + 1] - page_idx_begin;
-        const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+    dsa_v32_decode_accum_le2_tiles<Traits>(kargs, page_idx_begin, valid_kv_len, tile_begin, tile_end,
+                                           smem_kv, smem_kv_scale,
+                                           v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row, temperature_scale);
 
-        dsa_v32_decode_accum_le2_tiles<Traits>(kargs, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_kv_scale,
-                                               v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row, temperature_scale);
-    }
-
-    // Normalize the attention output by the softmax denominator.
     D_ACC o_scale = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
 
-    using D_OUT = typename T::D_OUT;
-    const int o_gmem_offset = q_token_idx * kargs.stride_o_n + h_block_start * kargs.stride_o_h;
-    auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
     int lane_id_o = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id_o));
     int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
-    auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
-    auto v_o_out = cast<D_OUT>(v_o);
-    store<T::VEC_O>(g_o, v_o_out, u_o);
+
+    if (slot < 0) {
+
+        const int o_gmem_offset = batch_idx * kargs.stride_o_b + h_block_start * kargs.stride_o_h;
+        auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
+        auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
+        auto v_o_out = cast<D_OUT>(v_o);
+        store<T::VEC_O>(g_o, v_o_out, u_o);
+    }
+    if (slot >= 0) {
+
+        const int oa_offset = slot * kargs.H * T::D_NOPE_SIZE + h_block_start * T::D_NOPE_SIZE;
+        auto g_oa = make_gmem(reinterpret_cast<D_ACC*>(kargs.o_accum) + oa_offset, (kargs.H - h_block_start) * T::D_NOPE_SIZE * sizeof(D_ACC));
+        auto u_oa = make_layout_o<T>(warp_id_o, lane_id_o, T::D_NOPE_SIZE);
+        store<T::VEC_O>(g_oa, v_o, u_oa);
+
+        if (lane_id < T::W_M) {
+            const int head = h_block_start + warp_id * T::Q_TILE_SIZE + lane_id;
+            const D_ACC lse = (l_row > D_ACC(0.0f)) ? (m_row + log2f(l_row)) : -3.0e38f;
+            reinterpret_cast<D_ACC*>(kargs.lse_accum)[slot * kargs.H + head] = lse;
+        }
+    }
+}
+
+}
+
+template<class Traits>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_v32_fp8_kargs kargs) {
+    using namespace opus;
+    using namespace dsa_v32_16mx8_32nx1_fp8;
+    using T = opus::remove_cvref_t<Traits>;
+    using D_NOPE = typename T::D_NOPE;
+
+    const int part = block_id_x();
+    const int h_block_idx = block_id_y();
+    if (part >= kargs.num_parts) return;
+
+    const DsaSchedMeta meta = kargs.sched_meta[part];
+    if (meta.begin_req_idx >= kargs.B) return;
+
+    __shared__ char smem_kv[T::smem_size_bytes()];
+    __shared__ char smem_kv_scale[T::KV_TILE_SIZE * T::D_SCALE_PADDED_SIZE * sizeof(D_NOPE)];
+
+    constexpr float LOG2_E = 1.44269504089f;
+    const float temperature_scale = kargs.softmax_scale * LOG2_E;
+
+    for (int req = meta.begin_req_idx; req <= meta.end_req_idx; ++req) {
+        const int valid_kv_len = kargs.kv_indptr[req + 1] - kargs.kv_indptr[req];
+        const int num_tiles    = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+
+        const int tile_begin = (req == meta.begin_req_idx) ? meta.begin_tile_idx : 0;
+        const int tile_end   = (req == meta.end_req_idx)   ? meta.end_tile_idx   : num_tiles;
+
+        const int nsplit = kargs.num_splits[req + 1] - kargs.num_splits[req];
+        const bool is_no_split = (nsplit <= 1);
+        const int n_split_idx = (req == meta.begin_req_idx) ? meta.begin_split_idx : 0;
+        const int slot = is_no_split ? -1 : (kargs.num_splits[req] + n_split_idx);
+
+        dsa_v32_decode_one_req<Traits>(kargs, req, h_block_idx, tile_begin, tile_end, slot,
+                                       smem_kv, smem_kv_scale, temperature_scale);
+    }
 }
