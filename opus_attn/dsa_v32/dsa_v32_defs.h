@@ -14,7 +14,6 @@ struct dsa_v32_fp8_kargs {
     const void* __restrict__ kv_nope_ptr;
     const void* __restrict__ kv_scale_ptr;
     const void* __restrict__ kv_rope_ptr;
-    const void* __restrict__ attn_sink_ptr;
     void* __restrict__ out_ptr;
     const int* __restrict__ kv_indptr;
     const int* __restrict__ kv_indices;

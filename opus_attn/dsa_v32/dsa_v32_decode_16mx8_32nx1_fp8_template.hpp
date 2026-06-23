@@ -748,14 +748,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_16mx8_32
                                                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row, temperature_scale);
     }
 
-    // Fold the per-head attention sink into the softmax denominator, then normalize.
-    const int sink_head_idx = h_block_start + warp_id * T::Q_TILE_SIZE + (lane_id % T::W_M);
-    auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
-    D_ACC sink_log2 = load(g_attn_sink, sink_head_idx)[0] * LOG2_E;
-    D_ACC m_final = max(m_row, sink_log2);
-    D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_final);
-    D_ACC l_final = l_row * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);
-    D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
+    // Normalize the attention output by the softmax denominator.
+    D_ACC o_scale = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
 
     using D_OUT = typename T::D_OUT;

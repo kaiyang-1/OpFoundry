@@ -283,7 +283,7 @@ inline void dequant_dsa_row_fp8(const typename PATraits::D_NOPE* nrow,
 
 template<class PATraits>
 inline void dsa_v32_attention_compute(const float* q_dense, const float* kv_dense, int num_rows,
-                                 float sink, typename PATraits::D_OUT* o_row) {
+                                      typename PATraits::D_OUT* o_row) {
     using O_t = typename PATraits::D_OUT;
     constexpr int D_QK = PATraits::D_HEAD_SIZE;
     constexpr int D_V  = PATraits::D_NOPE_SIZE;
@@ -296,10 +296,9 @@ inline void dsa_v32_attention_compute(const float* q_dense, const float* kv_dens
         for (int d = 0; d < D_QK; d++) dot += q_dense[d] * k[d];
         scores[p] = dot * softmax_scale;
     }
-    float max_score = std::max(*std::max_element(scores.begin(), scores.end()), sink);
+    float max_score = *std::max_element(scores.begin(), scores.end());
     float sum_exp = 0.0f;
     for (int p = 0; p < num_rows; p++) { scores[p] = std::exp(scores[p] - max_score); sum_exp += scores[p]; }
-    sum_exp += std::exp(sink - max_score);
     for (int p = 0; p < num_rows; p++)
         scores[p] = static_cast<float>(static_cast<bf16_t>(scores[p] / sum_exp));
     for (int d = 0; d < D_V; d++) {
@@ -313,7 +312,6 @@ template<class PATraits>
 void dsa_v32_attention_ref_fp8(
     const typename PATraits::D_NOPE* Q_nope, const uint8_t* Q_scale, const typename PATraits::D_ROPE* Q_rope,
     const typename PATraits::D_NOPE* KV_nope, const uint8_t* KV_scale, const typename PATraits::D_ROPE* KV_rope,
-    const float* AttnSink,
     typename PATraits::D_OUT* O,
     const int* kv_indptr, const int* kv_indices,
     int N, int H)
@@ -351,7 +349,7 @@ void dsa_v32_attention_ref_fp8(
                                               kv_dense.data() + (size_t)p * D_QK);
             }
 
-            dsa_v32_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, AttnSink[h], o_row);
+            dsa_v32_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, o_row);
         }
     }
 }
@@ -367,10 +365,8 @@ int run_dsa_v32_case(int H, int N, int total_tokens,
     constexpr int D_HEAD = PATraits::D_NOPE_SIZE;
     const size_t o_size = (size_t)N * H * D_HEAD;
 
-    auto host_attn_sink = std::make_unique<float[]>(H);
     auto host_o_ref = std::make_unique<OType[]>(o_size);
     auto host_o_gpu = std::make_unique<OType[]>(o_size);
-    rand_vector(host_attn_sink.get(), H, -2.f, 2.f);
 
     std::vector<int> host_kv_indptr, host_kv_indices;
     if (dense_kv) {
@@ -382,16 +378,13 @@ int run_dsa_v32_case(int H, int N, int total_tokens,
     assert(total_kv_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
     const int total_kv_count = static_cast<int>(total_kv_indices);
 
-    float *dev_attn_sink;
     OType *dev_o;
     int *dev_kv_indptr, *dev_kv_indices;
     const size_t kv_indices_alloc_size = std::max<size_t>(host_kv_indices.size(), 1);
-    CHECK_HIP(hipMalloc(&dev_attn_sink, H * sizeof(float)));
     CHECK_HIP(hipMalloc(&dev_o, o_size * sizeof(OType)));
     CHECK_HIP(hipMemset(dev_o, 0, o_size * sizeof(OType)));
     CHECK_HIP(hipMalloc(&dev_kv_indptr, host_kv_indptr.size() * sizeof(int)));
     CHECK_HIP(hipMalloc(&dev_kv_indices, kv_indices_alloc_size * sizeof(int)));
-    CHECK_HIP(hipMemcpy(dev_attn_sink, host_attn_sink.get(), H * sizeof(float), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(dev_kv_indptr, host_kv_indptr.data(), host_kv_indptr.size() * sizeof(int), hipMemcpyHostToDevice));
     if (!host_kv_indices.empty())
         CHECK_HIP(hipMemcpy(dev_kv_indices, host_kv_indices.data(), host_kv_indices.size() * sizeof(int), hipMemcpyHostToDevice));
@@ -456,9 +449,9 @@ int run_dsa_v32_case(int H, int N, int total_tokens,
 
     if (verify)
         dsa_v32_attention_ref_fp8<PATraits>(host_q_nope.get(), host_q_scale.get(), host_q_rope.get(),
-                                       host_kv_nope.get(), host_kv_scale.get(), host_kv_rope.get(),
-                                       host_attn_sink.get(), host_o_ref.get(),
-                                       host_kv_indptr.data(), host_kv_indices.data(), N, H);
+                                            host_kv_nope.get(), host_kv_scale.get(), host_kv_rope.get(),
+                                            host_o_ref.get(),
+                                            host_kv_indptr.data(), host_kv_indices.data(), N, H);
 
     dsa_v32_fp8_kargs kargs{};
     kargs.q_nope_ptr = dev_q_nope;
@@ -467,7 +460,6 @@ int run_dsa_v32_case(int H, int N, int total_tokens,
     kargs.kv_nope_ptr = dev_kv_nope;
     kargs.kv_scale_ptr = dev_kv_scale;
     kargs.kv_rope_ptr = dev_kv_rope;
-    kargs.attn_sink_ptr = dev_attn_sink;
     kargs.out_ptr = dev_o;
     kargs.kv_indptr = dev_kv_indptr;
     kargs.kv_indices = dev_kv_indices;
@@ -492,7 +484,6 @@ int run_dsa_v32_case(int H, int N, int total_tokens,
     CHECK_HIP(hipFree(dev_q_nope));   CHECK_HIP(hipFree(dev_q_rope));   CHECK_HIP(hipFree(dev_q_scale));
     CHECK_HIP(hipFree(dev_kv_nope));  CHECK_HIP(hipFree(dev_kv_rope));  CHECK_HIP(hipFree(dev_kv_scale));
 
-    CHECK_HIP(hipFree(dev_attn_sink));
     CHECK_HIP(hipFree(dev_o));
     CHECK_HIP(hipFree(dev_kv_indptr));
     CHECK_HIP(hipFree(dev_kv_indices));
