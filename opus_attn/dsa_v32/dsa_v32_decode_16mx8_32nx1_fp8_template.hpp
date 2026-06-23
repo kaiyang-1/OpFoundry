@@ -241,7 +241,7 @@ __device__ inline auto make_layout_sk_mxscl(int warp_id) {
 
     return opus::make_layout(
         sk_block_shape,
-        opus::unfold_x_stride(sk_block_dim, sk_block_shape, opus::tuple{opus::number<T::WARP_SIZE * 4>{}, 1_I}),
+        opus::unfold_x_stride(sk_block_dim, sk_block_shape, opus::tuple{opus::number<T::WARP_SIZE * 4 + T::smem_mxscl_padding>{}, 1_I}),
         opus::unfold_p_coord(sk_block_dim, opus::tuple{warp_id % T::smem_n_rpt}));
 }
 
@@ -266,7 +266,7 @@ __device__ inline auto make_layout_rk_mxscl(int lane_id) {
 
     return opus::make_layout(
         rk_block_shape,
-        opus::unfold_x_stride(rk_block_dim, rk_block_shape, opus::tuple{opus::number<T::D_SCALE_PADDED_SIZE * T::smem_n_per_wave>{},
+        opus::unfold_x_stride(rk_block_dim, rk_block_shape, opus::tuple{opus::number<T::D_SCALE_PADDED_SIZE * T::smem_n_per_wave + T::smem_mxscl_padding>{},
                                                                         opus::number<T::D_SCALE_PADDED_SIZE>{},
                                                                         1_I,
                                                                         opus::number<blocks_per_step>{}}),
@@ -685,6 +685,7 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
         v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv);
         v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
+        __builtin_amdgcn_sched_barrier(0);
         compute_pv(v_p, v_v, v_o_slices);
         __builtin_amdgcn_s_barrier();
     }

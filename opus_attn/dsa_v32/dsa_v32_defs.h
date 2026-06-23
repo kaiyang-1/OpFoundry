@@ -108,6 +108,8 @@ struct dsa_v32_16mx8_32nx1_fp8_traits {
     static constexpr int smem_v_padding = 32 / sizeof(D_ROPE);
     static constexpr size_t smem_v_bytes = KV_TILE_SIZE * (D_NOPE_SIZE + smem_v_padding) * sizeof(D_ROPE);
 
+    static constexpr int smem_mxscl_padding = 4 / sizeof(D_NOPE);
+
     static constexpr size_t smem_size_bytes() {
         return std::max(smem_k_nope_bytes + smem_k_rope_bytes, smem_v_bytes);
     }
