@@ -51,9 +51,10 @@ struct dsa_v32_16mx8_32nx1_fp8_traits {
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
 
     static constexpr int D_NOPE_SIZE = 512;
-    static constexpr int D_SCALE_SIZE = D_NOPE_SIZE / 32;
     static constexpr int D_ROPE_SIZE = 64;
     static constexpr int D_HEAD_SIZE = D_NOPE_SIZE + D_ROPE_SIZE;
+    static constexpr int D_SCALE_SIZE = D_NOPE_SIZE / 32; // 16
+    static constexpr int D_SCALE_PADDED_SIZE = 32;
 
     using D_NOPE = D_NOPE_;
     using D_ROPE = D_ROPE_;
@@ -104,7 +105,7 @@ struct dsa_v32_16mx8_32nx1_fp8_traits {
     static constexpr int smem_padding_32B_rope = 32 / sizeof(D_ROPE);
     static constexpr size_t smem_k_rope_bytes = smem_n_rpt * smem_d_rpt_rope * (smem_linear_wave_rope + smem_padding_32B_rope) * sizeof(D_ROPE);
 
-    static constexpr int smem_v_padding = dwordx4_size / sizeof(D_ROPE);
+    static constexpr int smem_v_padding = 32 / sizeof(D_ROPE);
     static constexpr size_t smem_v_bytes = KV_TILE_SIZE * (D_NOPE_SIZE + smem_v_padding) * sizeof(D_ROPE);
 
     static constexpr size_t smem_size_bytes() {

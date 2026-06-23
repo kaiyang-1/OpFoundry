@@ -72,6 +72,24 @@ __device__ inline auto make_layout_q_mxscl(int warp_id, int lane_id) {
         opus::unfold_p_coord(q_block_dim, opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
 }
 
+template<class T>
+__device__ inline auto make_layout_kv_indices(int warp_id, int lane_id) {
+    constexpr int threads_d = T::D_128B_NOPE_SIZE / T::VEC_Q_NOPE;
+
+    constexpr auto kv_indices_shape = opus::make_tuple(
+        opus::number<T::smem_n_per_wave>{},
+        opus::number<T::smem_n_rpt>{},
+        1_I);
+    
+    constexpr auto kv_indices_dim = opus::make_tuple(
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout(
+        kv_indices_shape,
+        opus::unfold_x_stride(kv_indices_dim, kv_indices_shape, opus::tuple{1_I}),
+        opus::unfold_p_coord(kv_indices_dim, opus::tuple{lane_id / threads_d, warp_id % T::smem_n_rpt}));
+}
+
 template<typename T>
 __device__ inline auto make_layout_gk_nope(int warp_id, int lane_id) {
     constexpr int threads_d = T::D_128B_NOPE_SIZE / T::VEC_KV_NOPE;
@@ -133,7 +151,7 @@ __device__ inline auto make_layout_rk_nope(int lane_id) {
 }
 
 template<typename T>
-__device__ inline auto make_layout_gk_rope(int warp_id, int lane_id) {
+__device__ inline auto make_layout_gk_rope(int lane_id) {
     constexpr int threads_d = T::D_128B_ROPE_SIZE / T::VEC_KV_ROPE;
 
     constexpr auto gk_block_shape = opus::make_tuple(
@@ -193,21 +211,66 @@ __device__ inline auto make_layout_rk_rope(int lane_id) {
 }
 
 template<typename T>
-__device__ inline auto make_layout_rk_mxscl(int lane_id) {
-    constexpr int blocks_per_step = T::W_K_NOPE / 32;
+__device__ inline auto make_layout_gk_mxscl(int lane_id) {
+    constexpr int threads_d = T::D_128B_ROPE_SIZE / T::VEC_KV_ROPE;
 
-    constexpr auto rk_mxscl_block_shape = opus::make_tuple(
-        opus::number<blocks_per_step>{},
-        opus::number<T::GEMM0_NOPE_E_K>{});
+    constexpr auto gk_block_shape = opus::make_tuple(
+        opus::number<threads_d>{},
+        4_I);
 
-    constexpr auto rk_mxscl_block_dim = opus::make_tuple(
+    constexpr auto gk_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout(
+        gk_block_shape,
+        opus::unfold_x_stride(gk_block_dim, gk_block_shape, opus::tuple{1_I}),
+        opus::unfold_p_coord(gk_block_dim, opus::tuple{lane_id % threads_d}));
+}
+
+template<typename T>
+__device__ inline auto make_layout_sk_mxscl(int warp_id) {
+    static_assert(T::WARP_SIZE * 4 == T::D_SCALE_PADDED_SIZE * T::smem_n_per_wave);
+
+    constexpr auto sk_block_shape = opus::make_tuple(
+        opus::number<T::smem_n_rpt>{},
+        4_I);
+
+    constexpr auto sk_block_dim = opus::make_tuple(
         opus::make_tuple(opus::p_dim{}),
         opus::make_tuple(opus::y_dim{}));
 
     return opus::make_layout(
-        rk_mxscl_block_shape,
-        opus::unfold_x_stride(rk_mxscl_block_dim, rk_mxscl_block_shape, opus::tuple{1_I, opus::number<blocks_per_step>{}}),
-        opus::unfold_p_coord(rk_mxscl_block_dim, opus::tuple{lane_id / T::W_N}));
+        sk_block_shape,
+        opus::unfold_x_stride(sk_block_dim, sk_block_shape, opus::tuple{opus::number<T::WARP_SIZE * 4>{}, 1_I}),
+        opus::unfold_p_coord(sk_block_dim, opus::tuple{warp_id % T::smem_n_rpt}));
+}
+
+template<typename T>
+__device__ inline auto make_layout_rk_mxscl(int lane_id) {
+    constexpr int blocks_per_step = T::W_K_NOPE / 32;
+
+    constexpr auto rk_block_shape = opus::make_tuple(
+        opus::number<T::smem_n_rpt>{},
+        opus::number<T::GEMM0_E_N>{},
+        opus::number<T::W_N / T::smem_n_rpt>{},
+        opus::number<blocks_per_step>{},
+        opus::number<T::GEMM0_NOPE_E_K>{});
+
+    constexpr auto rk_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}));
+
+    auto lane_id_n = lane_id % T::W_N;
+
+    return opus::make_layout(
+        rk_block_shape,
+        opus::unfold_x_stride(rk_block_dim, rk_block_shape, opus::tuple{opus::number<T::D_SCALE_PADDED_SIZE * T::smem_n_per_wave>{},
+                                                                        opus::number<T::D_SCALE_PADDED_SIZE>{},
+                                                                        1_I,
+                                                                        opus::number<blocks_per_step>{}}),
+        opus::unfold_p_coord(rk_block_dim, opus::tuple{lane_id_n % T::smem_n_rpt, lane_id_n / T::smem_n_rpt, lane_id / T::W_N}));
 }
 
 template<typename T>
@@ -436,7 +499,7 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
 template<class Traits, class VQN, class VQR, class VO>
 __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
                                                int page_idx_begin, int valid_kv_len, int num_kv_tiles,
-                                               char* smem_kv,
+                                               char* smem_kv, char* smem_kv_scale,
                                                VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
                                                typename Traits::D_ACC& m_row, typename Traits::D_ACC& l_row,
                                                float temperature_scale) {
@@ -457,16 +520,21 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
 
     auto s_k_nope = make_smem(reinterpret_cast<D_NOPE*>(smem_kv));
     auto s_k_rope = make_smem(reinterpret_cast<D_ROPE*>(smem_kv + T::smem_k_nope_bytes));
+    auto s_k_mxscl = make_smem(reinterpret_cast<D_NOPE*>(smem_kv_scale));
     auto s_v = make_smem(reinterpret_cast<D_ROPE*>(smem_kv));
+
+    auto u_kv_indices = make_layout_kv_indices<T>(warp_id, lane_id);
 
     auto u_gk_nope    = make_layout_gk_nope<T>(warp_id, lane_id);
     auto u_sk_nope    = make_layout_sk_nope<T>(warp_id);
     auto u_rk_nope    = make_layout_rk_nope<T>(lane_id);
 
-    auto u_gk_rope    = make_layout_gk_rope<T>(warp_id, lane_id);
+    auto u_gk_rope    = make_layout_gk_rope<T>(lane_id);
     auto u_sk_rope    = make_layout_sk_rope<T>(warp_id);
     auto u_rk_rope    = make_layout_rk_rope<T>(lane_id);
 
+    auto u_gk_mxscl   = make_layout_gk_mxscl<T>(lane_id);
+    auto u_sk_mxscl   = make_layout_sk_mxscl<T>(warp_id);
     auto u_rk_mxscl   = make_layout_rk_mxscl<T>(lane_id);
 
     auto u_sv_dequant = make_layout_sv_dequant<T>(warp_id, lane_id);
@@ -508,19 +576,7 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
         return number<s * T::SLICE_D>{};
     };
 
-    auto load_kv_page = [&](int tile_idx) {
-        constexpr int threads_d = T::D_128B_NOPE_SIZE / T::VEC_KV_NOPE;
-        const int tok = tile_idx * T::KV_TILE_SIZE + (lane_id / threads_d) * T::smem_n_rpt + (warp_id % T::smem_n_rpt);
-        return g_kv_indices.load(tok)[0];
-    };
-    auto load_kv_scale_pages = [&](int tile_idx) {
-        vector_t<int, T::GEMM0_E_N> pages;
-        static_for<T::GEMM0_E_N>([&](auto en) {
-            const int tok = tile_idx * T::KV_TILE_SIZE + en.value * T::W_N + (lane_id % T::W_N);
-            pages[en.value] = g_kv_indices.load(tok)[0];
-        });
-        return pages;
-    };
+    auto load_kv_page = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
     auto kv_nope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_nope_page; };
     auto kv_rope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_rope_page; };
 
@@ -575,16 +631,16 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
         // Stage this tile's K (NoPE + RoPE) from gmem into smem.
         const int kv_page = load_kv_page(tile_idx);
         async_load<T::VEC_KV_NOPE>(g_k_nope, s_k_nope.ptr, u_gk_nope + kv_nope_offset(kv_page), u_sk_nope);
-        async_load<T::VEC_KV_ROPE>(g_k_rope, s_k_rope.ptr, u_gk_rope + kv_rope_offset(kv_page), u_sk_rope);
+        if (warp_id < 4) {
+            async_load<T::VEC_KV_ROPE>(g_k_rope, s_k_rope.ptr, u_gk_rope + kv_rope_offset(kv_page), u_sk_rope);
+        } else {
+            async_load<4>(g_kv_scale, s_k_mxscl.ptr, u_gk_mxscl + kv_page * kargs.stride_kv_scale_page, u_sk_mxscl);
+        }
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
-        vector_t<D_NOPE, T::GEMM0_E_N * T::GEMM0_NOPE_E_K> v_k_mxscl;
-        auto kv_scale_pages = load_kv_scale_pages(tile_idx);
-        static_for<T::GEMM0_E_N>([&](auto en) {
-            reinterpret_cast<vector_t<D_NOPE, T::GEMM0_NOPE_E_K>*>(&v_k_mxscl)[en.value] = load<1>(g_kv_scale, u_rk_mxscl + kv_scale_pages[en.value] * kargs.stride_kv_scale_page);
-        });
         // GEMM0: scores = Q*K^T, summing the fp8 NoPE and bf16 RoPE parts.
+        auto v_k_mxscl = load<1>(s_k_mxscl, u_rk_mxscl);
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
@@ -657,6 +713,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_16mx8_32
     const int q_scale_gmem_offset = q_token_idx * kargs.stride_q_scale_n + h_block_start * kargs.stride_q_scale_h;
 
     __shared__ char smem_kv[T::smem_size_bytes()];
+    __shared__ char smem_kv_scale[T::KV_TILE_SIZE * T::D_SCALE_PADDED_SIZE * sizeof(D_NOPE)];
 
     constexpr float LOG2_E = 1.44269504089f;
     const float temperature_scale = kargs.softmax_scale * LOG2_E;
@@ -686,9 +743,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_16mx8_32
         const int valid_kv_len   = kargs.kv_indptr[q_token_idx + 1] - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        dsa_v32_decode_accum_le2_tiles<Traits>(kargs, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv,
-                                               v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
-                                               temperature_scale);
+        dsa_v32_decode_accum_le2_tiles<Traits>(kargs, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_kv_scale,
+                                               v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row, temperature_scale);
     }
 
     // Fold the per-head attention sink into the softmax denominator, then normalize.
