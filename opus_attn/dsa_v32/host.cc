@@ -17,16 +17,16 @@
 #include "defs.h"
 
 template<class Traits>
-__global__ void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_v32_fp8_kargs kargs);
+__global__ void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_kargs kargs);
 template<class Traits>
-__global__ void get_mla_metadata_kernel(dsa_v32_fp8_kargs kargs);
+__global__ void get_mla_metadata_kernel(dsa_kargs kargs);
 template<class Traits, int HEADS_PER_BLOCK = 8>
-__global__ void mla_combine_kernel(dsa_v32_fp8_kargs kargs);
+__global__ void mla_combine_kernel(dsa_kargs kargs);
 
 static constexpr int DSA_V32_COMBINE_HEADS_PER_BLOCK = 8;
 
 template<class Traits>
-inline void dsa_v32_launch_pipeline(Traits, const dsa_v32_fp8_kargs& kargs,
+inline void dsa_v32_launch_pipeline(Traits, const dsa_kargs& kargs,
                                     dim3 grid_main, dim3 block_main, bool run_metadata = true) {
     if (run_metadata)
         get_mla_metadata_kernel<Traits><<<dim3(1), dim3(Traits::WARP_SIZE), (2 * kargs.B + 1) * (int)sizeof(int)>>>(kargs);
@@ -241,9 +241,9 @@ bool validate_dsa_v32_results(const DType* ref, const DType* gpu,
     float max_abs_delta = 0.0f, ref_absmax = 0.0f;
     double sq_diff_sum = 0.0, ref_sq_sum = 0.0;
 
-    for (int n = 0; n < B; n++) {
+    for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
-            const size_t offset = ((size_t)n * H + h) * D;
+            const size_t offset = ((size_t)b * H + h) * D;
             for (int d = 0; d < D; d++) {
                 const float ref_val = static_cast<float>(ref[offset + d]);
                 const float gpu_val = static_cast<float>(gpu[offset + d]);
@@ -259,8 +259,8 @@ bool validate_dsa_v32_results(const DType* ref, const DType* gpu,
                     total_errors++;
                     max_abs_delta = std::max(max_abs_delta, delta);
                     if (printed++ < printNum)
-                        printf("  mismatch [n=%d,h=%d,d=%d] ref=%.6f gpu=%.6f delta=%.6f\n",
-                               n, h, d, ref_val, gpu_val, delta);
+                        printf("  mismatch [b=%d,h=%d,d=%d] ref=%.6f gpu=%.6f delta=%.6f\n",
+                               b, h, d, ref_val, gpu_val, delta);
                 }
             }
         }
@@ -477,7 +477,7 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
                                             host_o_ref.get(),
                                             host_kv_indptr.data(), host_kv_indices.data(), B, H);
 
-    dsa_v32_fp8_kargs kargs{};
+    dsa_kargs kargs{};
     kargs.q_nope_ptr = dev_q_nope;
     kargs.q_scale_ptr = dev_q_scale;
     kargs.q_rope_ptr = dev_q_rope;

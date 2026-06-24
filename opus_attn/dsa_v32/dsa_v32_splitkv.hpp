@@ -383,7 +383,7 @@ template<typename T, typename V>
 __device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
     using D_ACC = typename T::D_ACC;
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    D_ACC row_max = -1e30f;
+    D_ACC row_max = opus::numeric_limits<D_ACC>::lowest();
     opus::static_for<s_len>([&](auto i) {
         row_max = max(row_max, v_s[i.value]);
     });
@@ -503,7 +503,7 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
 }
 
 template<class Traits, class VQN, class VQR, class VO>
-__device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
+__device__ void dsa_v32_decode_accum_le2_tiles(dsa_kargs kargs,
                                                int page_idx_begin, int valid_kv_len, int tile_begin, int tile_end,
                                                char* smem_kv, char* smem_kv_scale,
                                                VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
@@ -694,7 +694,7 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
 }
 
 template<class Traits>
-__device__ void dsa_v32_decode_one_req(dsa_v32_fp8_kargs kargs, int batch_idx, int h_block_idx,
+__device__ void dsa_v32_decode_one_req(dsa_kargs kargs, int batch_idx, int h_block_idx,
                                        int tile_begin, int tile_end, int slot,
                                        char* smem_kv, char* smem_kv_scale, float temperature_scale) {
     using namespace opus;
@@ -761,9 +761,12 @@ __device__ void dsa_v32_decode_one_req(dsa_v32_fp8_kargs kargs, int batch_idx, i
         store<T::VEC_O>(g_oa, v_o, u_oa);
 
         if (lane_id < T::W_M) {
-            const int head = h_block_start + warp_id * T::Q_TILE_SIZE + lane_id;
-            const D_ACC lse = (l_row > D_ACC(0.0f)) ? (m_row + log2f(l_row)) : -3.0e38f;
-            reinterpret_cast<D_ACC*>(kargs.lse_accum)[slot * kargs.H + head] = lse;
+            const int lse_offset = slot * kargs.H + h_block_start;
+            auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_accum) + lse_offset,
+                                   (kargs.H - h_block_start) * sizeof(D_ACC));
+            const D_ACC lse = (l_row > D_ACC(0.0f)) ? (m_row + log2f(l_row))
+                                                    : opus::numeric_limits<D_ACC>::lowest();
+            g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
         }
     }
 }
@@ -771,7 +774,7 @@ __device__ void dsa_v32_decode_one_req(dsa_v32_fp8_kargs kargs, int batch_idx, i
 }
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_v32_fp8_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_kargs kargs) {
     using namespace opus;
     using namespace dsa_v32_16mx8_32nx1_fp8;
     using T = opus::remove_cvref_t<Traits>;

@@ -19,7 +19,7 @@ struct alignas(16) DsaSchedMeta {
     int _pad[3];
 };
 
-struct dsa_v32_fp8_kargs {
+struct dsa_kargs {
     const void* __restrict__ q_nope_ptr;
     const void* __restrict__ q_scale_ptr;
     const void* __restrict__ q_rope_ptr;
@@ -35,6 +35,7 @@ struct dsa_v32_fp8_kargs {
     void* __restrict__ o_accum;
     void* __restrict__ lse_accum;
     int num_parts;
+
     int B;
     int H;
     int total_tokens;
