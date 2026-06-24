@@ -509,8 +509,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     const int lane_id = thread_id_x() % T::WARP_SIZE;
 
     const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE;
-    const int q_nope_gmem_offset = q_token_idx * kargs.stride_q_nope_n + h_block_start * kargs.stride_q_nope_h;
-    const int q_rope_gmem_offset = q_token_idx * kargs.stride_q_rope_n + h_block_start * kargs.stride_q_rope_h;
+    const int64_t q_nope_gmem_offset = (int64_t)q_token_idx * kargs.stride_q_nope_n + (int64_t)h_block_start * kargs.stride_q_nope_h;
+    const int64_t q_rope_gmem_offset = (int64_t)q_token_idx * kargs.stride_q_rope_n + (int64_t)h_block_start * kargs.stride_q_rope_h;
 
     __shared__ char smem_kv[T::KV_TILE_SIZE * T::SMEM_KV_ROW * sizeof(D_ROPE)]; // for KV tiles
     __shared__ char smem_ml[2 * T::T_N * T::W_M * sizeof(D_ACC)];  // for inter-warp reduction
@@ -592,7 +592,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     scale_output_tile<T>(v_o, o_scale);
 
     using D_OUT = typename T::D_OUT;
-    const int o_gmem_offset = q_token_idx * kargs.stride_o_n + h_block_start * kargs.stride_o_h;
+    const int64_t o_gmem_offset = (int64_t)q_token_idx * kargs.stride_o_n + (int64_t)h_block_start * kargs.stride_o_h;
     auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
     int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_o_h);
