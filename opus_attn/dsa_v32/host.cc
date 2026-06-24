@@ -405,11 +405,11 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
         CHECK_HIP(hipMemcpy(dev_kv_indices, host_kv_indices.data(), host_kv_indices.size() * sizeof(int), hipMemcpyHostToDevice));
 
     const int num_h_blocks = ceil_div(H, PATraits::Q_TILE_SIZE * PATraits::T_M);
-    const int num_parts = DSA_V32_NUM_PARTS;
+    const int num_parts = std::max(1, DSA_V32_NUM_CU / num_h_blocks);
     dim3 grid(num_parts, num_h_blocks, 1);
     dim3 block(PATraits::BLOCK_SIZE);
-    printf("DSA v3.2 split-KV launch config: main grid=(%d,%d,%d) block=%d, num_parts=%d (NUM_WARPS=%d)\n",
-           grid.x, grid.y, grid.z, (int)block.x, num_parts, PATraits::NUM_WARPS);
+    printf("DSA v3.2 split-KV launch config: main grid=(%d,%d,%d) block=%d, num_parts=%d\n",
+           grid.x, grid.y, grid.z, block.x, num_parts);
 
     const int total_splits = B + num_parts;
     DsaSchedMeta* dev_sched_meta; int* dev_num_splits;

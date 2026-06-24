@@ -380,12 +380,6 @@ __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h) {
 }
 
 template<typename T, typename V>
-__device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
-    constexpr opus::index_t o_len = opus::vector_traits<V>::size();
-    opus::static_for<o_len>([&](auto i) { v_o[i.value] *= scale; });
-}
-
-template<typename T, typename V>
 __device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
     using D_ACC = typename T::D_ACC;
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
@@ -429,6 +423,24 @@ __device__ inline typename T::D_ACC attn_row_sum(const V& v_s) {
     row_sum = std::bit_cast<float>(res32.x) + std::bit_cast<float>(res32.y);
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
     return std::bit_cast<float>(res16.x) + std::bit_cast<float>(res16.y);
+}
+
+template<typename T, typename V>
+__device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
+    constexpr opus::index_t o_len = opus::vector_traits<V>::size();
+    opus::static_for<o_len>([&](auto i) { v_o[i.value] *= scale; });
+}
+
+template<typename V>
+__device__ inline void pin_output_tile(V& v_o) {
+    using chunk_t = opus::vector_t<float, 8>;
+    constexpr int num_chunks = opus::vector_traits<V>::size() / opus::vector_traits<chunk_t>::size();
+    static_assert(opus::vector_traits<V>::size() % opus::vector_traits<chunk_t>::size() == 0);
+    auto* chunks = reinterpret_cast<chunk_t*>(&v_o);
+    #pragma unroll
+    for (int i = 0; i < num_chunks; i++) {
+        asm volatile("" : "+v"(chunks[i]) ::);
+    }
 }
 
 template<int THR_X, int THR_Y>
@@ -622,7 +634,6 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
     };
 
     for (int tile_idx = tile_begin; tile_idx < tile_end; ++tile_idx) {
-
         const int kv_page = load_kv_page(tile_idx);
         async_load<T::VEC_KV_NOPE>(g_k_nope, s_k_nope.ptr, u_gk_nope + kv_nope_offset(kv_page), u_sk_nope);
         if (warp_id < 4) {
@@ -668,6 +679,7 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_v32_fp8_kargs kargs,
         l_row += attn_row_sum<T>(v_s);
         v_p = cast<D_ROPE>(v_s);
         scale_output_tile<T>(v_o, rescale_m);
+        pin_output_tile(v_o);
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
@@ -692,7 +704,8 @@ __device__ void dsa_v32_decode_one_req(dsa_v32_fp8_kargs kargs, int batch_idx, i
     using D_ACC = typename T::D_ACC;
     using D_OUT = typename T::D_OUT;
 
-    const int lane_id = thread_id_x() % T::WARP_SIZE;
+    int lane_id = thread_id_x() % T::WARP_SIZE;
+    asm volatile("" : "+v"(lane_id));
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE;
@@ -728,13 +741,13 @@ __device__ void dsa_v32_decode_one_req(dsa_v32_fp8_kargs kargs, int batch_idx, i
 
     D_ACC o_scale = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
+    pin_output_tile(v_o);
 
     int lane_id_o = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id_o));
     int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     if (slot < 0) {
-
         const int o_gmem_offset = batch_idx * kargs.stride_o_b + h_block_start * kargs.stride_o_h;
         auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
         auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
@@ -742,7 +755,6 @@ __device__ void dsa_v32_decode_one_req(dsa_v32_fp8_kargs kargs, int batch_idx, i
         store<T::VEC_O>(g_o, v_o_out, u_o);
     }
     if (slot >= 0) {
-
         const int oa_offset = slot * kargs.H * T::D_NOPE_SIZE + h_block_start * T::D_NOPE_SIZE;
         auto g_oa = make_gmem(reinterpret_cast<D_ACC*>(kargs.o_accum) + oa_offset, (kargs.H - h_block_start) * T::D_NOPE_SIZE * sizeof(D_ACC));
         auto u_oa = make_layout_o<T>(warp_id_o, lane_id_o, T::D_NOPE_SIZE);
@@ -763,7 +775,6 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_16mx8_32
     using namespace opus;
     using namespace dsa_v32_16mx8_32nx1_fp8;
     using T = opus::remove_cvref_t<Traits>;
-    using D_NOPE = typename T::D_NOPE;
 
     const int part = block_id_x();
     const int h_block_idx = block_id_y();
@@ -772,8 +783,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_16mx8_32
     const DsaSchedMeta meta = kargs.sched_meta[part];
     if (meta.begin_req_idx >= kargs.B) return;
 
-    __shared__ char smem_kv[T::smem_size_bytes()];
-    __shared__ char smem_kv_scale[T::KV_TILE_SIZE * T::D_SCALE_PADDED_SIZE * sizeof(D_NOPE)];
+    __shared__ char smem_kv[T::smem_kv_bytes()];
+    __shared__ char smem_kv_scale[T::smem_mxscl_bytes];
 
     constexpr float LOG2_E = 1.44269504089f;
     const float temperature_scale = kargs.softmax_scale * LOG2_E;

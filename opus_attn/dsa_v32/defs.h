@@ -8,9 +8,7 @@ using fp8_t  = _BitInt(8);
 using bf8_t  = unsigned _BitInt(8);
 
 static constexpr int DSA_V32_NUM_CU = 256;
-static constexpr int DSA_V32_NUM_PARTS = DSA_V32_NUM_CU;
 static constexpr int DSA_V32_FIXED_OVERHEAD = 5;
-static constexpr int DSA_V32_MAX_SPLITS = 128;
 
 struct alignas(16) DsaSchedMeta {
     int begin_req_idx;
@@ -126,12 +124,14 @@ struct dsa_v32_16mx8_32nx1_fp8_traits {
     static constexpr size_t smem_v_bytes = KV_TILE_SIZE * (D_NOPE_SIZE + smem_v_padding) * sizeof(D_ROPE);
 
     static constexpr int smem_mxscl_padding = 4 / sizeof(D_NOPE);
+    static constexpr size_t smem_mxscl_bytes = smem_n_rpt * (D_SCALE_PADDED_SIZE * smem_n_per_wave + smem_mxscl_padding) * sizeof(D_NOPE);
 
-    static constexpr size_t smem_size_bytes() {
+    static constexpr size_t smem_kv_bytes() {
         return std::max(smem_k_nope_bytes + smem_k_rope_bytes, smem_v_bytes);
     }
 
-    static constexpr int kv_buffer_load_insts = (KV_TILE_SIZE * D_NOPE_SIZE) / (BLOCK_SIZE * VEC_KV_NOPE) + 2 * (KV_TILE_SIZE * D_ROPE_SIZE) / (BLOCK_SIZE * VEC_KV_ROPE);
+    static constexpr int kv_buffer_load_insts = (KV_TILE_SIZE * D_NOPE_SIZE) / (BLOCK_SIZE * VEC_KV_NOPE)  // nope = 2
+                                                + 1; // rope = 1 for warp_id < 4 or mxscl = 1 for warp_id >= 4
     static constexpr int k_nope_ds_read_insts = (GEMM0_E_N * W_N * W_K_NOPE) / (WARP_SIZE * VEC_KV_NOPE);
     static constexpr int k_rope_ds_read_insts = (GEMM0_E_N * W_N * W_K_ROPE) / (WARP_SIZE * VEC_KV_ROPE);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K_ROPE) / (WARP_SIZE * VEC_TR_V);
