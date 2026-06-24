@@ -312,8 +312,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_kernel(opus_gq
     const int h_kv = h / group_size;
     const int q_block_size = T::NUM_WARPS * T::Q_TILE_SIZE;
     const int q_block_start = q_block_idx * q_block_size;
-    const int qo_gmem_offset = b * kargs.stride_q_b + q_block_start * kargs.stride_q_n + h * kargs.stride_q_h;
-    const int kv_gmem_offset = b * kargs.stride_kv_b + h_kv * kargs.stride_kv_h;
+    const int64_t qo_gmem_offset = (int64_t)b * kargs.stride_q_b + (int64_t)q_block_start * kargs.stride_q_n + (int64_t)h * kargs.stride_q_h;
+    const int64_t kv_gmem_offset = (int64_t)b * kargs.stride_kv_b + (int64_t)h_kv * kargs.stride_kv_h;
 
     // Global memory tensors
     auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_q) + qo_gmem_offset);
