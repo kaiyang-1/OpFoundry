@@ -528,7 +528,7 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
 int main(int argc, char** argv) {
     int H = 128;
     int B = 128;
-    int total_tokens = -1;
+    int total_tokens = 1024;
 
     bool verify = false;
     bool dense_kv = false;
@@ -556,9 +556,6 @@ int main(int argc, char** argv) {
         if (try_parse(H, "-h_q")) continue;
         if (try_parse(B, "-b")) continue;
         if (try_parse(total_tokens, "-total_tokens")) continue;
-    }
-    if (total_tokens < 0) {
-        total_tokens = B;
     }
 
     if (H <= 0 || B <= 0 || total_tokens <= 0) {
