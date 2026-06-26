@@ -503,12 +503,12 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
 }
 
 template<class Traits, class VQN, class VQR, class VO>
-__device__ void dsa_v32_decode_accum_le2_tiles(dsa_kargs kargs,
-                                               int page_idx_begin, int valid_kv_len, int tile_begin, int tile_end,
-                                               char* smem_kv, char* smem_kv_scale,
-                                               VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
-                                               typename Traits::D_ACC& m_row, typename Traits::D_ACC& l_row,
-                                               float temperature_scale) {
+__device__ void dsa_v32_decode_le2_tiles(dsa_kargs kargs,
+                                         int page_idx_begin, int valid_kv_len, int tile_begin, int tile_end,
+                                         char* smem_kv, char* smem_kv_scale,
+                                         VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
+                                         typename Traits::D_ACC& m_row, typename Traits::D_ACC& l_row,
+                                         float temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_NOPE = typename T::D_NOPE;
@@ -695,12 +695,12 @@ __device__ void dsa_v32_decode_accum_le2_tiles(dsa_kargs kargs,
 }
 
 template<class Traits, bool OddTail, class VQN, class VQR, class VO>
-__device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
-                                               int page_idx_begin, int valid_kv_len, int tile_begin, int tile_end,
-                                               char* smem_kv, char* smem_kv_scale,
-                                               VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
-                                               typename Traits::D_ACC& m_row, typename Traits::D_ACC& l_row,
-                                               float temperature_scale) {
+__device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
+                                         int page_idx_begin, int valid_kv_len, int tile_begin, int tile_end,
+                                         char* smem_kv, char* smem_kv_scale,
+                                         VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
+                                         typename Traits::D_ACC& m_row, typename Traits::D_ACC& l_row,
+                                         float temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_NOPE = typename T::D_NOPE;
@@ -717,22 +717,16 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
     auto g_kv_indices = make_gmem(kargs.kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
     auto g_kv_scale   = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.kv_scale_ptr), kargs.total_tokens * kargs.stride_kv_scale_page * sizeof(D_NOPE));
 
-    smem<D_NOPE> s_k_nope[2] = {
-        make_smem(reinterpret_cast<D_NOPE*>(smem_kv)),
-        make_smem(reinterpret_cast<D_NOPE*>(smem_kv + T::smem_kv_bytes())),
-    };
-    smem<D_ROPE> s_k_rope[2] = {
-        make_smem(reinterpret_cast<D_ROPE*>(smem_kv + T::smem_k_nope_bytes)),
-        make_smem(reinterpret_cast<D_ROPE*>(smem_kv + T::smem_kv_bytes() + T::smem_k_nope_bytes))
-    };
-    smem<D_NOPE> s_k_mxscl[2] = {
-        make_smem(reinterpret_cast<D_NOPE*>(smem_kv_scale)),
-        make_smem(reinterpret_cast<D_NOPE*>(smem_kv_scale + T::smem_mxscl_bytes))
-    };
-    smem<D_ROPE> s_v[2] = {
-        make_smem(reinterpret_cast<D_ROPE*>(smem_kv + 2 * T::smem_kv_bytes())),
-        make_smem(reinterpret_cast<D_ROPE*>(smem_kv + 3 * T::smem_kv_bytes()))
-    };
+    auto s_k_nope  = make_smem(reinterpret_cast<D_NOPE*>(smem_kv));
+    auto s_k_rope  = make_smem(reinterpret_cast<D_ROPE*>(smem_kv + T::smem_k_nope_bytes));
+    auto s_k_mxscl = make_smem(reinterpret_cast<D_NOPE*>(smem_kv_scale));
+    auto s_v       = make_smem(reinterpret_cast<D_ROPE*>(smem_kv + 2 * T::smem_kv_bytes()));
+
+    // Double-buffer slot stride (in elements) for each smem region.
+    constexpr auto k_nope_slot_off  = number<T::smem_kv_bytes() / sizeof(D_NOPE)>{};
+    constexpr auto k_rope_slot_off  = number<T::smem_kv_bytes() / sizeof(D_ROPE)>{};
+    constexpr auto k_mxscl_slot_off = number<T::smem_mxscl_bytes / sizeof(D_NOPE)>{};
+    constexpr auto v_slot_off       = number<T::smem_kv_bytes() / sizeof(D_ROPE)>{};
 
     auto u_kv_indices = make_layout_kv_indices<T>(warp_id, lane_id);
 
@@ -803,16 +797,17 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
     auto kv_rope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_rope_page; };
     auto kv_scale_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_scale_page; };
 
-    auto async_load_kv = [&](int buf, int token_idx) {
-        async_load<T::VEC_KV_NOPE>(g_k_nope, s_k_nope[buf].ptr, u_gk_nope + kv_nope_offset(token_idx), u_sk_nope);
+    auto async_load_kv = [&](auto slot_n, int token_idx) {
+        constexpr int sl = decltype(slot_n)::value;
+        async_load<T::VEC_KV_NOPE>(g_k_nope, s_k_nope.ptr, u_gk_nope + kv_nope_offset(token_idx), u_sk_nope + number<sl * (T::smem_kv_bytes() / sizeof(D_NOPE))>{});
         if (warp_id < 4) {
-            async_load<T::VEC_KV_ROPE>(g_k_rope, s_k_rope[buf].ptr, u_gk_rope + kv_rope_offset(token_idx), u_sk_rope);
+            async_load<T::VEC_KV_ROPE>(g_k_rope, s_k_rope.ptr, u_gk_rope + kv_rope_offset(token_idx), u_sk_rope + number<sl * (T::smem_kv_bytes() / sizeof(D_ROPE))>{});
         } else {
-            async_load<4>(g_kv_scale, s_k_mxscl[buf].ptr, u_gk_mxscl + kv_scale_offset(token_idx), u_sk_mxscl);
+            async_load<4>(g_kv_scale, s_k_mxscl.ptr, u_gk_mxscl + kv_scale_offset(token_idx), u_sk_mxscl + number<sl * (T::smem_mxscl_bytes / sizeof(D_NOPE))>{});
         }
     };
 
-    auto compute_qk_nope = [&](auto& s, auto& q, auto& k, auto& scale_q, auto& scale_k, auto& s_k_nope) {
+    auto compute_qk_nope = [&](auto& s, auto& q, auto& k, auto& scale_q, auto& scale_k, auto& s_k_nope, auto rk_offset) {
         clear(s);
         static_for<T::GEMM0_NOPE_E_K>([&](auto ek) {
             constexpr int idx = ek.value;
@@ -822,27 +817,27 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
             s_tile[0] = mfma0_nope(k_nope_tile[0], q[idx], s_tile[0], scale_k[0], scale_q, ek, ek);
             s_tile[1] = mfma0_nope(k_nope_tile[1], q[idx], s_tile[1], scale_k[1], scale_q, ek, ek);
             if constexpr (idx + 2 < T::GEMM0_NOPE_E_K) {
-                k[slot] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(number<idx + 2>{}));
+                k[slot] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + rk_offset + sk_nope_slice(number<idx + 2>{}));
                 s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
             } else if constexpr (idx + 1 < T::GEMM0_NOPE_E_K) {
                 s_waitcnt_lgkmcnt(0_I);
             }
         });
     };
-    auto compute_qk_rope = [&](auto& s, auto& q, auto& k, auto& s_k_rope) {
-        k[0] = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope);
-        k[1] = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope + sk_rope_slice(1_I));
+    auto compute_qk_rope = [&](auto& s, auto& q, auto& k, auto& s_k_rope, auto rk_offset) {
+        k[0] = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope + rk_offset);
+        k[1] = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope + rk_offset + sk_rope_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_rope_ds_read_insts>{});
         s = mma0_rope(q[0], k[0], s);
         s_waitcnt_lgkmcnt(0_I);
         s = mma0_rope(q[1], k[1], s);
     };
-    auto compute_pv = [&](const auto& p, auto& v, auto& o, auto& s_v) {
+    auto compute_pv = [&](const auto& p, auto& v, auto& o, auto& s_v, auto rv_offset) {
         static_for<T::NUM_D_SLICES - 2>([&](auto i) {
             constexpr int idx = i.value;
             constexpr int slot = idx & 1;
             o[idx] = mma1(p, v[slot], o[idx]);
-            v[slot] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slice(number<idx + 2>{}));
+            v[slot] = tr_load<T::VEC_TR_V>(s_v, u_rv + rv_offset + sv_slice(number<idx + 2>{}));
             s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
             __builtin_amdgcn_sched_barrier(0);
         });
@@ -874,27 +869,27 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
     // Prologue
     kv_page[2] = load_kv_page(tile_begin);
-    async_load_kv(0, kv_page[2]);
+    async_load_kv(0_I, kv_page[2]);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
     kv_page[0] = load_kv_page(tile_begin + 1);
-    async_load_kv(1, kv_page[0]);
+    async_load_kv(1_I, kv_page[0]);
     __builtin_amdgcn_sched_barrier(0);
     kv_page[1] = load_kv_page(tile_begin + 2);
-    v_k_mxscl = load<1>(s_k_mxscl[0], u_rk_mxscl);
-    v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope[0], u_rk_nope);
-    v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope[0], u_rk_nope + sk_nope_slice(1_I));
+    v_k_mxscl = load<1>(s_k_mxscl, u_rk_mxscl);
+    v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
+    v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
     s_waitcnt_vmcnt(1_I);
 
-    compute_qk_nope(v_s[0], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope[0]);
-    compute_qk_rope(v_s[0], v_q_rope_slices, v_k_rope, s_k_rope[0]);
-    auto v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope[0], u_rv_dequant);
+    compute_qk_nope(v_s[0], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope, 0_I);
+    compute_qk_rope(v_s[0], v_q_rope_slices, v_k_rope, s_k_rope, 0_I);
+    auto v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
     s_waitcnt_lgkmcnt(0_I);
     auto v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
-    store<T::VEC_KV_ROPE>(s_v[0], v_v_nope_bf16, u_sv_dequant);
+    store<T::VEC_KV_ROPE>(s_v, v_v_nope_bf16, u_sv_dequant);
 
     if (stagger) {
         __builtin_amdgcn_sched_barrier(0);
@@ -914,12 +909,11 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
     for (int j = tile_begin + 1; j < tile_end - 3; j += 2) {
         // Cluster 0
         s_waitcnt_vmcnt(0_I);
-        async_load_kv(0, kv_page[1]);
-        __builtin_amdgcn_sched_barrier(0);
+        v_k_mxscl = load<1>(s_k_mxscl, u_rk_mxscl + k_mxscl_slot_off);
+        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off);
+        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off + sk_nope_slice(1_I));
+        async_load_kv(0_I, kv_page[1]);
         kv_page[2] = load_kv_page(j + 2);
-        v_k_mxscl = load<1>(s_k_mxscl[1], u_rk_mxscl);
-        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope[1], u_rk_nope);
-        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope[1], u_rk_nope + sk_nope_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -928,13 +922,13 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 1
         __builtin_amdgcn_s_setprio(1);
-        compute_qk_nope(v_s[1], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope[1]);
-        compute_qk_rope(v_s[1], v_q_rope_slices, v_k_rope, s_k_rope[1]);
+        compute_qk_nope(v_s[1], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope, k_nope_slot_off);
+        compute_qk_rope(v_s[1], v_q_rope_slices, v_k_rope, s_k_rope, k_rope_slot_off);
         attn_exp2_slice<T, s_half_len, s_half_len>(v_s[0]);
         l_row += attn_row_sum<T>(v_s[0]);
         v_p = cast<D_ROPE>(v_s[0]);
         asm volatile("" : "+v"(v_p) ::);
-        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope[1], u_rv_dequant);
+        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         __builtin_amdgcn_s_setprio(0);
@@ -943,9 +937,9 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 2
-        store<T::VEC_KV_ROPE>(s_v[1], v_v_nope_bf16, u_sv_dequant);
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v[0], u_rv + sv_slice(1_I));
+        store<T::VEC_KV_ROPE>(s_v, v_v_nope_bf16, u_sv_dequant + v_slot_off);
+        v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv);
+        v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         s_waitcnt_vmcnt(1_I);
         __builtin_amdgcn_sched_barrier(0);
@@ -954,7 +948,7 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 3
         __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, v_v, v_o_slices, s_v[0]);
+        compute_pv(v_p, v_v, v_o_slices, s_v, 0_I);
         static_for<s_len>([&](auto i) { v_s[1][i.value] *= temperature_scale; });
         row_max = attn_row_max<T>(v_s[1]);
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
@@ -977,12 +971,11 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 4
         s_waitcnt_vmcnt(0_I);
-        async_load_kv(1, kv_page[2]);
-        __builtin_amdgcn_sched_barrier(0);
+        v_k_mxscl = load<1>(s_k_mxscl, u_rk_mxscl);
+        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
+        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
+        async_load_kv(1_I, kv_page[2]);
         kv_page[3] = load_kv_page(j + 3);
-        v_k_mxscl = load<1>(s_k_mxscl[0], u_rk_mxscl);
-        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope[0], u_rk_nope);
-        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope[0], u_rk_nope + sk_nope_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -991,13 +984,13 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 5
         __builtin_amdgcn_s_setprio(1);
-        compute_qk_nope(v_s[0], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope[0]);
-        compute_qk_rope(v_s[0], v_q_rope_slices, v_k_rope, s_k_rope[0]);
+        compute_qk_nope(v_s[0], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope, 0_I);
+        compute_qk_rope(v_s[0], v_q_rope_slices, v_k_rope, s_k_rope, 0_I);
         attn_exp2_slice<T, s_half_len, s_half_len>(v_s[1]);
         l_row += attn_row_sum<T>(v_s[1]);
         v_p = cast<D_ROPE>(v_s[1]);
         asm volatile("" : "+v"(v_p) ::);
-        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope[0], u_rv_dequant);
+        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         __builtin_amdgcn_s_setprio(0);
@@ -1006,9 +999,9 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 6
-        store<T::VEC_KV_ROPE>(s_v[0], v_v_nope_bf16, u_sv_dequant);
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v[1], u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v[1], u_rv + sv_slice(1_I));
+        store<T::VEC_KV_ROPE>(s_v, v_v_nope_bf16, u_sv_dequant);
+        v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv + v_slot_off);
+        v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + v_slot_off + sv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         s_waitcnt_vmcnt(1_I);
         __builtin_amdgcn_sched_barrier(0);
@@ -1017,7 +1010,7 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 7
         __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, v_v, v_o_slices, s_v[1]);
+        compute_pv(v_p, v_v, v_o_slices, s_v, v_slot_off);
         static_for<s_len>([&](auto i) { v_s[0][i.value] *= temperature_scale; });
         row_max = attn_row_max<T>(v_s[0]);
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
@@ -1046,10 +1039,10 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
     if constexpr (OddTail) {
         // Cluster 0
         s_waitcnt_vmcnt(0_I);
-        async_load_kv(0, kv_page[1]);
-        v_k_mxscl = load<1>(s_k_mxscl[1], u_rk_mxscl);
-        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope[1], u_rk_nope);
-        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope[1], u_rk_nope + sk_nope_slice(1_I));
+        v_k_mxscl = load<1>(s_k_mxscl, u_rk_mxscl + k_mxscl_slot_off);
+        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off);
+        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off + sk_nope_slice(1_I));
+        async_load_kv(0_I, kv_page[1]);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -1058,13 +1051,13 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 1
         __builtin_amdgcn_s_setprio(1);
-        compute_qk_nope(v_s[1], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope[1]);
-        compute_qk_rope(v_s[1], v_q_rope_slices, v_k_rope, s_k_rope[1]);
+        compute_qk_nope(v_s[1], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope, k_nope_slot_off);
+        compute_qk_rope(v_s[1], v_q_rope_slices, v_k_rope, s_k_rope, k_rope_slot_off);
         attn_exp2_slice<T, s_half_len, s_half_len>(v_s[0]);
         l_row += attn_row_sum<T>(v_s[0]);
         v_p = cast<D_ROPE>(v_s[0]);
         asm volatile("" : "+v"(v_p) ::);
-        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope[1], u_rv_dequant);
+        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         __builtin_amdgcn_s_setprio(0);
@@ -1073,9 +1066,9 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 2
-        store<T::VEC_KV_ROPE>(s_v[1], v_v_nope_bf16, u_sv_dequant);
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v[0], u_rv + sv_slice(1_I));
+        store<T::VEC_KV_ROPE>(s_v, v_v_nope_bf16, u_sv_dequant + v_slot_off);
+        v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv);
+        v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_sched_barrier(0);
@@ -1084,7 +1077,7 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 3
         __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, v_v, v_o_slices, s_v[0]);
+        compute_pv(v_p, v_v, v_o_slices, s_v, 0_I);
         static_for<s_len>([&](auto i) { v_s[1][i.value] *= temperature_scale; });
         row_max = max(m_row, attn_row_max<T>(v_s[1]));
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
@@ -1101,9 +1094,9 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 4
-        v_k_mxscl = load<1>(s_k_mxscl[0], u_rk_mxscl);
-        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope[0], u_rk_nope);
-        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope[0], u_rk_nope + sk_nope_slice(1_I));
+        v_k_mxscl = load<1>(s_k_mxscl, u_rk_mxscl);
+        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
+        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1111,14 +1104,14 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 5
         __builtin_amdgcn_s_setprio(1);
-        compute_qk_nope(v_s[0], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope[0]);
-        compute_qk_rope(v_s[0], v_q_rope_slices, v_k_rope, s_k_rope[0]);
+        compute_qk_nope(v_s[0], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope, 0_I);
+        compute_qk_rope(v_s[0], v_q_rope_slices, v_k_rope, s_k_rope, 0_I);
         l_row *= rescale_m;
         attn_exp2_slice<T, s_half_len, s_half_len>(v_s[1]);
         l_row += attn_row_sum<T>(v_s[1]);
         v_p = cast<D_ROPE>(v_s[1]);
         asm volatile("" : "+v"(v_p) ::);
-        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope[0], u_rv_dequant);
+        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         __builtin_amdgcn_s_setprio(0);
@@ -1127,9 +1120,9 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 6
-        store<T::VEC_KV_ROPE>(s_v[0], v_v_nope_bf16, u_sv_dequant);
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v[1], u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v[1], u_rv + sv_slice(1_I));
+        store<T::VEC_KV_ROPE>(s_v, v_v_nope_bf16, u_sv_dequant);
+        v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv + v_slot_off);
+        v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + v_slot_off + sv_slice(1_I));
         mask_oob_scores(v_s[0], tile_end - 1);
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -1138,7 +1131,7 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 7
         __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, v_v, v_o_slices, s_v[1]);
+        compute_pv(v_p, v_v, v_o_slices, s_v, v_slot_off);
         static_for<s_len>([&](auto i) { v_s[0][i.value] *= temperature_scale; });
         row_max = max(m_row, attn_row_max<T>(v_s[0]));
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
@@ -1160,15 +1153,15 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 8
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v[0], u_rv + sv_slice(1_I));
+        v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv);
+        v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 9
-        compute_pv(v_p, v_v, v_o_slices, s_v[0]);
+        compute_pv(v_p, v_v, v_o_slices, s_v, 0_I);
 
         if (!stagger) {
             __builtin_amdgcn_s_barrier();
@@ -1176,12 +1169,11 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
     } else {
         // Cluster 0
         s_waitcnt_vmcnt(0_I);
-        async_load_kv(0, kv_page[1]);
-        __builtin_amdgcn_sched_barrier(0);
+        v_k_mxscl = load<1>(s_k_mxscl, u_rk_mxscl + k_mxscl_slot_off);
+        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off);
+        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off + sk_nope_slice(1_I));
+        async_load_kv(0_I, kv_page[1]);
         kv_page[2] = load_kv_page(tile_end - 1);
-        v_k_mxscl = load<1>(s_k_mxscl[1], u_rk_mxscl);
-        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope[1], u_rk_nope);
-        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope[1], u_rk_nope + sk_nope_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -1190,13 +1182,13 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 1
         __builtin_amdgcn_s_setprio(1);
-        compute_qk_nope(v_s[1], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope[1]);
-        compute_qk_rope(v_s[1], v_q_rope_slices, v_k_rope, s_k_rope[1]);
+        compute_qk_nope(v_s[1], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope, k_nope_slot_off);
+        compute_qk_rope(v_s[1], v_q_rope_slices, v_k_rope, s_k_rope, k_rope_slot_off);
         attn_exp2_slice<T, s_half_len, s_half_len>(v_s[0]);
         l_row += attn_row_sum<T>(v_s[0]);
         v_p = cast<D_ROPE>(v_s[0]);
         asm volatile("" : "+v"(v_p) ::);
-        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope[1], u_rv_dequant);
+        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         __builtin_amdgcn_s_setprio(0);
@@ -1205,9 +1197,9 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 2
-        store<T::VEC_KV_ROPE>(s_v[1], v_v_nope_bf16, u_sv_dequant);
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v[0], u_rv + sv_slice(1_I));
+        store<T::VEC_KV_ROPE>(s_v, v_v_nope_bf16, u_sv_dequant + v_slot_off);
+        v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv);
+        v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         s_waitcnt_vmcnt(1_I);
         __builtin_amdgcn_sched_barrier(0);
@@ -1216,7 +1208,7 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 3
         __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, v_v, v_o_slices, s_v[0]);
+        compute_pv(v_p, v_v, v_o_slices, s_v, 0_I);
         static_for<s_len>([&](auto i) { v_s[1][i.value] *= temperature_scale; });
         row_max = max(m_row, attn_row_max<T>(v_s[1]));
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
@@ -1234,10 +1226,10 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 4
         s_waitcnt_vmcnt(0_I);
-        async_load_kv(1, kv_page[2]);
-        v_k_mxscl = load<1>(s_k_mxscl[0], u_rk_mxscl);
-        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope[0], u_rk_nope);
-        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope[0], u_rk_nope + sk_nope_slice(1_I));
+        v_k_mxscl = load<1>(s_k_mxscl, u_rk_mxscl);
+        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
+        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
+        async_load_kv(1_I, kv_page[2]);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -1246,14 +1238,14 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 5
         __builtin_amdgcn_s_setprio(1);
-        compute_qk_nope(v_s[0], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope[0]);
-        compute_qk_rope(v_s[0], v_q_rope_slices, v_k_rope, s_k_rope[0]);
+        compute_qk_nope(v_s[0], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope, 0_I);
+        compute_qk_rope(v_s[0], v_q_rope_slices, v_k_rope, s_k_rope, 0_I);
         l_row *= rescale_m;
         attn_exp2_slice<T, s_half_len, s_half_len>(v_s[1]);
         l_row += attn_row_sum<T>(v_s[1]);
         v_p = cast<D_ROPE>(v_s[1]);
         asm volatile("" : "+v"(v_p) ::);
-        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope[0], u_rv_dequant);
+        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         __builtin_amdgcn_s_setprio(0);
@@ -1262,9 +1254,9 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 6
-        store<T::VEC_KV_ROPE>(s_v[0], v_v_nope_bf16, u_sv_dequant);
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v[1], u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v[1], u_rv + sv_slice(1_I));
+        store<T::VEC_KV_ROPE>(s_v, v_v_nope_bf16, u_sv_dequant);
+        v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv + v_slot_off);
+        v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + v_slot_off + sv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_sched_barrier(0);
@@ -1273,7 +1265,7 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 7
         __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, v_v, v_o_slices, s_v[1]);
+        compute_pv(v_p, v_v, v_o_slices, s_v, v_slot_off);
         static_for<s_len>([&](auto i) { v_s[0][i.value] *= temperature_scale; });
         row_max = max(m_row, attn_row_max<T>(v_s[0]));
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
@@ -1290,9 +1282,9 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 8
-        v_k_mxscl = load<1>(s_k_mxscl[1], u_rk_mxscl);
-        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope[1], u_rk_nope);
-        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope[1], u_rk_nope + sk_nope_slice(1_I));
+        v_k_mxscl = load<1>(s_k_mxscl, u_rk_mxscl + k_mxscl_slot_off);
+        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off);
+        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off + sk_nope_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1300,14 +1292,14 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 9
         __builtin_amdgcn_s_setprio(1);
-        compute_qk_nope(v_s[1], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope[1]);
-        compute_qk_rope(v_s[1], v_q_rope_slices, v_k_rope, s_k_rope[1]);
+        compute_qk_nope(v_s[1], v_q_nope_slices, v_k_nope, scale_q, scale_k, s_k_nope, k_nope_slot_off);
+        compute_qk_rope(v_s[1], v_q_rope_slices, v_k_rope, s_k_rope, k_rope_slot_off);
         l_row *= rescale_m;
         attn_exp2_slice<T, s_half_len, s_half_len>(v_s[0]);
         l_row += attn_row_sum<T>(v_s[0]);
         v_p = cast<D_ROPE>(v_s[0]);
         asm volatile("" : "+v"(v_p) ::);
-        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope[1], u_rv_dequant);
+        v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         __builtin_amdgcn_s_setprio(0);
@@ -1316,9 +1308,9 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 10
-        store<T::VEC_KV_ROPE>(s_v[1], v_v_nope_bf16, u_sv_dequant);
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v[0], u_rv + sv_slice(1_I));
+        store<T::VEC_KV_ROPE>(s_v, v_v_nope_bf16, u_sv_dequant + v_slot_off);
+        v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv);
+        v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slice(1_I));
         mask_oob_scores(v_s[1], tile_end - 1);
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -1327,7 +1319,7 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
         // Cluster 11
         __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, v_v, v_o_slices, s_v[0]);
+        compute_pv(v_p, v_v, v_o_slices, s_v, 0_I);
         static_for<s_len>([&](auto i) { v_s[1][i.value] *= temperature_scale; });
         row_max = max(m_row, attn_row_max<T>(v_s[1]));
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
@@ -1349,15 +1341,15 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 12
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v[1], u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v[1], u_rv + sv_slice(1_I));
+        v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv + v_slot_off);
+        v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + v_slot_off + sv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 13
-        compute_pv(v_p, v_v, v_o_slices, s_v[1]);
+        compute_pv(v_p, v_v, v_o_slices, s_v, v_slot_off);
 
         if (!stagger) {
             __builtin_amdgcn_s_barrier();
@@ -1367,6 +1359,7 @@ __device__ void dsa_v32_decode_accum_pipelined(dsa_kargs kargs,
 
 template<class Traits>
 __device__ void dsa_v32_decode_one_req(dsa_kargs kargs, int batch_idx, int h_block_idx,
+                                       int page_idx_begin, int valid_kv_len,
                                        int tile_begin, int tile_end, int slot,
                                        char* smem_kv, char* smem_kv_scale, float temperature_scale) {
     using namespace opus;
@@ -1384,9 +1377,6 @@ __device__ void dsa_v32_decode_one_req(dsa_kargs kargs, int batch_idx, int h_blo
     const int q_nope_gmem_offset  = batch_idx * kargs.stride_q_nope_b  + h_block_start * kargs.stride_q_nope_h;
     const int q_rope_gmem_offset  = batch_idx * kargs.stride_q_rope_b  + h_block_start * kargs.stride_q_rope_h;
     const int q_scale_gmem_offset = batch_idx * kargs.stride_q_scale_b + h_block_start * kargs.stride_q_scale_h;
-
-    const int page_idx_begin = kargs.kv_indptr[batch_idx];
-    const int valid_kv_len   = kargs.kv_indptr[batch_idx + 1] - page_idx_begin;
 
     auto g_q_nope = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.q_nope_ptr) + q_nope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_nope_h * sizeof(D_NOPE));
     auto g_q_rope = make_gmem(reinterpret_cast<const D_ROPE*>(kargs.q_rope_ptr) + q_rope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_rope_h * sizeof(D_ROPE));
@@ -1409,17 +1399,17 @@ __device__ void dsa_v32_decode_one_req(dsa_kargs kargs, int batch_idx, int h_blo
 
     const int n_tiles = tile_end - tile_begin;
     if (n_tiles <= 2) {
-        dsa_v32_decode_accum_le2_tiles<Traits>(kargs, page_idx_begin, valid_kv_len, tile_begin, tile_end,
+        dsa_v32_decode_le2_tiles<Traits>(kargs, page_idx_begin, valid_kv_len, tile_begin, tile_end,
+                                         smem_kv, smem_kv_scale,
+                                         v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row, temperature_scale);
+    } else if (n_tiles & 1) {
+        dsa_v32_decode_pipelined<Traits, true>(kargs, page_idx_begin, valid_kv_len, tile_begin, tile_end,
                                                smem_kv, smem_kv_scale,
                                                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row, temperature_scale);
-    } else if (n_tiles & 1) {
-        dsa_v32_decode_accum_pipelined<Traits, true>(kargs, page_idx_begin, valid_kv_len, tile_begin, tile_end,
-                                                     smem_kv, smem_kv_scale,
-                                                     v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row, temperature_scale);
     } else {
-        dsa_v32_decode_accum_pipelined<Traits, false>(kargs, page_idx_begin, valid_kv_len, tile_begin, tile_end,
-                                                      smem_kv, smem_kv_scale,
-                                                      v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row, temperature_scale);
+        dsa_v32_decode_pipelined<Traits, false>(kargs, page_idx_begin, valid_kv_len, tile_begin, tile_end,
+                                                smem_kv, smem_kv_scale,
+                                                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row, temperature_scale);
     }
 
     D_ACC o_scale = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
@@ -1476,8 +1466,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_16mx8_32
     const float temperature_scale = kargs.softmax_scale * LOG2_E;
 
     for (int req = meta.begin_req_idx; req <= meta.end_req_idx; ++req) {
-        const int valid_kv_len = kargs.kv_indptr[req + 1] - kargs.kv_indptr[req];
-        const int num_tiles    = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+        const int page_idx_begin = __builtin_amdgcn_readfirstlane(kargs.kv_indptr[req]);
+        const int valid_kv_len   = __builtin_amdgcn_readfirstlane(kargs.kv_indptr[req + 1]) - page_idx_begin;
+        const int num_tiles      = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         const int tile_begin = (req == meta.begin_req_idx) ? meta.begin_tile_idx : 0;
         const int tile_end   = (req == meta.end_req_idx)   ? meta.end_tile_idx   : num_tiles;
@@ -1487,7 +1478,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_16mx8_32
         const int n_split_idx = (req == meta.begin_req_idx) ? meta.begin_split_idx : 0;
         const int slot = is_no_split ? -1 : (kargs.num_splits[req] + n_split_idx);
 
-        dsa_v32_decode_one_req<Traits>(kargs, req, h_block_idx, tile_begin, tile_end, slot,
+        dsa_v32_decode_one_req<Traits>(kargs, req, h_block_idx, page_idx_begin, valid_kv_len,
+                                       tile_begin, tile_end, slot,
                                        smem_kv, smem_kv_scale, temperature_scale);
     }
 }
