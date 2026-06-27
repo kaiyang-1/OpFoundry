@@ -24,6 +24,8 @@ template<class Traits>
 __global__ void pa_prefill_16mx8_32nx1_kernel(pa_kargs kargs);
 template<class Traits>
 __global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs kargs);
+template<class Traits>
+__global__ void pa_prefill_16mx8_32nx1_fp8_kernel(pa_fp8_kargs kargs);
 
 // Launch wrappers — overloaded on the trait type so each selects its own kernel.
 template<int Q, int KV, int D, int NW, class DT, class DO>
@@ -36,10 +38,15 @@ inline void pa_launch(pa_16mx8_32nx1_traits<Q, KV, D, NW, DT, DO>,
                       const pa_kargs& kargs, dim3 grid, dim3 block) {
     pa_prefill_16mx8_32nx1_kernel<pa_16mx8_32nx1_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
 }
-template<int Q, int KV, int D, int NW, class NOPE, class ROPE, class DO>
-inline void pa_launch(pa_16mx1_16nx4_fp8_traits<Q, KV, D, NW, NOPE, ROPE, DO>,
+template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
+inline void pa_launch(pa_16mx1_16nx4_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>,
                       const pa_fp8_kargs& kargs, dim3 grid, dim3 block) {
-    pa_prefill_16mx1_16nx4_fp8_kernel<pa_16mx1_16nx4_fp8_traits<Q, KV, D, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
+    pa_prefill_16mx1_16nx4_fp8_kernel<pa_16mx1_16nx4_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
+}
+template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
+inline void pa_launch(pa_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>,
+                      const pa_fp8_kargs& kargs, dim3 grid, dim3 block) {
+    pa_prefill_16mx8_32nx1_fp8_kernel<pa_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 
 #define CHECK_HIP(call)                                                                                   \
@@ -224,9 +231,16 @@ void benchmark_pa_kernel(const KArgs& kargs, dim3 grid, dim3 block,
     const double tflops = flops / (avg_time * 1e-3) / 1e12;
 
     // Bandwidth: Q read (packed row) + O write (bf16) + KV read (packed row), each its own dtype.
-    const size_t q_bytes  = (size_t)kargs.N * kargs.H * Traits::D_TILE_SIZE * sizeof(D_ATTN);
+    size_t row_bytes;
+    if constexpr (std::is_same_v<KArgs, pa_fp8_kargs>) {
+        row_bytes = (size_t)Traits::D_NOPE_PADDED_SIZE * sizeof(typename Traits::D_NOPE)
+                  + (size_t)Traits::D_ROPE_SIZE * sizeof(typename Traits::D_ROPE);
+    } else {
+        row_bytes = (size_t)Traits::D_TILE_SIZE * sizeof(D_ATTN);
+    }
+    const size_t q_bytes  = (size_t)kargs.N * kargs.H * row_bytes;
     const size_t o_bytes  = (size_t)kargs.N * kargs.H * D_HEAD * sizeof(D_OUT);
-    const size_t kv_bytes = (size_t)indices_prefix_sum * Traits::D_TILE_SIZE * sizeof(D_ATTN);
+    const size_t kv_bytes = (size_t)indices_prefix_sum * row_bytes;
     const double tbps = double(q_bytes + o_bytes + kv_bytes) / (avg_time * 1e-3) / 1e12;
 
     printf("PA Prefill Kernel Performance: avg_time=%.3f ms, %.2f TFlops, %.2f TB/s\n",
@@ -729,7 +743,7 @@ int main(int argc, char** argv) {
     }
 
     if (use_fp8) {
-        return run_pa_case<pa_16mx1_16nx4_fp8_traits<16, 64, 640, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        return run_pa_case<pa_16mx1_16nx4_fp8_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
     }
     // Dispatch by query-head count: h_q <= 32 favors the 16mx1_16nx4 layout,
     // otherwise the 16mx8_32nx1 layout. Both are correct for any H > 0.

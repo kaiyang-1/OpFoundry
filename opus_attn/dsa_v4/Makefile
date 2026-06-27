@@ -8,7 +8,7 @@ KERNEL_FLAGS = -ffast-math -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage
 BUILD = build
 OUT   = $(BUILD)/pa_prefill.exe
 
-KERNEL_SRCS = pa_prefill_16mx1_16nx4_kernel.cc pa_prefill_16mx8_32nx1_kernel.cc pa_prefill_16mx1_16nx4_fp8_kernel.cc
+KERNEL_SRCS = pa_prefill_16mx1_16nx4_kernel.cc pa_prefill_16mx8_32nx1_kernel.cc pa_prefill_16mx1_16nx4_fp8_kernel.cc pa_prefill_16mx8_32nx1_fp8_kernel.cc
 HOST_SRC    = pa_host.cc
 KERNEL_OBJS = $(patsubst %.cc,$(BUILD)/%.o,$(KERNEL_SRCS))
 HOST_OBJ    = $(BUILD)/pa_host.o
@@ -23,7 +23,7 @@ $(BUILD):
 # Kernel objects (heavy — device+host passes, parallelizable via make -j)
 # -D__HIPCC_RTC__ skips implicit __clang_hip_runtime_wrapper.h on host pass (~250ms saved)
 # Each kernel .cc only includes its own template hpp; depending on both keeps the rule simple.
-$(BUILD)/%.o: %.cc pa_prefill_16mx1_16nx4_template.hpp pa_prefill_16mx8_32nx1_template.hpp pa_prefill_16mx1_16nx4_fp8_template.hpp pa_defs.h | $(BUILD)
+$(BUILD)/%.o: %.cc pa_prefill_16mx1_16nx4_template.hpp pa_prefill_16mx8_32nx1_template.hpp pa_prefill_16mx1_16nx4_fp8_template.hpp pa_prefill_16mx8_32nx1_fp8_template.hpp pa_defs.h | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) -c -o $@
 
 # Host object (no -D__HIPCC_RTC__ — needs full HIP runtime for <<<>>> syntax)
