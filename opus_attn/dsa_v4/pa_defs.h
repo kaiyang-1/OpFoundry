@@ -1,6 +1,8 @@
 // Shared types and constants between device kernel and host code
 #pragma once
 
+#include <algorithm>
+
 using bf16_t = __bf16;
 using fp16_t = __fp16;
 // 8-bit float storage types, aliased to match opus's dtype registration.

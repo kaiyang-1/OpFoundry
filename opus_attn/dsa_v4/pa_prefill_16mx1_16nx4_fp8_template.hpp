@@ -1,3 +1,5 @@
+#pragma once
+
 #include <opus/opus.hpp>
 #include "pa_defs.h"
 #include <bit>
@@ -419,9 +421,6 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
         static_for([&](auto i) { v_k_nope[i.value] = static_cast<D_NOPE>(0); }, number<k_nope_vals>{}, number<k_nope_len>{});
 
         auto v_k_mxscl = load<T::VEC_KV_NOPE>(g_k_nope, kv_nope_offset(kv_page) + T::D_NOPE_SIZE);
-        constexpr index_t k_mxscl_len  = vector_traits<decltype(v_k_mxscl)>::size();  // 16 (padded scale count)
-        constexpr index_t k_mxscl_vals = T::D_NOPE_SIZE / 32;                         // 14 real scales
-        static_for([&](auto i) { v_k_mxscl[i.value] = static_cast<D_NOPE>(0); }, number<k_mxscl_vals>{}, number<k_mxscl_len>{});
         reorder_mxscl_for_opsel<T>(v_k_mxscl);
 
         // ──── GEMM0: S = Q·Kᵀ  (NoPE MXFP8) ────
@@ -537,12 +536,6 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     // NoPE mx scales (fp8 E8M0, one per 32-elem K block).
     auto u_q_mxscl = make_layout_q_mxscl<T>(lane_id);
     auto v_q_mxscl = load<1>(g_q_nope, u_q_mxscl + T::D_NOPE_SIZE);
-    const int q_kblk = lane_id / T::W_M;
-    constexpr index_t q_blocks_per_step = T::W_K_NOPE / 32;
-    constexpr index_t q_mxscl_vals      = T::D_NOPE_SIZE / 32;
-    static_for<T::GEMM0_NOPE_E_K>([&](auto j) {
-        if (j.value * q_blocks_per_step + q_kblk >= q_mxscl_vals) v_q_mxscl[j.value] = static_cast<D_NOPE>(0);
-    });
     int scale_q = reinterpret_cast<int&>(v_q_mxscl);
 
     // Output accumulator and online-softmax state.
