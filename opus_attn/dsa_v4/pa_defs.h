@@ -347,12 +347,17 @@ struct pa_16mx8_32nx1_fp8_traits {
     static constexpr int smem_padding_32B_rope = 32 / sizeof(D_ROPE);
     static constexpr size_t smem_k_rope_bytes = smem_n_rpt * smem_d_rpt_rope * (smem_linear_wave_rope + smem_padding_32B_rope) * sizeof(D_ROPE);
 
-    static constexpr int smem_v_padding = 32 / sizeof(D_ROPE);
-    static constexpr size_t smem_v_bytes = KV_TILE_SIZE * (D_HEAD_SIZE + smem_v_padding) * sizeof(D_ROPE);
+    static constexpr int smem_d_rpt_head = D_HEAD_SIZE / D_128B_ROPE_SIZE;
+    static constexpr size_t smem_v_bytes = smem_n_rpt * smem_d_rpt_head * (smem_linear_wave_rope + smem_padding_32B_rope) * sizeof(D_ROPE);
+    static constexpr size_t smem_v_nope_bytes = smem_n_rpt * (smem_d_rpt_head - smem_d_rpt_rope) * (smem_linear_wave_rope + smem_padding_32B_rope) * sizeof(D_ROPE);
 
     static constexpr size_t smem_kv_bytes() {
         return std::max(smem_k_nope_bytes + smem_k_rope_bytes, smem_v_bytes);
     }
+
+    static constexpr int k_nope_ds_read_insts = (GEMM0_E_N * W_N * W_K_NOPE) / (WARP_SIZE * VEC_KV_NOPE);
+    static constexpr int k_rope_ds_read_insts = (GEMM0_E_N * W_N * W_K_ROPE) / (WARP_SIZE * VEC_KV_ROPE);
+    static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K_ROPE) / (WARP_SIZE * VEC_TR_V);
 };
 
 __host__ __device__ inline int ceil_div(int a, int b) {
