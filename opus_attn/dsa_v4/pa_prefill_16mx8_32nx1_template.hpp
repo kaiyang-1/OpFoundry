@@ -265,7 +265,7 @@ __device__ inline void pin_output_tile(V& v_o) {
     using chunk_t = opus::vector_t<float, 8>;
     constexpr int num_chunks = opus::vector_traits<V>::size() / opus::vector_traits<chunk_t>::size();
     static_assert(opus::vector_traits<V>::size() % opus::vector_traits<chunk_t>::size() == 0);
-    auto* chunks = reinterpret_cast<chunk_t*>(&v_o);
+    auto& chunks = reinterpret_cast<chunk_t(&)[num_chunks]>(v_o);
     #pragma unroll
     for (int i = 0; i < num_chunks; i++) {
         asm volatile("" : "+v"(chunks[i]) ::);
