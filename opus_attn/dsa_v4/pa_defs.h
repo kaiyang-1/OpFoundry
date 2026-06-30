@@ -358,6 +358,8 @@ struct pa_16mx8_32nx1_fp8_traits {
         return 4 * smem_kv_bytes();
     }
 
+    static constexpr int kv_buffer_load_insts = (KV_TILE_SIZE * D_NOPE_PADDED_SIZE) / (BLOCK_SIZE * VEC_KV_NOPE)
+                                              + (KV_TILE_SIZE * D_ROPE_SIZE) / (BLOCK_SIZE / 2 * VEC_KV_ROPE);
     static constexpr int k_nope_ds_read_insts = (GEMM0_E_N * W_N * W_K_NOPE) / (WARP_SIZE * VEC_KV_NOPE);
     static constexpr int k_rope_ds_read_insts = (GEMM0_E_N * W_N * W_K_ROPE) / (WARP_SIZE * VEC_KV_ROPE);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K_ROPE) / (WARP_SIZE * VEC_TR_V);
