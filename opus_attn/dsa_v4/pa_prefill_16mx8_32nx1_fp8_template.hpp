@@ -267,7 +267,7 @@ template<typename T>
 __device__ inline auto make_layout_sv_dequant(int warp_id, int lane_id) {
     constexpr int warps_n = T::GEMM0_E_N;
     constexpr int warps_d = T::NUM_WARPS / warps_n;
-    constexpr int wn_hi   = T::W_N / T::smem_n_per_wave;
+    constexpr int wn_rpt  = T::W_N / T::smem_n_rpt;
     constexpr int wd_hi   = (T::WARP_SIZE / T::W_N) / 2;
     constexpr int wd_lo   = 2;
     constexpr int dinner  = T::W_N * T::W_K_NOPE / T::WARP_SIZE / T::VEC_KV_ROPE;
@@ -276,23 +276,23 @@ __device__ inline auto make_layout_sv_dequant(int warp_id, int lane_id) {
     constexpr auto sv_block_shape = opus::make_tuple(
         opus::number<warps_d>{},
         opus::number<wd_hi>{},
+        opus::number<T::smem_n_rpt>{},
         opus::number<warps_n>{},
-        opus::number<wn_hi>{},
-        opus::number<T::smem_n_per_wave>{},
+        opus::number<wn_rpt>{},
         opus::number<wd_lo>{},
         opus::number<dinner>{},
         opus::number<T::VEC_KV_ROPE>{});
 
     constexpr auto sv_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}, opus::y_dim{}));
 
     auto lane_id_n = lane_id % T::W_N;
 
     return opus::make_layout(
         sv_block_shape,
         opus::unfold_x_stride(sv_block_dim, sv_block_shape, opus::tuple{opus::number<T::smem_linear_wave_rope + T::smem_padding_32B_rope>{}, 1_I}),
-        opus::unfold_p_coord(sv_block_dim, opus::tuple{warp_id / warps_n, (lane_id / T::W_N) / 2, warp_id % warps_n, lane_id_n / T::smem_n_per_wave, lane_id_n % T::smem_n_per_wave, (lane_id / T::W_N) % 2}));
+        opus::unfold_p_coord(sv_block_dim, opus::tuple{warp_id / warps_n, (lane_id / T::W_N) / 2, lane_id_n % T::smem_n_rpt, warp_id % warps_n, lane_id_n / T::smem_n_rpt, (lane_id / T::W_N) % 2}));
 }
 
 template<class T>
@@ -634,7 +634,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
 
         constexpr int mxscl_chunk = T::D_NOPE_SIZE / T::D_128B_NOPE_SIZE;
         constexpr int mxscl_col   = T::D_NOPE_SIZE % T::D_128B_NOPE_SIZE;
-        auto v_k_mxscl = load<1>(s_k_nope, u_rk_mxscl + sk_nope_slice(number<mxscl_chunk>{}) + mxscl_col);
+        auto v_k_mxscl = load<1>(s_k_nope, u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}));
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
