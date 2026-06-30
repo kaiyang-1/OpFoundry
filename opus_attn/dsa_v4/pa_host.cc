@@ -743,10 +743,10 @@ int main(int argc, char** argv) {
     }
 
     if (use_fp8) {
-        return run_pa_case<pa_16mx1_16nx4_fp8_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        return H <= 32
+            ? run_pa_case<pa_16mx1_16nx4_fp8_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
+            : run_pa_case<pa_16mx8_32nx1_fp8_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
     }
-    // Dispatch by query-head count: h_q <= 32 favors the 16mx1_16nx4 layout,
-    // otherwise the 16mx8_32nx1 layout. Both are correct for any H > 0.
     return H <= 32
         ? run_pa_case<pa_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
         : run_pa_case<pa_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);

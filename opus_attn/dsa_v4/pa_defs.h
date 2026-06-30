@@ -354,6 +354,9 @@ struct pa_16mx8_32nx1_fp8_traits {
     static constexpr size_t smem_kv_bytes() {
         return std::max(smem_k_nope_bytes + smem_k_rope_bytes, smem_v_bytes);
     }
+    static constexpr size_t smem_size_bytes() {
+        return 4 * smem_kv_bytes();
+    }
 
     static constexpr int k_nope_ds_read_insts = (GEMM0_E_N * W_N * W_K_NOPE) / (WARP_SIZE * VEC_KV_NOPE);
     static constexpr int k_rope_ds_read_insts = (GEMM0_E_N * W_N * W_K_ROPE) / (WARP_SIZE * VEC_KV_ROPE);
