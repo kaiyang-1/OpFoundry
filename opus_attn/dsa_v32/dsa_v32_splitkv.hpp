@@ -931,6 +931,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        asm volatile("" : "+v"(v_v_nope_bf16) ::);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -993,6 +994,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        asm volatile("" : "+v"(v_v_nope_bf16) ::);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1060,6 +1062,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        asm volatile("" : "+v"(v_v_nope_bf16) ::);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1114,6 +1117,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        asm volatile("" : "+v"(v_v_nope_bf16) ::);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1191,6 +1195,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        asm volatile("" : "+v"(v_v_nope_bf16) ::);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1248,6 +1253,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        asm volatile("" : "+v"(v_v_nope_bf16) ::);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1302,6 +1308,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        asm volatile("" : "+v"(v_v_nope_bf16) ::);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
