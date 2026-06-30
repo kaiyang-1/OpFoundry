@@ -9,6 +9,35 @@ using opus::operator""_I;
 
 namespace pa_16mx8_32nx1_fp8 {
 
+constexpr int MFMA_MASK    = 0x08;
+constexpr int VALU_MASK    = 0x02;
+constexpr int SALU_MASK    = 0x04;
+constexpr int EXP_MASK     = 0x400;
+constexpr int DS_READ_MASK = 0x100;
+
+template<int Group>
+__device__ inline void sched_compute_qk() {
+    opus::static_for<4>([&](auto) {
+        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, Group);
+        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, Group);
+        __builtin_amdgcn_sched_group_barrier(EXP_MASK, 1, Group);
+    });
+    opus::static_for<2>([&](auto) {
+        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, Group);
+        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, Group);
+        __builtin_amdgcn_sched_group_barrier(VALU_MASK, 2, Group);
+    });
+    opus::static_for<2>([&](auto) {
+        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, Group);
+        __builtin_amdgcn_sched_group_barrier(VALU_MASK, 4, Group);
+    });
+    opus::static_for<4>([&](auto) {
+        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, Group);
+        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, Group);
+        __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, Group);
+    });
+}
+
 template<class T>
 __device__ inline auto make_layout_q_nope(int warp_id, int lane_id) {
     constexpr auto q_block_shape = opus::make_tuple(
@@ -982,6 +1011,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         asm volatile("" : "+v"(v_v_nope_bf16) ::);
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1045,6 +1075,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         asm volatile("" : "+v"(v_v_nope_bf16) ::);
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1113,6 +1144,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         asm volatile("" : "+v"(v_v_nope_bf16) ::);
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1168,6 +1200,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         asm volatile("" : "+v"(v_v_nope_bf16) ::);
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1246,6 +1279,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         asm volatile("" : "+v"(v_v_nope_bf16) ::);
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1304,6 +1338,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         asm volatile("" : "+v"(v_v_nope_bf16) ::);
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1359,6 +1394,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
         asm volatile("" : "+v"(v_v_nope_bf16) ::);
+        sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
