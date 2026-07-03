@@ -4,7 +4,7 @@
 #include "defs.h"
 
 template<class Traits>
-__global__ void get_mla_metadata_kernel(dsa_v32_fp8_kargs kargs) {
+__global__ void get_mla_metadata_kernel(dsa_kargs kargs) {
     using T = opus::remove_cvref_t<Traits>;
     constexpr int WARP = T::WARP_SIZE;
 
