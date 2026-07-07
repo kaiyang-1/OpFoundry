@@ -239,10 +239,10 @@ __device__ inline typename T::D_ACC attn_row_max(const V& v_s, S& s_m, int warp_
 }
 
 template<typename T, typename V>
-__device__ inline void attn_sub_row(V& v_s, typename T::D_ACC row_max) {
+__device__ inline void attn_row_scale_sub(V& v_s, typename T::D_ACC scale, typename T::D_ACC row_max) {
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
     opus::static_for<s_len>([&](auto i) {
-        v_s[i.value] -= row_max;
+        v_s[i.value] = __builtin_fmaf(v_s[i.value], scale, -row_max);
     });
 }
 
@@ -460,12 +460,11 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
         store<T::VEC_KV_ROPE>(s_kv, v_k_rope, u_sk_rope + T::D_NOPE_SIZE);
 
         // ──── Cross-warp online softmax ────
-        scale_output_tile<T>(v_s, temperature_scale);
         mask_oob_scores(v_s, tile_idx);
-        D_ACC row_max   = max(m_row, attn_row_max<T>(v_s, s_m, warp_id, lane_id));
+        D_ACC row_max   = max(m_row, attn_row_max<T>(v_s, s_m, warp_id, lane_id) * temperature_scale);
         D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s, row_max);
+        attn_row_scale_sub<T>(v_s, temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_len>(v_s);
         l_row *= rescale_m;
         l_row += attn_row_sum<T>(v_s, s_l, warp_id, lane_id);
