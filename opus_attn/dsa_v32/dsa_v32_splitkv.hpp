@@ -395,10 +395,10 @@ __device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
 }
 
 template<typename T, typename V>
-__device__ inline void attn_sub_row(V& v_s, typename T::D_ACC row_max) {
+__device__ inline void attn_row_scale_sub(V& v_s, typename T::D_ACC scale, typename T::D_ACC row_max) {
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
     opus::static_for<s_len>([&](auto i) {
-        v_s[i.value] -= row_max;
+        v_s[i.value] = __builtin_fmaf(v_s[i.value], scale, -row_max);
     });
 }
 
@@ -668,13 +668,12 @@ __device__ void dsa_v32_decode_le2_tiles(dsa_kargs kargs,
         store<T::VEC_KV_ROPE>(s_v, v_v_nope_bf16, u_sv_dequant);
 
         constexpr index_t s_len = vector_traits<decltype(v_s)>::size();
-        static_for<s_len>([&](auto i) { v_s[i.value] *= temperature_scale; });
         mask_oob_scores(v_s, tile_idx);
 
-        D_ACC row_max = max(m_row, attn_row_max<T>(v_s));
+        D_ACC row_max = max(m_row, attn_row_max<T>(v_s) * temperature_scale);
         D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s, row_max);
+        attn_row_scale_sub<T>(v_s, temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_len>(v_s);
         l_row *= rescale_m;
         l_row += attn_row_sum<T>(v_s);
@@ -896,9 +895,8 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         __builtin_amdgcn_s_barrier();
     }
 
-    static_for<s_len>([&](auto i) { v_s[0][i.value] *= temperature_scale; });
-    m_row = max(m_row, attn_row_max<T>(v_s[0]));
-    attn_sub_row<T>(v_s[0], m_row);
+    m_row = max(m_row, attn_row_max<T>(v_s[0]) * temperature_scale);
+    attn_row_scale_sub<T>(v_s[0], temperature_scale, m_row);
     attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
     asm volatile("" : "+v"(v_s[0]) ::);
     __builtin_amdgcn_sched_barrier(0);
@@ -950,12 +948,11 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         // Cluster 3
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_v, 0_I);
-        static_for<s_len>([&](auto i) { v_s[1][i.value] *= temperature_scale; });
-        row_max = attn_row_max<T>(v_s[1]);
+        row_max = attn_row_max<T>(v_s[1]) * temperature_scale;
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
         row_max = all_below ? m_row : max(m_row, row_max);
-        attn_sub_row<T>(v_s[1], row_max);
+        attn_row_scale_sub<T>(v_s[1], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
@@ -1013,12 +1010,11 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         // Cluster 7
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_v, v_slot_off);
-        static_for<s_len>([&](auto i) { v_s[0][i.value] *= temperature_scale; });
-        row_max = attn_row_max<T>(v_s[0]);
+        row_max = attn_row_max<T>(v_s[0]) * temperature_scale;
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
         row_max = all_below ? m_row : max(m_row, row_max);
-        attn_sub_row<T>(v_s[0], row_max);
+        attn_row_scale_sub<T>(v_s[0], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
         asm volatile("" : "+v"(v_s[0]) ::);
         __builtin_amdgcn_sched_barrier(0);
@@ -1081,11 +1077,10 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         // Cluster 3
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_v, 0_I);
-        static_for<s_len>([&](auto i) { v_s[1][i.value] *= temperature_scale; });
-        row_max = max(m_row, attn_row_max<T>(v_s[1]));
+        row_max = max(m_row, attn_row_max<T>(v_s[1]) * temperature_scale);
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s[1], row_max);
+        attn_row_scale_sub<T>(v_s[1], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
@@ -1136,11 +1131,10 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         // Cluster 7
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_v, v_slot_off);
-        static_for<s_len>([&](auto i) { v_s[0][i.value] *= temperature_scale; });
-        row_max = max(m_row, attn_row_max<T>(v_s[0]));
+        row_max = max(m_row, attn_row_max<T>(v_s[0]) * temperature_scale);
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s[0], row_max);
+        attn_row_scale_sub<T>(v_s[0], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
         asm volatile("" : "+v"(v_s[0]) ::);
         __builtin_amdgcn_sched_barrier(0);
@@ -1214,11 +1208,10 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         // Cluster 3
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_v, 0_I);
-        static_for<s_len>([&](auto i) { v_s[1][i.value] *= temperature_scale; });
-        row_max = max(m_row, attn_row_max<T>(v_s[1]));
+        row_max = max(m_row, attn_row_max<T>(v_s[1]) * temperature_scale);
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s[1], row_max);
+        attn_row_scale_sub<T>(v_s[1], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
@@ -1272,11 +1265,10 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         // Cluster 7
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_v, v_slot_off);
-        static_for<s_len>([&](auto i) { v_s[0][i.value] *= temperature_scale; });
-        row_max = max(m_row, attn_row_max<T>(v_s[0]));
+        row_max = max(m_row, attn_row_max<T>(v_s[0]) * temperature_scale);
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s[0], row_max);
+        attn_row_scale_sub<T>(v_s[0], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
         asm volatile("" : "+v"(v_s[0]) ::);
         __builtin_amdgcn_sched_barrier(0);
@@ -1327,11 +1319,10 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         // Cluster 11
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_v, 0_I);
-        static_for<s_len>([&](auto i) { v_s[1][i.value] *= temperature_scale; });
-        row_max = max(m_row, attn_row_max<T>(v_s[1]));
+        row_max = max(m_row, attn_row_max<T>(v_s[1]) * temperature_scale);
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s[1], row_max);
+        attn_row_scale_sub<T>(v_s[1], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
