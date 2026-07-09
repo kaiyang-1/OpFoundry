@@ -307,6 +307,35 @@ __device__ inline auto make_layout_rv_dequant(int warp_id, int lane_id) {
 }
 
 template<typename T>
+__device__ inline auto make_layout_rv_mxscl(int warp_id, int lane_id) {
+    constexpr int warps_n = T::GEMM0_E_N;
+
+    constexpr auto rv_block_shape = opus::make_tuple(
+        opus::number<T::GEMM0_NOPE_E_K>{},
+        opus::number<T::smem_n_rpt>{},
+        opus::number<T::GEMM0_E_N>{},
+        opus::number<T::W_N / T::smem_n_rpt>{},
+        opus::number<T::WARP_SIZE / T::W_N>{},
+        1_I);
+
+    constexpr auto rv_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+
+    auto lane_id_n = lane_id % T::W_N;
+
+    return opus::make_layout(
+        rv_block_shape,
+        opus::unfold_x_stride(rv_block_dim, rv_block_shape, opus::tuple{opus::number<T::D_128B_NOPE_SIZE / 32>{},
+                                                                        opus::number<T::smem_linear_wave_nope + T::smem_padding_32B_nope>{},
+                                                                        opus::number<T::D_128B_NOPE_SIZE>{},
+                                                                        1_I}),
+        opus::unfold_p_coord(rv_block_dim, opus::tuple{warp_id / warps_n, lane_id_n % T::smem_n_rpt, warp_id % warps_n, lane_id_n / T::smem_n_rpt, lane_id / T::W_N}));
+}
+
+template<typename T>
 __device__ inline auto make_layout_sv_dequant(int warp_id, int lane_id) {
     constexpr int warps_n = T::GEMM0_E_N;
     constexpr int warps_d = T::NUM_WARPS / warps_n;
@@ -555,11 +584,12 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
     auto u_gk_nope    = make_layout_gk_nope<T>(warp_id, lane_id);
     auto u_sk_nope    = make_layout_sk_nope<T>(warp_id);
     auto u_rk_nope    = make_layout_rk_nope<T>(lane_id);
-    auto u_rk_mxscl   = make_layout_rk_mxscl<T>(lane_id);
+    auto u_rk_mxscl   = make_layout_rk_mxscl<T>(lane_id) + T::mxscl_base;
     auto u_gk_rope    = make_layout_gk_rope<T>(lane_id);
     auto u_sk_rope    = make_layout_sk_rope<T>(warp_id);
     auto u_rk_rope    = make_layout_rk_rope<T>(lane_id);
     auto u_rv_dequant = make_layout_rv_dequant<T>(warp_id, lane_id);
+    auto u_rv_mxscl   = make_layout_rv_mxscl<T>(warp_id, lane_id) + T::mxscl_base;
     auto u_sv_dequant = make_layout_sv_dequant<T>(warp_id, lane_id);
     auto u_rv         = make_layout_rv<T>(lane_id);
 
@@ -584,6 +614,12 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
     typename decltype(mma1)::vtype_b v_v;
     auto v_s_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>*>(&v_s);
     auto v_o_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::SLICE_D / T::WARP_SIZE>*>(&v_o);
+    using nope_slice_t = vector_t<D_NOPE, T::W_M * T::W_K_NOPE / T::WARP_SIZE>;
+    auto v_q_nope_slices = reinterpret_cast<nope_slice_t*>(&v_q_nope);
+    auto v_k_nope_slices = reinterpret_cast<nope_slice_t*>(&v_k_nope);
+    constexpr index_t k_nope_len = vector_traits<decltype(v_k_nope)>::size();
+    constexpr index_t k_nope_pad_len = (T::D_NOPE_PADDED_SIZE - T::D_NOPE_SIZE) * k_nope_len / T::D_NOPE_PADDED_SIZE;
+    auto& v_k_nope_pad = *reinterpret_cast<vector_t<D_NOPE, k_nope_pad_len>*>(reinterpret_cast<D_NOPE*>(&v_k_nope) + (k_nope_len - k_nope_pad_len));
 
     // smem stage-stride helpers
     auto sk_nope_stage = [](auto stage_idx) {
@@ -611,6 +647,18 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
         }
     };
 
+    auto dequant_v = [](auto v_fp8, float scale) {
+        constexpr index_t len = vector_traits<decltype(v_fp8)>::size();
+        vector_t<D_ROPE, len> v_bf16;
+        auto& in  = reinterpret_cast<vector_t<u32_t, len / 4>&>(v_fp8);
+        auto* out = reinterpret_cast<vector_t<D_ROPE, 2>*>(&v_bf16);
+        static_for<len / 4>([&](auto d) {
+            out[d.value * 2 + 0] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(in[d.value], scale, false);
+            out[d.value * 2 + 1] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(in[d.value], scale, true);
+        });
+        return v_bf16;
+    };
+
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         const int kv_page = load_kv_page(tile_idx);
         async_load<T::VEC_KV_NOPE>(g_k_nope, s_k_nope.ptr, u_gk_nope + kv_nope_offset(kv_page), u_sk_nope);
@@ -618,31 +666,29 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
-        constexpr int mxscl_chunk = T::D_NOPE_SIZE / T::D_128B_NOPE_SIZE;
-        constexpr int mxscl_col   = T::D_NOPE_SIZE % T::D_128B_NOPE_SIZE;
-        auto v_k_mxscl = load<1>(s_k_nope, u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}));
-        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
-        v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
-        s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
-        compute_qk_nope(v_s, v_q_nope_slices, v_k_nope, scale_q, v_k_mxscl);
-        compute_qk_rope(v_s, v_q_rope_slices, v_k_rope);
-
-        auto v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
-        s_waitcnt_lgkmcnt(0_I);
-        const u32_t e8m0 = (reinterpret_cast<vector_t<u32_t, T::GEMM0_E_N>&>(v_k_mxscl)[warp_id % T::GEMM0_E_N] >> (int(warp_id / T::GEMM0_E_N) * 8)) & 0xFFu;
-        const float scale = std::bit_cast<float>(e8m0 << 23);
-        constexpr index_t v_nope_deq_len = vector_traits<decltype(v_v_nope_fp8)>::size();
-        vector_t<D_ROPE, v_nope_deq_len> v_v_nope_bf16;
-        auto& v_fp8_w   = reinterpret_cast<vector_t<u32_t, v_nope_deq_len / 4>&>(v_v_nope_fp8);
-        auto* v_bf16_pk = reinterpret_cast<vector_t<D_ROPE, 2>*>(&v_v_nope_bf16);
-        static_for<v_nope_deq_len / 4>([&](auto d) {
-            v_bf16_pk[d.value * 2 + 0] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(v_fp8_w[d.value], scale, false);
-            v_bf16_pk[d.value * 2 + 1] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(v_fp8_w[d.value], scale, true);
+        static_for<T::GEMM0_STAGE>([&](auto s) {
+            auto v_k_mxscl = load<1>(s_k_nope, u_rk_mxscl + sk_nope_stage(s));
+            int scale_k = reinterpret_cast<int&>(v_k_mxscl);
+            v_k_nope = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_stage(s));
+            v_k_rope = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope + sk_rope_stage(s));
+            s_waitcnt_lgkmcnt(0_I);
+            
+            clear(v_k_nope_pad);
+            clear(v_s_stages[s.value]);
+            static_for<T::GEMM0_NOPE_E_K>([&](auto ek) {
+                v_s_stages[s.value] = mfma0_nope(v_k_nope_slices[ek.value], v_q_nope_slices[ek.value], v_s_stages[s.value], scale_k, scale_q, ek, ek);
+            });
+            v_s_stages[s.value] = mma0_rope(v_q_rope, v_k_rope, v_s_stages[s.value]);
         });
 
+        auto v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
+        auto v_v_mxscl    = load<1>(s_k_nope, u_rv_mxscl);
+        s_waitcnt_lgkmcnt(0_I);
+        const float scale_v = std::bit_cast<float>(u32_t{reinterpret_cast<unsigned char&>(v_v_mxscl)} << 23);
+        auto v_v_nope_bf16 = dequant_v(v_v_nope_fp8, scale_v);
+
         __builtin_amdgcn_s_barrier();
-        constexpr int d_per_lane = T::W_N * T::W_K_NOPE / T::WARP_SIZE;
-        const int d_base = (warp_id / T::GEMM0_E_N) * T::W_K_NOPE + (lane_id / T::W_N) * d_per_lane;
+        const int d_base = (warp_id / T::GEMM0_E_N) * T::W_K_NOPE + (lane_id / T::W_N) * (T::W_N * T::W_K_NOPE / T::WARP_SIZE);
         if (d_base < T::D_NOPE_SIZE) {
             store<T::VEC_KV_ROPE>(s_v, v_v_nope_bf16, u_sv_dequant);
         }
@@ -663,11 +709,14 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slice(1_I));
-        s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
-        __builtin_amdgcn_sched_barrier(0);
-        compute_pv(v_p, v_v, v_o_slices);
+    
+        static_for<T::GEMM1_STAGE>([&](auto s) {
+            v_v = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_stage(s));
+            s_waitcnt_lgkmcnt(0_I);
+            __builtin_amdgcn_sched_barrier(0);
+
+            v_o_stages[s.value] = mma1(v_p, v_v, v_o_stages[s.value]);
+        });
         __builtin_amdgcn_s_barrier();
     }
 }

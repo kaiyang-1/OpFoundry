@@ -343,6 +343,10 @@ struct pa_16mx8_32nx1_fp8_traits {
     static constexpr int smem_padding_32B_nope = 32 / sizeof(D_NOPE);
     static constexpr size_t smem_k_nope_bytes = smem_n_rpt * smem_d_rpt_nope * (smem_linear_wave_nope + smem_padding_32B_nope) * sizeof(D_NOPE);
 
+    static constexpr int mxscl_chunk = D_NOPE_SIZE / D_128B_NOPE_SIZE;
+    static constexpr int mxscl_col   = D_NOPE_SIZE % D_128B_NOPE_SIZE;
+    static constexpr int mxscl_base  = mxscl_col + mxscl_chunk * smem_n_rpt * (smem_linear_wave_nope + smem_padding_32B_nope);
+
     static constexpr int D_128B_ROPE_SIZE = 128 / sizeof(D_ROPE);
     static constexpr int smem_linear_wave_rope = WARP_SIZE * dwordx4_size / sizeof(D_ROPE);
     static constexpr int smem_d_rpt_rope = D_ROPE_SIZE / D_128B_ROPE_SIZE;
