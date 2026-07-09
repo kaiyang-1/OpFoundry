@@ -843,11 +843,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         return v_bf16;
     };
     auto store_v_nope = [&](auto& v_v_nope_bf16, auto sv_off) {
-        constexpr int d_per_lane = T::W_N * T::W_K_NOPE / T::WARP_SIZE;
-        const int d_base = (warp_id / T::GEMM0_E_N) * T::W_K_NOPE + (lane_id / T::W_N) * d_per_lane;
-        if (d_base < T::D_NOPE_SIZE) {
-            store<T::VEC_KV_ROPE>(s_v, v_v_nope_bf16, u_sv_dequant + sv_off);
-        }
+        store<T::VEC_KV_ROPE>(s_v, v_v_nope_bf16, u_sv_dequant + sv_off);
     };
     auto cp_v_rope = [&](auto sv_off) {
         auto r = load<T::VEC_KV_ROPE>(s_k_rope, u_cp_rope + sv_off);
@@ -905,6 +901,8 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
     s_waitcnt_lgkmcnt(0_I);
     auto v_v_nope_bf16 = dequant_v(v_v_nope_fp8, v_v_mxscl);
     store_v_nope(v_v_nope_bf16, 0_I);
+    s_waitcnt_lgkmcnt(0_I);
+    __builtin_amdgcn_s_barrier();
     cp_v_rope(0_I);
 
     s_waitcnt_vmcnt(1_I);
@@ -927,6 +925,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         l_row *= rescale_m;
         m_row = row_max;
         scale_output_tile<T>(v_o, rescale_m);
+        pin_output_tile(v_o);
     }
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
@@ -993,7 +992,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
             // memory
             if constexpr (s.value == 0) {
                 store_v_nope(v_v_nope_bf16, v_store_off);
-            } else if constexpr (s.value == 1) {
+            } else if constexpr (s.value == 2) {
                 cp_v_rope(v_store_off);
             } else if constexpr (s.value == T::GEMM1_STAGE - 1) {
                 s_waitcnt_vmcnt(1_I);
@@ -1029,6 +1028,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
                     l_row *= rescale_m;
                     m_row = row_max;
                     scale_output_tile<T>(v_o, rescale_m);
+                    pin_output_tile(v_o);
                 }
             }
             __builtin_amdgcn_s_setprio(0);
