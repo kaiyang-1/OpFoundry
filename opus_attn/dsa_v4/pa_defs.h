@@ -313,8 +313,7 @@ struct pa_16mx8_32nx1_fp8_traits {
     static constexpr int W_K_NOPE = 128;
     static constexpr int W_K_ROPE = 32;
 
-    static constexpr int SLICE_D = 32;
-    static constexpr int NUM_D_SLICES = D_HEAD_SIZE / SLICE_D;
+    static constexpr int SLICE_D = 128;
 
     static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
     static constexpr int GEMM0_E_N = KV_TILE_SIZE / W_N;
@@ -324,6 +323,9 @@ struct pa_16mx8_32nx1_fp8_traits {
     static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
     static constexpr int GEMM1_E_N = SLICE_D / W_N;
     static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K_ROPE;
+
+    static constexpr int GEMM0_STAGE = GEMM0_E_N;
+    static constexpr int GEMM1_STAGE = D_HEAD_SIZE / SLICE_D;
 
     static constexpr int VEC_Q_NOPE  = 16;
     static constexpr int VEC_Q_ROPE  = 8;
@@ -360,8 +362,8 @@ struct pa_16mx8_32nx1_fp8_traits {
 
     static constexpr int kv_buffer_load_insts = (KV_TILE_SIZE * D_NOPE_PADDED_SIZE) / (BLOCK_SIZE * VEC_KV_NOPE)
                                               + (KV_TILE_SIZE * D_ROPE_SIZE) / (BLOCK_SIZE / 2 * VEC_KV_ROPE);
-    static constexpr int k_nope_ds_read_insts = (GEMM0_E_N * W_N * W_K_NOPE) / (WARP_SIZE * VEC_KV_NOPE);
-    static constexpr int k_rope_ds_read_insts = (GEMM0_E_N * W_N * W_K_ROPE) / (WARP_SIZE * VEC_KV_ROPE);
+    static constexpr int k_nope_ds_read_insts = (GEMM0_NOPE_E_K * W_N * W_K_NOPE) / (WARP_SIZE * VEC_KV_NOPE);
+    static constexpr int k_rope_ds_read_insts = (GEMM0_ROPE_E_K * W_N * W_K_ROPE) / (WARP_SIZE * VEC_KV_ROPE);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K_ROPE) / (WARP_SIZE * VEC_TR_V);
 };
 

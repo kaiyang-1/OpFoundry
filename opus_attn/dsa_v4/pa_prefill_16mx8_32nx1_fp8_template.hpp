@@ -158,16 +158,16 @@ __device__ inline auto make_layout_sk_nope(int warp_id) {
 template<typename T>
 __device__ inline auto make_layout_rk_nope(int lane_id) {
     constexpr auto rk_block_shape = opus::make_tuple(
+        opus::number<T::GEMM0_NOPE_E_K>{},
         opus::number<T::smem_n_rpt>{},
-        opus::number<T::GEMM0_E_N>{},
         opus::number<T::W_N / T::smem_n_rpt>{},
         opus::number<T::W_N * T::W_K_NOPE / T::WARP_SIZE / T::VEC_KV_NOPE>{},
         opus::number<T::WARP_SIZE / T::W_N>{},
         opus::number<T::VEC_KV_NOPE>{});
 
     constexpr auto rk_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
 
     auto lane_id_n = lane_id % T::W_N;
 
@@ -183,14 +183,13 @@ __device__ inline auto make_layout_rk_mxscl(int lane_id) {
 
     constexpr auto rk_block_shape = opus::make_tuple(
         opus::number<T::smem_n_rpt>{},
-        opus::number<T::GEMM0_E_N>{},
         opus::number<T::W_N / T::smem_n_rpt>{},
         opus::number<blocks_per_step>{},
         opus::number<T::GEMM0_NOPE_E_K>{});
 
     constexpr auto rk_block_dim = opus::make_tuple(
         opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}),
         opus::make_tuple(opus::p_dim{}),
         opus::make_tuple(opus::y_dim{}));
 
@@ -262,22 +261,20 @@ template<typename T>
 __device__ inline auto make_layout_rk_rope(int lane_id) {
     constexpr auto rk_block_shape = opus::make_tuple(
         opus::number<T::smem_n_rpt>{},
-        opus::number<T::GEMM0_E_N>{},
         opus::number<T::W_N / T::smem_n_rpt>{},
+        opus::number<T::GEMM0_ROPE_E_K>{},
         opus::number<T::WARP_SIZE / T::W_N>{},
         opus::number<T::VEC_KV_ROPE>{});
 
     constexpr auto rk_block_dim = opus::make_tuple(
         opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
 
     auto lane_id_n = lane_id % T::W_N;
 
     return opus::make_layout(
         rk_block_shape,
         opus::unfold_x_stride(rk_block_dim, rk_block_shape, opus::tuple{opus::number<T::smem_linear_wave_rope + T::smem_padding_32B_rope>{},
-                                                                        opus::number<T::D_128B_ROPE_SIZE>{},
                                                                         1_I}),
         opus::unfold_p_coord(rk_block_dim, opus::tuple{lane_id_n % T::smem_n_rpt, lane_id_n / T::smem_n_rpt, lane_id / T::W_N}));
 }
@@ -352,7 +349,8 @@ __device__ inline auto make_layout_rv(int lane_id) {
     constexpr int grp_k = num_grps / grp_n;
 
     constexpr auto rv_block_shape = opus::make_tuple(
-        opus::number<T::GEMM1_E_N>{},
+        opus::number<T::GEMM1_E_N / (T::D_128B_ROPE_SIZE / T::W_N)>{},
+        opus::number<T::D_128B_ROPE_SIZE / T::W_N>{},
         opus::number<T::GEMM1_E_K>{},
         opus::number<lane_hi>{},
         opus::number<T::W_K_ROPE / (lane_hi * grp_k)>{},
@@ -363,6 +361,7 @@ __device__ inline auto make_layout_rv(int lane_id) {
 
     constexpr auto rv_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}),
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
         opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
@@ -372,7 +371,8 @@ __device__ inline auto make_layout_rv(int lane_id) {
 
     return opus::make_layout(
         rv_block_shape,
-        opus::unfold_x_stride(rv_block_dim, rv_block_shape, opus::tuple{opus::number<grp_n * lane_lo * T::VEC_TR_V>{},
+        opus::unfold_x_stride(rv_block_dim, rv_block_shape, opus::tuple{opus::number<T::smem_n_rpt * (T::smem_linear_wave_rope + T::smem_padding_32B_rope)>{},
+                                                                        opus::number<grp_n * lane_lo * T::VEC_TR_V>{},
                                                                         opus::number<T::smem_linear_wave_rope + T::smem_padding_32B_rope>{},
                                                                         opus::number<T::D_128B_ROPE_SIZE>{},
                                                                         1_I}),
@@ -566,8 +566,8 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
     // Tiled MMA operators
     auto mfma0_nope = make_mfma<D_NOPE, D_NOPE, D_ACC>(number<T::W_M>{}, number<T::W_N>{}, number<T::W_K_NOPE>{});
     auto mma0_rope = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
-        seq<T::GEMM0_E_M, T::GEMM0_E_N, 1_I>{},
-        seq<1_I, 1_I, 1_I>{},
+        seq<T::GEMM0_E_M, 1_I, T::GEMM0_ROPE_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
         seq<T::W_M, T::W_N, T::W_K_ROPE>{},
         mfma_adaptor_swap_ab{});
     auto mma1 = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
@@ -577,92 +577,32 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
         mfma_adaptor_swap_ab{});
 
     // Register fragments
-    using k_nope_tile_t = vector_t<D_NOPE, T::W_N * T::W_K_NOPE / T::WARP_SIZE>;
-    using s_tile_t      = vector_t<D_ACC,  T::W_M * T::W_N / T::WARP_SIZE>;
-    vector_t<D_NOPE, T::GEMM0_E_N * T::W_N * T::W_K_NOPE / T::WARP_SIZE> v_k_nope[2];
-    vector_t<D_ROPE, T::GEMM0_E_N * T::W_N * T::W_K_ROPE / T::WARP_SIZE> v_k_rope[2];
-    typename decltype(mma0_rope)::vtype_c v_s;
-    typename decltype(mma1)::vtype_a      v_p;
-    typename decltype(mma1)::vtype_b      v_v[2];
-    auto v_q_nope_slices = reinterpret_cast<vector_t<D_NOPE, T::W_M * T::W_K_NOPE / T::WARP_SIZE>*>(&v_q_nope);
-    auto v_q_rope_slices = reinterpret_cast<vector_t<D_ROPE, T::W_M * T::W_K_ROPE / T::WARP_SIZE>*>(&v_q_rope);
-    auto v_o_slices      = reinterpret_cast<vector_t<D_ACC,  T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_o);
+    vector_t<D_NOPE, T::GEMM0_NOPE_E_K * T::W_N * T::W_K_NOPE / T::WARP_SIZE> v_k_nope;
+    vector_t<D_ROPE, T::GEMM0_ROPE_E_K * T::W_N * T::W_K_ROPE / T::WARP_SIZE> v_k_rope;
+    vector_t<D_ACC, T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE> v_s;
+    typename decltype(mma1)::vtype_a v_p;
+    typename decltype(mma1)::vtype_b v_v;
+    auto v_s_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>*>(&v_s);
+    auto v_o_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::SLICE_D / T::WARP_SIZE>*>(&v_o);
 
-    // smem slice-stride helpers
-    auto sk_nope_slice = [](auto slice_idx) {
-        constexpr int s = decltype(slice_idx)::value;
-        return number<s * T::smem_n_rpt * (T::smem_linear_wave_nope + T::smem_padding_32B_nope)>{};
+    // smem stage-stride helpers
+    auto sk_nope_stage = [](auto stage_idx) {
+        constexpr int s = decltype(stage_idx)::value;
+        return number<s * (T::W_N / T::smem_n_rpt) * T::D_128B_NOPE_SIZE>{};
     };
-    auto sk_rope_slice = [](auto slice_idx) {
-        constexpr int s = decltype(slice_idx)::value;
-        return number<s * T::SLICE_D>{};
+    auto sk_rope_stage = [](auto stage_idx) {
+        constexpr int s = decltype(stage_idx)::value;
+        return number<s * (T::W_N / T::smem_n_rpt) * T::D_128B_ROPE_SIZE>{};
     };
-    auto sv_slice = [](auto slice_idx) {
-        constexpr int s = decltype(slice_idx)::value;
-        return number<(s / 2) * T::smem_n_rpt * (T::smem_linear_wave_rope + T::smem_padding_32B_rope) + (s % 2) * T::SLICE_D>{};
+    auto sv_stage = [](auto stage_idx) {
+        constexpr int s = decltype(stage_idx)::value;
+        return number<s * (T::SLICE_D / T::D_128B_ROPE_SIZE) * T::smem_n_rpt * (T::smem_linear_wave_rope + T::smem_padding_32B_rope)>{};
     };
 
     // Tile traversal helpers
     auto load_kv_page   = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
     auto kv_nope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_nope_page; };
     auto kv_rope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_rope_page; };
-
-    auto compute_qk_nope = [&](auto& s, auto& q, auto& k, auto& scale_q, auto& v_k_mxscl) {
-        clear(s);
-        auto& scale_k = reinterpret_cast<vector_t<int, T::GEMM0_E_N>&>(v_k_mxscl);
-        static_for<T::GEMM0_NOPE_E_K>([&](auto ek) {
-            constexpr int idx = ek.value;
-            constexpr int slot = idx & 1;
-            auto s_tile = reinterpret_cast<s_tile_t*>(&s);
-            auto k_nope_tile = reinterpret_cast<k_nope_tile_t*>(&k[slot]);
-            s_tile[0] = mfma0_nope(k_nope_tile[0], q[idx], s_tile[0], scale_k[0], scale_q, ek, ek);
-            s_tile[1] = mfma0_nope(k_nope_tile[1], q[idx], s_tile[1], scale_k[1], scale_q, ek, ek);
-            if constexpr (idx + 2 < T::GEMM0_NOPE_E_K) {
-                k[slot] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(number<idx + 2>{}));
-                s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
-            } else if constexpr (idx + 1 < T::GEMM0_NOPE_E_K) {
-                s_waitcnt_lgkmcnt(0_I);
-                // Zero the last K-step's padded D cols [D_NOPE_SIZE, D_NOPE_PADDED_SIZE)
-                constexpr int last_slot   = (idx + 1) & 1;
-                constexpr int n_i2        = T::W_N * T::W_K_NOPE / T::WARP_SIZE / T::VEC_KV_NOPE;
-                constexpr int cols_per_i2 = T::W_K_NOPE / n_i2;
-                constexpr int valid_cols  = T::D_NOPE_SIZE - (T::GEMM0_NOPE_E_K - 1) * T::W_K_NOPE;
-                constexpr int valid_i2    = valid_cols / cols_per_i2;
-                static_assert(valid_cols % cols_per_i2 == 0, "NoPE padding must fall on an i2 boundary");
-                static_for<T::GEMM0_E_N>([&](auto e_n) {
-                    static_for<n_i2>([&](auto i2) {
-                        if constexpr (i2.value >= valid_i2) {
-                            static_for<T::VEC_KV_NOPE>([&](auto v) {
-                                k[last_slot][(e_n.value * n_i2 + i2.value) * T::VEC_KV_NOPE + v.value] = static_cast<D_NOPE>(0);
-                            });
-                        }
-                    });
-                });
-            }
-        });
-    };
-    auto compute_qk_rope = [&](auto& s, auto& q, auto& k) {
-        k[0] = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope);
-        k[1] = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope + sk_rope_slice(1_I));
-        s_waitcnt_lgkmcnt(number<T::k_rope_ds_read_insts>{});
-        s = mma0_rope(q[0], k[0], s);
-        s_waitcnt_lgkmcnt(0_I);
-        s = mma0_rope(q[1], k[1], s);
-    };
-    auto compute_pv = [&](const auto& p, auto& v, auto& o) {
-        static_for<T::NUM_D_SLICES - 2>([&](auto i) {
-            constexpr int idx = i.value;
-            constexpr int slot = idx & 1;
-            o[idx] = mma1(p, v[slot], o[idx]);
-            v[slot] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slice(number<idx + 2>{}));
-            s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
-            __builtin_amdgcn_sched_barrier(0);
-        });
-        o[T::NUM_D_SLICES - 2] = mma1(p, v[(T::NUM_D_SLICES - 2) & 1], o[T::NUM_D_SLICES - 2]);
-        s_waitcnt_lgkmcnt(0_I);
-        __builtin_amdgcn_sched_barrier(0);
-        o[T::NUM_D_SLICES - 1] = mma1(p, v[(T::NUM_D_SLICES - 1) & 1], o[T::NUM_D_SLICES - 1]);
-    };
 
     const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
     auto mask_oob_scores = [&](auto& s, int tile_idx) {
@@ -732,6 +672,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
     }
 }
 
+#if 0
 template<class Traits, bool OddTail, class VQN, class VQR, class VO>
 __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         pa_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
@@ -1440,6 +1381,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         }
     }
 }
+#endif
 
 } // namespace pa_16mx8_32nx1_fp8
 
@@ -1501,30 +1443,30 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        if (num_kv_tiles <= 2) {
+//        if (num_kv_tiles <= 2) {
             pa_prefill_16mx8_32nx1_fp8_le2_tiles<Traits>(
                 kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.total_pages, kargs.kv_indices_prefix,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
                 v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
                 temperature_scale);
-        }
-        if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true>(
-                kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.total_pages, kargs.kv_indices_prefix,
-                page_idx_begin, valid_kv_len, num_kv_tiles,
-                smem_kv,
-                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
-                temperature_scale);
-        }
-        if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false>(
-                kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.total_pages, kargs.kv_indices_prefix,
-                page_idx_begin, valid_kv_len, num_kv_tiles,
-                smem_kv,
-                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
-                temperature_scale);
-        }
+//        }
+//        if (num_kv_tiles > 2 && num_kv_tiles & 1) {
+//            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true>(
+//                kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.total_pages, kargs.kv_indices_prefix,
+//                page_idx_begin, valid_kv_len, num_kv_tiles,
+//                smem_kv,
+//                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
+//                temperature_scale);
+//        }
+//        if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
+//            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false>(
+//                kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.total_pages, kargs.kv_indices_prefix,
+//                page_idx_begin, valid_kv_len, num_kv_tiles,
+//                smem_kv,
+//                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
+//                temperature_scale);
+//        }
     }
 
     // ──── Extend segment ────
@@ -1534,30 +1476,30 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        if (num_kv_tiles <= 2) {
+//        if (num_kv_tiles <= 2) {
             pa_prefill_16mx8_32nx1_fp8_le2_tiles<Traits>(
                 kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.total_tokens, kargs.kv_indices_extend,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
                 v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
                 temperature_scale);
-        }
-        if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true>(
-                kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.total_tokens, kargs.kv_indices_extend,
-                page_idx_begin, valid_kv_len, num_kv_tiles,
-                smem_kv,
-                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
-                temperature_scale);
-        }
-        if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false>(
-                kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.total_tokens, kargs.kv_indices_extend,
-                page_idx_begin, valid_kv_len, num_kv_tiles,
-                smem_kv,
-                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
-                temperature_scale);
-        }
+//        }
+//        if (num_kv_tiles > 2 && num_kv_tiles & 1) {
+//            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true>(
+//                kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.total_tokens, kargs.kv_indices_extend,
+//                page_idx_begin, valid_kv_len, num_kv_tiles,
+//                smem_kv,
+//                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
+//                temperature_scale);
+//        }
+//        if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
+//            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false>(
+//                kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.total_tokens, kargs.kv_indices_extend,
+//                page_idx_begin, valid_kv_len, num_kv_tiles,
+//                smem_kv,
+//                v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
+//                temperature_scale);
+//        }
     }
 
     // ──── Sink finalization, normalize O, and store to gmem ────
