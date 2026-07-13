@@ -623,21 +623,10 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
             } else if constexpr (idx + 1 < T::GEMM0_NOPE_E_K) {
                 s_waitcnt_lgkmcnt(0_I);
                 // Zero the last K-step's padded D cols [D_NOPE_SIZE, D_NOPE_PADDED_SIZE)
-                constexpr int last_slot   = (idx + 1) & 1;
-                constexpr int n_i2        = T::W_N * T::W_K_NOPE / T::WARP_SIZE / T::VEC_KV_NOPE;
-                constexpr int cols_per_i2 = T::W_K_NOPE / n_i2;
-                constexpr int valid_cols  = T::D_NOPE_SIZE - (T::GEMM0_NOPE_E_K - 1) * T::W_K_NOPE;
-                constexpr int valid_i2    = valid_cols / cols_per_i2;
-                static_assert(valid_cols % cols_per_i2 == 0, "NoPE padding must fall on an i2 boundary");
-                static_for<T::GEMM0_E_N>([&](auto e_n) {
-                    static_for<n_i2>([&](auto i2) {
-                        if constexpr (i2.value >= valid_i2) {
-                            static_for<T::VEC_KV_NOPE>([&](auto v) {
-                                k[last_slot][(e_n.value * n_i2 + i2.value) * T::VEC_KV_NOPE + v.value] = static_cast<D_NOPE>(0);
-                            });
-                        }
-                    });
-                });
+                constexpr int last_slot = (idx + 1) & 1;
+                auto& k_blk = reinterpret_cast<vector_t<D_NOPE, 16>(&)[4]>(k[last_slot]);
+                clear(k_blk[1]);
+                clear(k_blk[3]);
             }
         });
     };
@@ -858,21 +847,10 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
             } else if constexpr (idx + 1 < T::GEMM0_NOPE_E_K) {
                 s_waitcnt_lgkmcnt(0_I);
                 // Zero the last K-step's padded D cols [D_NOPE_SIZE, D_NOPE_PADDED_SIZE)
-                constexpr int last_slot   = (idx + 1) & 1;
-                constexpr int n_i2        = T::W_N * T::W_K_NOPE / T::WARP_SIZE / T::VEC_KV_NOPE;
-                constexpr int cols_per_i2 = T::W_K_NOPE / n_i2;
-                constexpr int valid_cols  = T::D_NOPE_SIZE - (T::GEMM0_NOPE_E_K - 1) * T::W_K_NOPE;
-                constexpr int valid_i2    = valid_cols / cols_per_i2;
-                static_assert(valid_cols % cols_per_i2 == 0, "NoPE padding must fall on an i2 boundary");
-                static_for<T::GEMM0_E_N>([&](auto e_n) {
-                    static_for<n_i2>([&](auto i2) {
-                        if constexpr (i2.value >= valid_i2) {
-                            static_for<T::VEC_KV_NOPE>([&](auto v) {
-                                k[last_slot][(e_n.value * n_i2 + i2.value) * T::VEC_KV_NOPE + v.value] = static_cast<D_NOPE>(0);
-                            });
-                        }
-                    });
-                });
+                constexpr int last_slot = (idx + 1) & 1;
+                auto& k_blk = reinterpret_cast<vector_t<D_NOPE, 16>(&)[4]>(k[last_slot]);
+                clear(k_blk[1]);
+                clear(k_blk[3]);
             }
         });
     };

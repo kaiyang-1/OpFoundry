@@ -475,7 +475,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_kernel(opus_gq
         sched_barrier_pairs<4, 5, 2>();
         bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
-        row_max = all_below ? m_row : row_max;
+        row_max = all_below ? m_row : max(m_row, row_max);
         v_o = mma1.step_k(1_I, v_p, v_v, v_o);
         v_o = mma1.step_k(2_I, v_p, v_v, v_o);
         v_o = mma1.step_k(3_I, v_p, v_v, v_o);
@@ -487,9 +487,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_kernel(opus_gq
         sched_barrier_exp_pairs<6, 3, 2>();
         if (!all_below) {
             rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-            scale_output_tile<T>(v_o, rescale_m);
             l_row *= rescale_m;
             m_row = row_max;
+            scale_output_tile<T>(v_o, rescale_m);
         }
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
@@ -539,7 +539,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_kernel(opus_gq
         sched_barrier_pairs<4, 5, 4>();
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
-        row_max = all_below ? m_row : row_max;
+        row_max = all_below ? m_row : max(m_row, row_max);
         v_o = mma1.step_k(1_I, v_p, v_v, v_o);
         v_o = mma1.step_k(2_I, v_p, v_v, v_o);
         v_o = mma1.step_k(3_I, v_p, v_v, v_o);
@@ -551,9 +551,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_kernel(opus_gq
         sched_barrier_exp_pairs<6, 3, 4>();
         if (!all_below) {
             rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-            scale_output_tile<T>(v_o, rescale_m);
             l_row *= rescale_m;
             m_row = row_max;
+            scale_output_tile<T>(v_o, rescale_m);
         }
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
