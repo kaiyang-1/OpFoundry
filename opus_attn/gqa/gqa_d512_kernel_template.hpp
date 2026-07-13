@@ -536,17 +536,17 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d512_kernel(opus_gq
         D_ACC row_max = attn_row_max<T>(v_s[1]);
         bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
-        if (__builtin_expect(all_below, 1)) {
-            row_max = m_row;
-        } else {
-            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-            scale_output_tile<T>(v_o, rescale_m);
-            l_row *= rescale_m;
-            m_row = row_max;
-        }
+        row_max = all_below ? m_row : max(m_row, row_max);
         attn_sub_row<T>(v_s[1], row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
         asm volatile("" : "+v"(v_s[1]) ::);
+        __builtin_amdgcn_sched_barrier(0);
+        if (!all_below) {
+            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+            l_row *= rescale_m;
+            m_row = row_max;
+            scale_output_tile<T>(v_o, rescale_m);
+        }
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -598,17 +598,17 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d512_kernel(opus_gq
         row_max = attn_row_max<T>(v_s[0]);
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
-        if (__builtin_expect(all_below, 1)) {
-            row_max = m_row;
-        } else {
-            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-            scale_output_tile<T>(v_o, rescale_m);
-            l_row *= rescale_m;
-            m_row = row_max;
-        }
+        row_max = all_below ? m_row : max(m_row, row_max);
         attn_sub_row<T>(v_s[0], row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
         asm volatile("" : "+v"(v_s[0]) ::);
+        __builtin_amdgcn_sched_barrier(0);
+        if (!all_below) {
+            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+            l_row *= rescale_m;
+            m_row = row_max;
+            scale_output_tile<T>(v_o, rescale_m);
+        }
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
