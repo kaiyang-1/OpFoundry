@@ -260,18 +260,6 @@ __device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
     opus::static_for<o_len>([&](auto i) { v_o[i.value] *= scale;});
 }
 
-template<typename V>
-__device__ inline void pin_output_tile(V& v_o) {
-    using chunk_t = opus::vector_t<float, 8>;
-    constexpr int num_chunks = opus::vector_traits<V>::size() / opus::vector_traits<chunk_t>::size();
-    static_assert(opus::vector_traits<V>::size() % opus::vector_traits<chunk_t>::size() == 0);
-    auto& chunks = reinterpret_cast<chunk_t(&)[num_chunks]>(v_o);
-    #pragma unroll
-    for (int i = 0; i < num_chunks; i++) {
-        asm volatile("" : "+v"(chunks[i]) ::);
-    }
-}
-
 template<int THR_X, int THR_Y>
 __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr, opus::u32_t neg_inf_vgpr,
                                           opus::u32_t& x_ref, opus::u32_t& y_ref) {
@@ -772,7 +760,6 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -827,7 +814,6 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         asm volatile("" : "+v"(v_p) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -893,7 +879,6 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -944,7 +929,6 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         asm volatile("" : "+v"(v_s[0]) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -999,7 +983,6 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         asm volatile("" : "+v"(v_p) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);

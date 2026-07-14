@@ -406,18 +406,6 @@ __device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
     opus::static_for<o_len>([&](auto i) { v_o[i.value] *= scale; });
 }
 
-template<typename V>
-__device__ inline void pin_output_tile(V& v_o) {
-    using chunk_t = opus::vector_t<float, 8>;
-    constexpr int num_chunks = opus::vector_traits<V>::size() / opus::vector_traits<chunk_t>::size();
-    static_assert(opus::vector_traits<V>::size() % opus::vector_traits<chunk_t>::size() == 0);
-    auto& chunks = reinterpret_cast<chunk_t(&)[num_chunks]>(v_o);
-    #pragma unroll
-    for (int i = 0; i < num_chunks; i++) {
-        asm volatile("" : "+v"(chunks[i]) ::);
-    }
-}
-
 template<typename T, typename V>
 __device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
     using D_ACC = typename T::D_ACC;
@@ -710,7 +698,6 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
         l_row += attn_row_sum<T>(v_s);
         v_p = cast<D_ROPE>(v_s);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
@@ -1152,7 +1139,6 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1213,7 +1199,6 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         asm volatile("" : "+v"(v_p) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -1285,7 +1270,6 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1343,7 +1327,6 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         asm volatile("" : "+v"(v_s[0]) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1404,7 +1387,6 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         asm volatile("" : "+v"(v_p) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
