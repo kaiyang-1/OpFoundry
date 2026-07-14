@@ -421,6 +421,8 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
         static_for([&](auto i) { v_k_nope[i.value] = static_cast<D_NOPE>(0); }, number<k_nope_vals>{}, number<k_nope_len>{});
 
         auto v_k_mxscl = load<T::VEC_KV_NOPE>(g_k_nope, kv_nope_offset(kv_page) + T::D_NOPE_SIZE);
+        v_k_mxscl[14] = static_cast<D_NOPE>(0);
+        v_k_mxscl[15] = static_cast<D_NOPE>(0);
         reorder_mxscl_for_opsel<T>(v_k_mxscl);
 
         // ──── GEMM0: S = Q·Kᵀ  (NoPE MXFP8) ────
@@ -535,6 +537,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     // NoPE mx scales (fp8 E8M0, one per 32-elem K block).
     auto u_q_mxscl = make_layout_q_mxscl<T>(lane_id);
     auto v_q_mxscl = load<1>(g_q_nope, u_q_mxscl + T::D_NOPE_SIZE);
+    v_q_mxscl[3] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_q_mxscl[3];
     int scale_q = reinterpret_cast<int&>(v_q_mxscl);
 
     // Output accumulator and online-softmax state.
