@@ -443,6 +443,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row);
     }
 
+    __builtin_amdgcn_s_barrier();
+
     // ──── Extend segment ────
     {
         const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];

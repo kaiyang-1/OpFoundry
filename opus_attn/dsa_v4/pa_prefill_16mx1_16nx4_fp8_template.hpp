@@ -561,6 +561,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
             temperature_scale);
     }
 
+    __builtin_amdgcn_s_barrier();
+
     // ──── Extend segment ────
     {
         const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
