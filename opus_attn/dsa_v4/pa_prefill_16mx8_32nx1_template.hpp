@@ -514,7 +514,7 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         constexpr int s = decltype(slice_idx)::value;
         return number<(s / 2) * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B) + (s % 2) * T::SLICE_D>{};
     };
-    int kv_page[4];
+    int kv_page[2];
 
     auto compute_qk = [&](auto& s, const auto& q, auto& k, auto& sk, auto rk_offset) {
         clear(s);
@@ -554,16 +554,16 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
     };
 
     // Prologue
-    kv_page[2] = load_kv_page(0);
-    async_load<T::VEC_KV>(g_kv, s_kv[0].ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv);
+    int pg = load_kv_page(0);
+    async_load<T::VEC_KV>(g_kv, s_kv[0].ptr, u_gkv + kv_token_offset(pg), u_skv);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
-    kv_page[0] = load_kv_page(1);
-    async_load<T::VEC_KV>(g_kv, s_kv[0].ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv + kv_slot_offset);
+    pg = load_kv_page(1);
+    async_load<T::VEC_KV>(g_kv, s_kv[0].ptr, u_gkv + kv_token_offset(pg), u_skv + kv_slot_offset);
     __builtin_amdgcn_sched_barrier(0);
-    kv_page[1] = load_kv_page(2);
+    kv_page[0] = load_kv_page(2);
     v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk);
     v_k[1] = load<T::VEC_KV>(s_kv[0], u_rk + skv_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
@@ -597,9 +597,9 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
     for (int j = 1; j < num_kv_tiles - 3; j += 2) {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
+        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
         __builtin_amdgcn_sched_barrier(0);
-        kv_page[2] = load_kv_page(j + 2);
+        kv_page[1] = load_kv_page(j + 2);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
         v_k[1] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
@@ -654,9 +654,9 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
 
         // Cluster 4:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv + kv_slot_offset);
+        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv + kv_slot_offset);
         __builtin_amdgcn_sched_barrier(0);
-        kv_page[3] = load_kv_page(j + 3);
+        kv_page[0] = load_kv_page(j + 3);
         v_k[0] = load<T::VEC_KV>(s_kv[1], u_rk);
         v_k[1] = load<T::VEC_KV>(s_kv[1], u_rk + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
@@ -709,8 +709,6 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        kv_page[0] = kv_page[2];
-        kv_page[1] = kv_page[3];
         std::swap(s_kv[0], s_kv[1]);
     }
 
@@ -718,7 +716,7 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
     if constexpr (OddTail) {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
+        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
         v_k[1] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
@@ -835,9 +833,9 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
     } else {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
+        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
         __builtin_amdgcn_sched_barrier(0);
-        kv_page[2] = load_kv_page(num_kv_tiles - 1);
+        kv_page[1] = load_kv_page(num_kv_tiles - 1);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
         v_k[1] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
@@ -886,7 +884,7 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
 
         // Cluster 4:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv + kv_slot_offset);
+        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv + kv_slot_offset);
         v_k[0] = load<T::VEC_KV>(s_kv[1], u_rk);
         v_k[1] = load<T::VEC_KV>(s_kv[1], u_rk + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});

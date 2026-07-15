@@ -806,7 +806,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
     constexpr int mxscl_col   = T::D_NOPE_SIZE % T::D_128B_NOPE_SIZE;
 
     // Tile traversal helpers
-    int kv_page[4];
+    int kv_page[2];
     auto load_kv_page   = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
     auto kv_nope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_nope_page; };
     auto kv_rope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_rope_page; };
@@ -909,16 +909,16 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
     };
 
     // Prologue
-    kv_page[2] = load_kv_page(0);
-    async_load_kv(0_I, kv_page[2]);
+    int pg = load_kv_page(0);
+    async_load_kv(0_I, pg);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
-    kv_page[0] = load_kv_page(1);
-    async_load_kv(1_I, kv_page[0]);
+    pg = load_kv_page(1);
+    async_load_kv(1_I, pg);
     __builtin_amdgcn_sched_barrier(0);
-    kv_page[1] = load_kv_page(2);
+    kv_page[0] = load_kv_page(2);
     v_k_mxscl = load_mxscl(0_I);
     v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
     v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
@@ -961,8 +961,8 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         v_k_mxscl = load_mxscl(k_nope_slot_off);
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off + sk_nope_slice(1_I));
-        async_load_kv(0_I, kv_page[1]);
-        kv_page[2] = load_kv_page(j + 2);
+        async_load_kv(0_I, kv_page[0]);
+        kv_page[1] = load_kv_page(j + 2);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -1024,8 +1024,8 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         v_k_mxscl = load_mxscl(0_I);
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
-        async_load_kv(1_I, kv_page[2]);
-        kv_page[3] = load_kv_page(j + 3);
+        async_load_kv(1_I, kv_page[1]);
+        kv_page[0] = load_kv_page(j + 3);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -1081,9 +1081,6 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
-
-        kv_page[0] = kv_page[2];
-        kv_page[1] = kv_page[3];
     }
 
     // Epilogue
@@ -1093,7 +1090,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         v_k_mxscl = load_mxscl(k_nope_slot_off);
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off + sk_nope_slice(1_I));
-        async_load_kv(0_I, kv_page[1]);
+        async_load_kv(0_I, kv_page[0]);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -1223,8 +1220,8 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         v_k_mxscl = load_mxscl(k_nope_slot_off);
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off + sk_nope_slice(1_I));
-        async_load_kv(0_I, kv_page[1]);
-        kv_page[2] = load_kv_page(num_kv_tiles - 1);
+        async_load_kv(0_I, kv_page[0]);
+        kv_page[1] = load_kv_page(num_kv_tiles - 1);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -1280,7 +1277,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         v_k_mxscl = load_mxscl(0_I);
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
-        async_load_kv(1_I, kv_page[2]);
+        async_load_kv(1_I, kv_page[1]);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         __builtin_amdgcn_sched_barrier(0);
