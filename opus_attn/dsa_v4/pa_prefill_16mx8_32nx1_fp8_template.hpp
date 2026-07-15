@@ -512,7 +512,7 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
 }
 
 template<class T, class V>
-__device__ inline void attn_mask_oob_value(V& v, int valid_kv_len, int kv_tile_idx) {
+__device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile_idx) {
     using D_ROPE = typename T::D_ROPE;
     
     if ((kv_tile_idx + 1) * T::KV_TILE_SIZE <= valid_kv_len) return;
@@ -525,10 +525,10 @@ __device__ inline void attn_mask_oob_value(V& v, int valid_kv_len, int kv_tile_i
     constexpr int en_stride = opus::vector_traits<V>::size() / T::GEMM1_E_N;
     opus::static_for<en_stride>([&](auto ik) {
         constexpr int k   = ik.value;
-        constexpr int thr = ((k / T::VEC_TR_V) & 1) * (T::W_K_ROPE / 2) + (k % T::VEC_TR_V);
+        constexpr int thr = (k / T::VEC_TR_V) * (T::W_K_ROPE / 2) + (k % T::VEC_TR_V);
         if (thr > rel) {
             opus::static_for<T::GEMM1_E_N>([&](auto e) {
-                v[e.value * en_stride + k] = static_cast<D_ROPE>(0);
+                v_v[e.value * en_stride + k] = static_cast<D_ROPE>(0);
             });
         }
     });
