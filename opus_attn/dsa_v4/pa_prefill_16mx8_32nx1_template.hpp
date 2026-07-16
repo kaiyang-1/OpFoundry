@@ -223,10 +223,10 @@ __device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
 }
 
 template<typename T, typename V>
-__device__ inline void attn_sub_row(V& v_s, typename T::D_ACC row_max) {
+__device__ inline void attn_row_scale_sub(V& v_s, typename T::D_ACC scale, typename T::D_ACC row_max) {
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
     opus::static_for<s_len>([&](auto i) {
-        v_s[i.value] -= row_max;
+        v_s[i.value] = __builtin_fmaf(v_s[i.value], scale, -row_max);
     });
 }
 
@@ -352,7 +352,8 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
                                            opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
                                            opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
                                            typename Traits::D_ACC& m_row,
-                                           typename Traits::D_ACC& l_row) {
+                                           typename Traits::D_ACC& l_row,
+                                           typename Traits::D_ACC temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
@@ -447,10 +448,10 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
         compute_qk(v_s, v_q_slices, v_k);
         attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, neg_inf_v);
 
-        D_ACC row_max = max(m_row, attn_row_max<T>(v_s));
+        D_ACC row_max = max(m_row, attn_row_max<T>(v_s) * temperature_scale);
         D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s, row_max);
+        attn_row_scale_sub<T>(v_s, temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_len>(v_s);
         l_row *= rescale_m;
         l_row += attn_row_sum<T>(v_s);
@@ -474,7 +475,8 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
                                            opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
                                            opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
                                            typename Traits::D_ACC& m_row,
-                                           typename Traits::D_ACC& l_row) {
+                                           typename Traits::D_ACC& l_row,
+                                           typename Traits::D_ACC temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
@@ -601,11 +603,11 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         __builtin_amdgcn_s_barrier();
     }
 
-    D_ACC row_max = attn_row_max<T>(v_s[0]);
+    D_ACC row_max = attn_row_max<T>(v_s[0]) * temperature_scale;
     bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
     bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
     row_max = all_below ? m_row : max(m_row, row_max);
-    attn_sub_row<T>(v_s[0], row_max);
+    attn_row_scale_sub<T>(v_s[0], temperature_scale, row_max);
     attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
     asm volatile("" : "+v"(v_s[0]) ::);
     __builtin_amdgcn_sched_barrier(0);
@@ -658,11 +660,11 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         // Cluster 3:
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_kv[0], 0_I, false_type{});
-        row_max = attn_row_max<T>(v_s[1]);
+        row_max = attn_row_max<T>(v_s[1]) * temperature_scale;
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
         row_max = all_below ? m_row : max(m_row, row_max);
-        attn_sub_row<T>(v_s[1], row_max);
+        attn_row_scale_sub<T>(v_s[1], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
@@ -715,11 +717,11 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         // Cluster 7:
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_kv[0], kv_slot_offset, false_type{});
-        row_max = attn_row_max<T>(v_s[0]);
+        row_max = attn_row_max<T>(v_s[0]) * temperature_scale;
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
         row_max = all_below ? m_row : max(m_row, row_max);
-        attn_sub_row<T>(v_s[0], row_max);
+        attn_row_scale_sub<T>(v_s[0], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
         asm volatile("" : "+v"(v_s[0]) ::);
         __builtin_amdgcn_sched_barrier(0);
@@ -775,10 +777,10 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         // Cluster 3:
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_kv[0], 0_I, false_type{});
-        row_max = max(m_row, attn_row_max<T>(v_s[1]));
+        row_max = max(m_row, attn_row_max<T>(v_s[1]) * temperature_scale);
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s[1], row_max);
+        attn_row_scale_sub<T>(v_s[1], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
@@ -822,10 +824,10 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         // Cluster 7:
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_kv[0], kv_slot_offset, false_type{});
-        row_max = max(m_row, attn_row_max<T>(v_s[0]));
+        row_max = max(m_row, attn_row_max<T>(v_s[0]) * temperature_scale);
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s[0], row_max);
+        attn_row_scale_sub<T>(v_s[0], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
         asm volatile("" : "+v"(v_s[0]) ::);
         __builtin_amdgcn_sched_barrier(0);
@@ -894,10 +896,10 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         // Cluster 3:
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_kv[0], 0_I, false_type{});
-        row_max = max(m_row, attn_row_max<T>(v_s[1]));
+        row_max = max(m_row, attn_row_max<T>(v_s[1]) * temperature_scale);
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s[1], row_max);
+        attn_row_scale_sub<T>(v_s[1], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
@@ -944,10 +946,10 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         // Cluster 7:
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_kv[0], kv_slot_offset, false_type{});
-        row_max = max(m_row, attn_row_max<T>(v_s[0]));
+        row_max = max(m_row, attn_row_max<T>(v_s[0]) * temperature_scale);
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s[0], row_max);
+        attn_row_scale_sub<T>(v_s[0], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
         asm volatile("" : "+v"(v_s[0]) ::);
         __builtin_amdgcn_sched_barrier(0);
@@ -991,10 +993,10 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
         // Cluster 11:
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, s_kv[1], 0_I, false_type{});
-        row_max = max(m_row, attn_row_max<T>(v_s[1]));
+        row_max = max(m_row, attn_row_max<T>(v_s[1]) * temperature_scale);
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s[1], row_max);
+        attn_row_scale_sub<T>(v_s[1], temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
@@ -1056,14 +1058,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     vector_t<D_ATTN, T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_q;
     vector_t<D_ACC,  T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_o;
 
-    constexpr index_t q_len = vector_traits<decltype(v_q)>::size();
-    constexpr float LOG2_E = 1.44269504089f;
-    const float temperature_scale = kargs.softmax_scale * LOG2_E;
+    constexpr D_ACC LOG2_E = 1.44269504089f;
+    const D_ACC temperature_scale = kargs.softmax_scale * LOG2_E;
 
     v_q = load<T::VEC_Q>(g_q, u_q);
-    auto v_q_f32 = cast<float>(v_q);
-    static_for<q_len>([&](auto i) { v_q_f32[i.value] *= temperature_scale; });
-    v_q = cast<D_ATTN>(v_q_f32);
 
     // Initialize shared attention state
     clear(v_o);
@@ -1078,13 +1076,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row);
+            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row);
+            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row);
+            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
     }
 
@@ -1098,13 +1096,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row);
+            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row);
+            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row);
+            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
     }
 

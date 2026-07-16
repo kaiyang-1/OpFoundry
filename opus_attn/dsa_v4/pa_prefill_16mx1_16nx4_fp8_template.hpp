@@ -366,7 +366,7 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
         char* smem_kv, char* smem_ml, char* smem_p,
         VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
         typename Traits::D_ACC& m_row, typename Traits::D_ACC& l_row,
-        float temperature_scale) {
+        typename Traits::D_ACC temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_NOPE = typename T::D_NOPE;
@@ -533,8 +533,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     __shared__ char smem_ml[2 * T::T_N * T::W_M * sizeof(D_ACC)];  // for inter-warp reduction
     __shared__ char smem_p[T::T_N * T::W_M * T::W_N * sizeof(D_ROPE)]; // for combining P across warps before PV compute
 
-    constexpr float LOG2_E = 1.44269504089f;
-    const float temperature_scale = kargs.softmax_scale * LOG2_E;
+    constexpr D_ACC LOG2_E = 1.44269504089f;
+    const D_ACC temperature_scale = kargs.softmax_scale * LOG2_E;
 
     // Load Q tile from global memory to registers
     auto g_q_nope = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.q_nope_ptr) + q_nope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_nope_h * sizeof(D_NOPE));

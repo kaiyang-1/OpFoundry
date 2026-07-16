@@ -542,7 +542,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
         char* smem_kv,
         VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
         typename Traits::D_ACC& m_row, typename Traits::D_ACC& l_row,
-        float temperature_scale) {
+        typename Traits::D_ACC temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_NOPE = typename T::D_NOPE;
@@ -741,7 +741,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         char* smem_kv,
         VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
         typename Traits::D_ACC& m_row, typename Traits::D_ACC& l_row,
-        float temperature_scale) {
+        typename Traits::D_ACC temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_NOPE = typename T::D_NOPE;
@@ -1472,8 +1472,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
 
     __shared__ char smem_kv[4 * T::smem_kv_bytes()];
 
-    constexpr float LOG2_E = 1.44269504089f;
-    const float temperature_scale = kargs.softmax_scale * LOG2_E;
+    constexpr D_ACC LOG2_E = 1.44269504089f;
+    const D_ACC temperature_scale = kargs.softmax_scale * LOG2_E;
 
     // Output accumulator and online-softmax state.
     vector_t<D_ACC, T::Q_TILE_SIZE * T::D_HEAD_SIZE / (T::T_N * T::WARP_SIZE)> v_o;

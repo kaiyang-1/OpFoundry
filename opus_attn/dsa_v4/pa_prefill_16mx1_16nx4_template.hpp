@@ -212,10 +212,10 @@ __device__ inline typename T::D_ACC attn_row_max(const V& v_s, S& s_m, int warp_
 }
 
 template<typename T, typename V>
-__device__ inline void attn_sub_row(V& v_s, typename T::D_ACC row_max) {
+__device__ inline void attn_row_scale_sub(V& v_s, typename T::D_ACC scale, typename T::D_ACC row_max) {
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
     opus::static_for<s_len>([&](auto i) {
-        v_s[i.value] -= row_max;
+        v_s[i.value] = __builtin_fmaf(v_s[i.value], scale, -row_max);
     });
 }
 
@@ -319,7 +319,8 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_kargs kargs,
                                                 char* smem_kv, char* smem_ml, char* smem_p,
                                                 VQ& v_q, VO& v_o,
                                                 typename Traits::D_ACC& m_row,
-                                                typename Traits::D_ACC& l_row) {
+                                                typename Traits::D_ACC& l_row,
+                                                typename Traits::D_ACC temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
@@ -380,10 +381,10 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_kargs kargs,
         v_s = mma0(v_q, v_k);
         attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, warp_id, lane_id);
 
-        D_ACC row_max = max(m_row, attn_row_max<T>(v_s, s_m, warp_id, lane_id));
+        D_ACC row_max = max(m_row, attn_row_max<T>(v_s, s_m, warp_id, lane_id) * temperature_scale);
         D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_sub_row<T>(v_s, row_max);
+        attn_row_scale_sub<T>(v_s, temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_len>(v_s);
         l_row *= rescale_m;
         l_row += attn_row_sum<T>(v_s, s_l, warp_id, lane_id);
@@ -436,14 +437,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     vector_t<D_ATTN, T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_q;
     vector_t<D_ACC,  T::Q_TILE_SIZE * T::D_TILE_SIZE / (T::T_N * T::WARP_SIZE)> v_o;
 
-    constexpr index_t q_len = vector_traits<decltype(v_q)>::size();
-    constexpr float LOG2_E = 1.44269504089f;
-    const float temperature_scale = kargs.softmax_scale * LOG2_E;
+    constexpr D_ACC LOG2_E = 1.44269504089f;
+    const D_ACC temperature_scale = kargs.softmax_scale * LOG2_E;
 
     v_q = load<T::VEC_Q>(g_q, u_q);
-    auto v_q_f32 = cast<float>(v_q);
-    static_for<q_len>([&](auto i) { v_q_f32[i.value] *= temperature_scale; });
-    v_q = cast<D_ATTN>(v_q_f32);
 
     // Initialize shared attention state
     clear(v_o);
@@ -457,7 +454,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row);
+        pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
     }
 
     __builtin_amdgcn_s_barrier();
@@ -469,7 +466,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row);
+        pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
     }
 
     // ──── Sink finalization, normalize O, and store to gmem ────
