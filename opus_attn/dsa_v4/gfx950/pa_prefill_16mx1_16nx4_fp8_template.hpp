@@ -1,7 +1,7 @@
 #pragma once
 
 #include <opus/opus.hpp>
-#include "pa_defs.h"
+#include "pa_traits.h"
 #include <bit>
 #include <cstdint>
 

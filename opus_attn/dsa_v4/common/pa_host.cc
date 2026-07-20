@@ -15,9 +15,9 @@
 #include <type_traits>
 #include <omp.h>
 
-#include "pa_defs.h"
+#if defined(PA_ARCH_GFX950)
+#include "gfx950/pa_traits.h"
 
-// Declared in per-variant/per-dtype kernel instantiation TUs.
 template<class Traits>
 __global__ void pa_prefill_16mx1_16nx4_kernel(pa_kargs kargs);
 template<class Traits>
@@ -48,6 +48,14 @@ inline void pa_launch(pa_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>,
                       const pa_fp8_kargs& kargs, dim3 grid, dim3 block) {
     pa_prefill_16mx8_32nx1_fp8_kernel<pa_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
+
+#elif defined(PA_ARCH_GFX1250)
+#include "gfx1250/pa_traits.h"
+
+#  error "gfx1250 PA host glue not implemented yet (add kernels, pa_launch() overloads, and trait selection here)"
+#else
+#  error "No target arch defined. The Makefile passes PA_ARCH_<ARCH> from ARCH (e.g. ARCH=gfx950)."
+#endif
 
 #define CHECK_HIP(call)                                                                                   \
     do {                                                                                                  \
@@ -742,6 +750,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+#if defined(PA_ARCH_GFX950)
     if (use_fp8) {
         return H <= 32
             ? run_pa_case<pa_16mx1_16nx4_fp8_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
@@ -750,4 +759,5 @@ int main(int argc, char** argv) {
     return H <= 32
         ? run_pa_case<pa_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
         : run_pa_case<pa_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+#endif
 }

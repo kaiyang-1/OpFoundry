@@ -2,7 +2,7 @@
 // Host pass: empty stub for __device_stub__ generation
 // Device pass: includes full kernel template
 #include <opus/hip_minimal.hpp>
-#include "pa_defs.h"
+#include "pa_traits.h"
 
 #ifndef __HIP_DEVICE_COMPILE__
 template<typename Traits> __global__ void pa_prefill_16mx1_16nx4_kernel(pa_kargs kargs) {}
