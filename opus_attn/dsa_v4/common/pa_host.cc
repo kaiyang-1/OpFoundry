@@ -162,7 +162,9 @@ void init_sparse_kv_indices(std::vector<int>& kv_indptr,
         }
 
         std::shuffle(pages.begin(), pages.end(), gen);
+        const size_t seg_begin = kv_indices.size();
         kv_indices.insert(kv_indices.end(), pages.begin(), pages.begin() + nnz);
+        std::sort(kv_indices.begin() + seg_begin, kv_indices.end());
         assert(kv_indices.size() <= static_cast<size_t>(std::numeric_limits<int>::max()));
         kv_indptr[q + 1] = static_cast<int>(kv_indices.size());
     }
@@ -173,6 +175,8 @@ void init_sparse_kv_indices(std::vector<int>& kv_indptr,
         assert(kv_indptr[q] <= kv_indptr[q + 1]);
         for (int p = kv_indptr[q]; p < kv_indptr[q + 1]; ++p) {
             assert(kv_indices[p] >= 0 && kv_indices[p] < total_pages);
+            if (p > kv_indptr[q])
+                assert(kv_indices[p] >= kv_indices[p - 1]);
         }
     }
 }
