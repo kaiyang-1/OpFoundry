@@ -9,6 +9,7 @@
 #include <opus/opus.hpp>
 #include "pa_traits.h"
 #include <cstdint>
+#include <bit>
 
 using opus::operator""_I;
 
@@ -113,6 +114,46 @@ __device__ inline auto make_layout_rv(int lane_id) {
         v_block_shape,
         opus::unfold_x_stride(v_block_dim, v_block_shape, opus::tuple{opus::number<lane_n * T::VEC_KV>{}, opus::number<T::D_TILE_SIZE + T::KV_ROW_PAD_SIZE>{}, 1_I}),
         opus::unfold_p_coord(v_block_dim, opus::tuple{lane_id / lane_per_grp, (lane_id % lane_per_grp) % lane_k, (lane_id % lane_per_grp) / lane_k}));
+}
+
+template<typename T, typename V>
+__device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
+    using D_ACC = typename T::D_ACC;
+    constexpr opus::index_t s_len = opus::vector_traits<V>::size();
+    D_ACC row_max = -1e30f;
+    opus::static_for<s_len>([&](auto i) {
+        row_max = max(row_max, v_s[i.value]);
+    });
+    opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
+    return max(std::bit_cast<float>(res16.x), std::bit_cast<float>(res16.y));
+}
+
+template<typename T, typename V>
+__device__ inline void attn_row_scale_sub(V& v_s, typename T::D_ACC scale, typename T::D_ACC row_max) {
+    constexpr opus::index_t s_len = opus::vector_traits<V>::size();
+    opus::static_for<s_len>([&](auto i) {
+        v_s[i.value] = __builtin_fmaf(v_s[i.value], scale, -row_max);
+    });
+}
+
+template<typename T, opus::index_t Offset, opus::index_t Count, typename V>
+__device__ inline void attn_exp2_slice(V& v_s) {
+    opus::static_for<Count>([&](auto i) {
+        constexpr opus::index_t idx = Offset + i.value;
+        v_s[idx] = __builtin_amdgcn_exp2f(v_s[idx]);
+    });
+}
+
+template<typename T, typename V>
+__device__ inline typename T::D_ACC attn_row_sum(const V& v_s) {
+    using D_ACC = typename T::D_ACC;
+    constexpr opus::index_t s_len = opus::vector_traits<V>::size();
+    D_ACC row_sum = 0.0f;
+    opus::static_for<s_len>([&](auto i) {
+        row_sum += v_s[i.value];
+    });
+    opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
+    return std::bit_cast<float>(res16.x) + std::bit_cast<float>(res16.y);
 }
 
 template<typename T, typename V>
@@ -236,8 +277,19 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
             clear(v_s_stages[stage]);
             v_s_stages[stage] = mma0(v_q, v_k, v_s_stages[stage]);
         });
+        __builtin_amdgcn_sched_barrier(0);
 
+        D_ACC row_max = max(m_row, attn_row_max<T>(v_s) * temperature_scale);
+        D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+        m_row = row_max;
+        attn_row_scale_sub<T>(v_s, temperature_scale, row_max);
+        constexpr index_t s_len = vector_traits<decltype(v_s)>::size();
+        attn_exp2_slice<T, 0, s_len>(v_s);
+        l_row *= rescale_m;
+        l_row += attn_row_sum<T>(v_s);
         v_p = cast<D_ATTN>(v_s);
+        scale_output_tile<T>(v_o, rescale_m);
+        __builtin_amdgcn_sched_barrier(0);
 
         static_for<T::GEMM1_STAGE_N * T::GEMM1_STAGE_K>([&](auto s) {
             constexpr int stage = s.value;
@@ -246,6 +298,7 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
             
             tr_load_v(number<stage_n>{}, number<stage_k>{});
             s_wait_dscnt(0_I);
+            __builtin_amdgcn_sched_barrier(0);
             v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v, v_o_stages[stage_n]);
         });
     }

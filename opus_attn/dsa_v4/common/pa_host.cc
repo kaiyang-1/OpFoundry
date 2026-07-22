@@ -52,7 +52,14 @@ inline void pa_launch(pa_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>,
 #elif defined(PA_ARCH_GFX1250)
 #include "gfx1250/pa_traits.h"
 
-#  error "gfx1250 PA host glue not implemented yet (add kernels, pa_launch() overloads, and trait selection here)"
+template<class Traits>
+__global__ void pa_prefill_16mx4_64nx1_kernel(pa_kargs kargs);
+
+template<int Q, int KV, int D, int NW, class DT, class DO>
+inline void pa_launch(pa_16mx4_64nx1_traits<Q, KV, D, NW, DT, DO>,
+                      const pa_kargs& kargs, dim3 grid, dim3 block) {
+    pa_prefill_16mx4_64nx1_kernel<pa_16mx4_64nx1_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
+}
 #else
 #  error "No target arch defined. The Makefile passes PA_ARCH_<ARCH> from ARCH (e.g. ARCH=gfx950)."
 #endif
@@ -763,5 +770,11 @@ int main(int argc, char** argv) {
     return H <= 32
         ? run_pa_case<pa_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
         : run_pa_case<pa_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+#elif defined(PA_ARCH_GFX1250)
+    if (use_fp8) {
+        std::cerr << "gfx1250: only the bf16 16mx4_64nx1 variant is implemented; -dtype fp8 is unsupported.\n";
+        return 1;
+    }
+    return run_pa_case<pa_16mx4_64nx1_traits<16, 64, 512, 4, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
 #endif
 }
