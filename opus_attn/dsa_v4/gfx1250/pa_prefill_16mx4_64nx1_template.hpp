@@ -71,6 +71,50 @@ __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h) {
         opus::unfold_p_coord(o_block_dim, opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
 }
 
+template<class T>
+__device__ inline auto make_layout_rk(int lane_id) {
+    constexpr auto k_block_shape = opus::make_tuple(
+        opus::number<T::GEMM0_E_N>{},
+        opus::number<T::W_N>{},
+        opus::number<T::D_TILE_SIZE / T::W_K>{},
+        opus::number<T::W_N * T::W_K / (T::WARP_SIZE * T::VEC_KV)>{},
+        opus::number<T::WARP_SIZE / T::W_N>{},
+        opus::number<T::VEC_KV>{});
+
+    constexpr auto k_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout(
+        k_block_shape,
+        opus::unfold_x_stride(k_block_dim, k_block_shape, opus::tuple{opus::number<T::D_TILE_SIZE + T::KV_ROW_PAD_SIZE>{}, 1_I}),
+        opus::unfold_p_coord(k_block_dim, opus::tuple{lane_id % T::W_N, lane_id / T::W_N}));
+}
+
+template<class T>
+__device__ inline auto make_layout_rv(int lane_id) {
+    constexpr int lane_per_grp = 16;
+    constexpr int lane_n = 2;
+    constexpr int lane_k = lane_per_grp / lane_n;
+
+    constexpr auto v_block_shape = opus::make_tuple(
+        opus::number<T::GEMM1_E_N>{},
+        opus::number<T::WARP_SIZE / lane_per_grp>{},
+        opus::number<lane_k>{},
+        opus::number<lane_n>{},
+        opus::number<T::VEC_KV>{});
+    
+    constexpr auto v_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+    
+    return opus::make_layout(
+        v_block_shape,
+        opus::unfold_x_stride(v_block_dim, v_block_shape, opus::tuple{opus::number<lane_n * T::VEC_KV>{}, opus::number<T::D_TILE_SIZE + T::KV_ROW_PAD_SIZE>{}, 1_I}),
+        opus::unfold_p_coord(v_block_dim, opus::tuple{lane_id / lane_per_grp, (lane_id % lane_per_grp) % lane_k, (lane_id % lane_per_grp) / lane_k}));
+}
+
 template<typename T, typename V>
 __device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
     constexpr opus::index_t o_len = opus::vector_traits<V>::size();
@@ -122,11 +166,34 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
         /*td1=*/ kv_rows,
         /*s0=*/ kargs.stride_kv_page);
 
+    auto mma0 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
+        seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K>{},
+        wmma_adaptor_swap_ab{});
+    auto mma1 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
+        seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K>{},
+        wmma_adaptor_swap_ab{});
+
+    auto u_rk = make_layout_rk<T>(lane_id);
+    auto u_rv = make_layout_rv<T>(lane_id);
+
+    vector_t<D_ATTN, T::GEMM0_E_N * T::GEMM0_E_K * T::W_N * T::W_K / T::WARP_SIZE> v_k;
+    vector_t<D_ATTN, T::GEMM1_E_N * T::GEMM1_E_K * T::W_N * T::W_K / T::WARP_SIZE> v_v;
+    vector_t<D_ACC, T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE> v_s;
+    vector_t<D_ATTN, T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE> v_p;
+    auto v_s_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>*>(&v_s);
+    auto v_p_stages = reinterpret_cast<vector_t<D_ATTN, T::W_M * T::W_K / T::WARP_SIZE>*>(&v_p);
+    auto v_o_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::D_TILE_SIZE / T::GEMM1_STAGE_N / T::WARP_SIZE>*>(&v_o);
+
     auto load_kv_tile = [&](int tile_idx) {
         constexpr int lds_step = T::INDICES_PER_TDM * T::KV_ROW_LDS_BYTES;
 
         const int idx_byte_off = (tile_idx * T::KV_TILE_SIZE + warp_id * T::ROWS_PER_WAVE) * (int)sizeof(int);
         const u32x16_t row_ids = llvm_amdgcn_s_buffer_load_v16i32(kv_indices_rsrc, idx_byte_off, /*aux=*/0);
+        s_wait_kmcnt(0_I);
 
         static_for<T::TDM_LOADS_PER_WAVE>([&](auto d) {
             constexpr int ld = d.value;
@@ -140,24 +207,47 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
         tdm_kv.move(0_I, 0_I, 0_I, 0_I, 0_I, number<-(T::TDM_LOADS_PER_WAVE - 1) * lds_step>{});
     };
 
-    auto mma0 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
-        seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_E_K>{},
-        seq<T::T_M, T::T_N, T::T_K>{},
-        seq<T::W_M, T::W_N, T::W_K>{},
-        wmma_adaptor_swap_ab{});
-    auto mma1 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
-        seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
-        seq<T::T_M, T::T_N, T::T_K>{},
-        seq<T::W_M, T::W_N, T::W_K>{},
-        wmma_adaptor_swap_ab{});
+    auto tr_load_v = [&](auto sn, auto sk) {
+        constexpr int stage_n = sn.value;
+        constexpr int stage_k = sk.value;
+        
+        auto v_v0 = tr_load<T::VEC_KV>(s_kv[2 * stage_k],     u_rv + number<stage_n * (T::D_TILE_SIZE / 4)>{});
+        auto v_v1 = tr_load<T::VEC_KV>(s_kv[2 * stage_k + 1], u_rv + number<stage_n * (T::D_TILE_SIZE / 4)>{});
+
+        constexpr int chunk  = T::VEC_KV;
+        constexpr int groups = opus::vector_traits<decltype(v_v0)>::size() / chunk;
+        static_for<groups>([&](auto g) {
+            static_for<chunk>([&](auto i) {
+                v_v[2 * chunk * g.value + i.value]         = v_v0[chunk * g.value + i.value];
+                v_v[2 * chunk * g.value + chunk + i.value] = v_v1[chunk * g.value + i.value];
+            });
+        });
+    };
 
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         load_kv_tile(tile_idx);
-        s_wait_tensorcnt<0>();
-
+        s_wait_tensorcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
-        
+        static_for<T::GEMM0_STAGE_N>([&](auto s) {
+            constexpr int stage = s.value;
+            v_k = load<T::VEC_KV>(s_kv[stage], u_rk);
+            s_wait_dscnt(0_I);
+            clear(v_s_stages[stage]);
+            v_s_stages[stage] = mma0(v_q, v_k, v_s_stages[stage]);
+        });
+
+        v_p = cast<D_ATTN>(v_s);
+
+        static_for<T::GEMM1_STAGE_N * T::GEMM1_STAGE_K>([&](auto s) {
+            constexpr int stage = s.value;
+            constexpr int stage_n = stage % T::GEMM1_STAGE_N;
+            constexpr int stage_k = stage / T::GEMM1_STAGE_N;
+            
+            tr_load_v(number<stage_n>{}, number<stage_k>{});
+            s_wait_dscnt(0_I);
+            v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v, v_o_stages[stage_n]);
+        });
     }
 }
 
