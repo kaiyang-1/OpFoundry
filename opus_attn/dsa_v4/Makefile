@@ -1,6 +1,6 @@
 OPUS_INCLUDE_DIR ?= /path/to/aiter/csrc/include
 HIPCC           ?= /opt/rocm/bin/hipcc
-ARCH            ?= gfx950
+ARCH            ?= gfx1250
 
 ARCH_MACRO = PA_ARCH_$(shell echo $(ARCH) | tr '[:lower:]' '[:upper:]')
 COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -fopenmp -O3 -Wall -D$(ARCH_MACRO) --offload-arch=$(ARCH)
