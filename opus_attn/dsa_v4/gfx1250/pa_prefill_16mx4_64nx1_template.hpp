@@ -281,8 +281,8 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
     auto u_rk = make_layout_rk<T>(lane_id);
     auto u_rv = make_layout_rv<T>(lane_id);
 
-    vector_t<D_ATTN, T::GEMM0_E_N * T::GEMM0_E_K * T::W_N * T::W_K / T::WARP_SIZE> v_k;
-    vector_t<D_ATTN, T::GEMM1_E_N * T::GEMM1_E_K * T::W_N * T::W_K / T::WARP_SIZE> v_v;
+    vector_t<D_ATTN, T::GEMM0_E_N * T::GEMM0_E_K * T::W_N * T::W_K / T::WARP_SIZE> v_k[2];
+    vector_t<D_ATTN, T::GEMM1_E_N * T::GEMM1_E_K * T::W_N * T::W_K / T::WARP_SIZE> v_v[2];
     vector_t<D_ACC, T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE> v_s;
     vector_t<D_ATTN, T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE> v_p;
     auto v_s_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>*>(&v_s);
@@ -310,10 +310,11 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
         tdm_kv.move(0_I, 0_I, 0_I, 0_I, 0_I, number<-(T::TDM_LOADS_PER_WAVE - 1) * lds_step>{});
     };
 
-    auto tr_load_v = [&](auto sn, auto sk) {
+    auto tr_load_v = [&](auto sn, auto sk, auto buf) {
         constexpr int stage_n = sn.value;
         constexpr int stage_k = sk.value;
-        
+        constexpr int b       = buf.value;
+
         auto v_v0 = tr_load<T::VEC_KV>(s_kv[2 * stage_k],     u_rv + number<stage_n * (T::D_TILE_SIZE / 4)>{});
         auto v_v1 = tr_load<T::VEC_KV>(s_kv[2 * stage_k + 1], u_rv + number<stage_n * (T::D_TILE_SIZE / 4)>{});
 
@@ -321,8 +322,8 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
         constexpr int groups = opus::vector_traits<decltype(v_v0)>::size() / chunk;
         static_for<groups>([&](auto g) {
             static_for<chunk>([&](auto i) {
-                v_v[2 * chunk * g.value + i.value]         = v_v0[chunk * g.value + i.value];
-                v_v[2 * chunk * g.value + chunk + i.value] = v_v1[chunk * g.value + i.value];
+                v_v[b][2 * chunk * g.value + i.value]         = v_v0[chunk * g.value + i.value];
+                v_v[b][2 * chunk * g.value + chunk + i.value] = v_v1[chunk * g.value + i.value];
             });
         });
     };
@@ -333,15 +334,20 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
         __builtin_amdgcn_s_barrier();
 
         constexpr int gemmk_perm[4] = {0, 2, 1, 3};
+        v_k[0] = load<T::VEC_KV>(s_kv[WARP ^ gemmk_perm[0]], u_rk);
         static_for<T::GEMM0_STAGE_N>([&](auto j) {
             constexpr int stage = WARP ^ gemmk_perm[j.value];
-
-            v_k = load<T::VEC_KV>(s_kv[stage], u_rk);
-            s_wait_dscnt(0_I);
+            constexpr int cur   = j.value & 1;
+            if constexpr (j.value + 1 < T::GEMM0_STAGE_N) {
+                v_k[(j.value + 1) & 1] = load<T::VEC_KV>(s_kv[WARP ^ gemmk_perm[j.value + 1]], u_rk);
+                s_wait_dscnt(number<T::k_ds_load_insts>{});
+            } else {
+                s_wait_dscnt(0_I);
+            }
+            __builtin_amdgcn_sched_barrier(0);
             clear(v_s_stages[stage]);
-            v_s_stages[stage] = mma0(v_q, v_k, v_s_stages[stage]);
+            v_s_stages[stage] = mma0(v_q, v_k[cur], v_s_stages[stage]);
         });
-        __builtin_amdgcn_sched_barrier(0);
 
         attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, neg_inf_v);
         D_ACC row_max = max(m_row, attn_row_max<T>(v_s) * temperature_scale);
@@ -354,16 +360,23 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
         l_row += attn_row_sum<T>(v_s);
         v_p = cast<D_ATTN>(v_s);
         scale_output_tile<T>(v_o, rescale_m);
-        __builtin_amdgcn_sched_barrier(0);
 
-        static_for<T::GEMM1_STAGE_N * T::GEMM1_STAGE_K>([&](auto s) {
+        constexpr int GEMM1_STAGES = T::GEMM1_STAGE_N * T::GEMM1_STAGE_K;
+        tr_load_v(0_I, number<WARP & 1>{}, 0_I);
+        static_for<GEMM1_STAGES>([&](auto s) {
             constexpr int stage_n = s.value % T::GEMM1_STAGE_N;
             constexpr int stage_k = WARP & 1 ? 1 - (s.value / T::GEMM1_STAGE_N) : s.value / T::GEMM1_STAGE_N;
-
-            tr_load_v(number<stage_n>{}, number<stage_k>{});
-            s_wait_dscnt(0_I);
+            constexpr int cur     = s.value & 1;
+            if constexpr (s.value + 1 < GEMM1_STAGES) {
+                constexpr int n_sn = (s.value + 1) % T::GEMM1_STAGE_N;
+                constexpr int n_sk = WARP & 1 ? 1 - ((s.value + 1) / T::GEMM1_STAGE_N) : (s.value + 1) / T::GEMM1_STAGE_N;
+                tr_load_v(number<n_sn>{}, number<n_sk>{}, number<(s.value + 1) & 1>{});
+                s_wait_dscnt(number<T::v_ds_load_insts>{});
+            } else {
+                s_wait_dscnt(0_I);
+            }
             __builtin_amdgcn_sched_barrier(0);
-            v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v, v_o_stages[stage_n]);
+            v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v[cur], v_o_stages[stage_n]);
         });
 
         __builtin_amdgcn_s_barrier();

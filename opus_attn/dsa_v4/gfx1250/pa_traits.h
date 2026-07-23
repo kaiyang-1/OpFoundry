@@ -52,6 +52,10 @@ struct pa_16mx4_64nx1_traits {
     static constexpr int VEC_KV = 8;
     static constexpr int VEC_O  = 8;
 
+    // LDS instruction count per GEMMK/GEMMV stage
+    static constexpr int k_ds_load_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
+    static constexpr int v_ds_load_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
+
     // TDM gather KV load
     static constexpr int ROWS_PER_WAVE      = KV_TILE_SIZE / NUM_WARPS;              // 16
     static constexpr int INDICES_PER_TDM    = 8;                                     // 32-bit gather cap
