@@ -116,14 +116,22 @@ __device__ inline auto make_layout_rv(int lane_id) {
         opus::unfold_p_coord(v_block_dim, opus::tuple{lane_id / lane_per_grp, (lane_id % lane_per_grp) % lane_k, (lane_id % lane_per_grp) / lane_k}));
 }
 
+template<int Lo, int Hi, typename V, typename Op>
+__device__ inline auto tree_reduce(const V& v, Op op) {
+    if constexpr (Hi - Lo == 1) return v[Lo];
+    else {
+        constexpr int Mid = (Lo + Hi) / 2;
+        return op(tree_reduce<Lo, Mid>(v, op), tree_reduce<Mid, Hi>(v, op));
+    }
+}
+
 template<typename T, typename V>
 __device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
     using D_ACC = typename T::D_ACC;
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    D_ACC row_max = -1e30f;
-    opus::static_for<s_len>([&](auto i) {
-        row_max = max(row_max, v_s[i.value]);
-    });
+    D_ACC row_max = max(opus::numeric_limits<D_ACC>::lowest(),
+                        tree_reduce<0, s_len>(v_s, [](D_ACC x, D_ACC y) { return max(x, y); }));
+
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
     return max(std::bit_cast<float>(res16.x), std::bit_cast<float>(res16.y));
 }
@@ -148,10 +156,8 @@ template<typename T, typename V>
 __device__ inline typename T::D_ACC attn_row_sum(const V& v_s) {
     using D_ACC = typename T::D_ACC;
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    D_ACC row_sum = 0.0f;
-    opus::static_for<s_len>([&](auto i) {
-        row_sum += v_s[i.value];
-    });
+    D_ACC row_sum = tree_reduce<0, s_len>(v_s, [](D_ACC x, D_ACC y) { return x + y; });
+
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
     return std::bit_cast<float>(res16.x) + std::bit_cast<float>(res16.y);
 }
@@ -393,6 +399,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
     const D_ACC temperature_scale = kargs.softmax_scale * LOG2_E;
 
     v_q = load<T::VEC_Q>(g_q, u_q);
+    s_wait_loadcnt(0_I);
 
     // Initialize shared attention state
     clear(v_o);
