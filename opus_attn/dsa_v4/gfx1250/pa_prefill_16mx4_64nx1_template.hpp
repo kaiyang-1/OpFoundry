@@ -223,7 +223,7 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
     });
 }
 
-template<class Traits>
+template<class Traits, int WARP>
 __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
                                            const void* kv_ptr, int kv_rows,
                                            const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
@@ -239,7 +239,7 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
     using D_ACC = typename T::D_ACC;
 
     int lane_id = thread_id_x() % T::WARP_SIZE;
-    const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+    constexpr int warp_id = WARP;
 
     smem<D_ATTN> s_kv[T::NUM_WARPS] = {
         make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf + 0 * T::SEG_BYTES)),
@@ -332,8 +332,10 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
         s_wait_tensorcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
-        static_for<T::GEMM0_STAGE_N>([&](auto s) {
-            constexpr int stage = s.value;
+        constexpr int gemmk_perm[4] = {0, 2, 1, 3};
+        static_for<T::GEMM0_STAGE_N>([&](auto j) {
+            constexpr int stage = WARP ^ gemmk_perm[j.value];
+
             v_k = load<T::VEC_KV>(s_kv[stage], u_rk);
             s_wait_dscnt(0_I);
             clear(v_s_stages[stage]);
@@ -355,15 +357,16 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
         __builtin_amdgcn_sched_barrier(0);
 
         static_for<T::GEMM1_STAGE_N * T::GEMM1_STAGE_K>([&](auto s) {
-            constexpr int stage = s.value;
-            constexpr int stage_n = stage % T::GEMM1_STAGE_N;
-            constexpr int stage_k = stage / T::GEMM1_STAGE_N;
-            
+            constexpr int stage_n = s.value % T::GEMM1_STAGE_N;
+            constexpr int stage_k = WARP & 1 ? 1 - (s.value / T::GEMM1_STAGE_N) : s.value / T::GEMM1_STAGE_N;
+
             tr_load_v(number<stage_n>{}, number<stage_k>{});
             s_wait_dscnt(0_I);
             __builtin_amdgcn_sched_barrier(0);
             v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v, v_o_stages[stage_n]);
         });
+
+        __builtin_amdgcn_s_barrier();
     }
 }
 
@@ -379,7 +382,6 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
 
     const int q_token_idx = block_id_x();
     const int h_block_idx = block_id_y();
-
     const int lane_id = thread_id_x() % T::WARP_SIZE;
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
@@ -411,9 +413,12 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
         const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
         const int valid_kv_len   = kargs.kv_indptr_prefix[q_token_idx + 1] - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
-        pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages,
-                                           kargs.kv_indices_prefix, page_idx_begin, valid_kv_len,
-                                           num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+        switch (warp_id & (T::NUM_WARPS - 1)) {
+            case 0:  pa_prefill_accum_le2_tiles<Traits, 0>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale); break;
+            case 1:  pa_prefill_accum_le2_tiles<Traits, 1>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale); break;
+            case 2:  pa_prefill_accum_le2_tiles<Traits, 2>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale); break;
+            default: pa_prefill_accum_le2_tiles<Traits, 3>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale); break;
+        }
     }
     __builtin_amdgcn_s_barrier();
 
@@ -422,9 +427,12 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
         const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
         const int valid_kv_len   = kargs.kv_indptr_extend[q_token_idx + 1] - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
-        pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens,
-                                           kargs.kv_indices_extend, page_idx_begin, valid_kv_len,
-                                           num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+        switch (warp_id & (T::NUM_WARPS - 1)) {
+            case 0:  pa_prefill_accum_le2_tiles<Traits, 0>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale); break;
+            case 1:  pa_prefill_accum_le2_tiles<Traits, 1>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale); break;
+            case 2:  pa_prefill_accum_le2_tiles<Traits, 2>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale); break;
+            default: pa_prefill_accum_le2_tiles<Traits, 3>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale); break;
+        }
     }
 
     // ──── Sink finalization, normalize O, and store to gmem ────
