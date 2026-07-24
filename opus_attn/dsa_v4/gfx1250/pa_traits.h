@@ -34,18 +34,18 @@ struct pa_16mx4_64nx1_traits {
     static constexpr int W_N = 16;
     static constexpr int W_K = 32;
 
-    // GEMM0: S[Q_TILE x KV_TILE] = Q[Q_TILE x D_TILE] @ K^T[D_TILE x KV_TILE]
-    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
-    static constexpr int GEMM0_E_N = (KV_TILE_SIZE / 4) / W_N;
-    static constexpr int GEMM0_E_K = D_TILE_SIZE / W_K;
+    // GEMM0: S = Q @ K^T
     static constexpr int GEMM0_STAGE_N = 4;
+    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM0_E_N = (KV_TILE_SIZE / GEMM0_STAGE_N) / W_N;
+    static constexpr int GEMM0_E_K = D_TILE_SIZE / W_K;
 
-    // GEMM1: O[Q_TILE x D_TILE] = P[Q_TILE x KV_TILE] @ V[KV_TILE x D_TILE]
-    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
-    static constexpr int GEMM1_E_N = (D_TILE_SIZE / 4) / W_N;
-    static constexpr int GEMM1_E_K = (KV_TILE_SIZE / 2) / W_K;
+    // GEMM1: O = P @ V
     static constexpr int GEMM1_STAGE_N = 4;
     static constexpr int GEMM1_STAGE_K = 2;
+    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM1_E_N = (D_TILE_SIZE / GEMM1_STAGE_N) / W_N;
+    static constexpr int GEMM1_E_K = (KV_TILE_SIZE / GEMM1_STAGE_K) / W_K;
 
     // Vector lengths for global load/store
     static constexpr int VEC_Q  = 8;

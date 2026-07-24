@@ -57,14 +57,14 @@ __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h) {
         opus::number<T::GEMM1_E_M>{},
         opus::number<T::T_M>{},
         opus::number<T::W_M>{},
-        opus::number<T::D_TILE_SIZE / T::W_N>{},
-        opus::number<T::W_M * T::W_N / (T::WARP_SIZE * T::VEC_O)>{},
+        opus::number<T::GEMM1_STAGE_N>{},
         opus::number<T::WARP_SIZE / T::W_M>{},
+        opus::number<T::GEMM1_E_N>{},
         opus::number<T::VEC_O>{});
 
     constexpr auto o_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::y_dim{}));
 
     return opus::make_layout(
         o_block_shape,
@@ -99,20 +99,20 @@ __device__ inline auto make_layout_rv(int lane_id) {
     constexpr int lane_k = lane_per_grp / lane_n;
 
     constexpr auto v_block_shape = opus::make_tuple(
-        opus::number<T::GEMM1_E_N>{},
         opus::number<T::WARP_SIZE / lane_per_grp>{},
         opus::number<lane_k>{},
         opus::number<lane_n>{},
+        opus::number<T::GEMM1_E_N>{},
         opus::number<T::VEC_KV>{});
     
     constexpr auto v_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}),
         opus::make_tuple(opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::y_dim{}));
     
     return opus::make_layout(
         v_block_shape,
-        opus::unfold_x_stride(v_block_dim, v_block_shape, opus::tuple{opus::number<lane_n * T::VEC_KV>{}, opus::number<T::D_TILE_SIZE + T::KV_ROW_PAD_SIZE>{}, 1_I}),
+        opus::unfold_x_stride(v_block_dim, v_block_shape, opus::tuple{opus::number<T::D_TILE_SIZE + T::KV_ROW_PAD_SIZE>{}, opus::number<T::D_TILE_SIZE / T::GEMM1_STAGE_N / lane_n>{}, 1_I}),
         opus::unfold_p_coord(v_block_dim, opus::tuple{lane_id / lane_per_grp, (lane_id % lane_per_grp) % lane_k, (lane_id % lane_per_grp) / lane_k}));
 }
 
