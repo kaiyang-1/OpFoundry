@@ -63,8 +63,10 @@ struct pa_16mx4_64nx1_traits {
     static constexpr int KV_ROW_LDS_BYTES   = D_TILE_SIZE * sizeof(D_ATTN) + 16;    // padded row stride (16B/row)
     static constexpr int KV_ROW_PAD_SIZE    = 16 / sizeof(D_ATTN);
     static constexpr int SEG_BYTES          = 64 * 1024;
+    static constexpr int KV_BUF_BYTES       = ROWS_PER_WAVE * KV_ROW_LDS_BYTES;      // one tile's rows per wave
+    static constexpr int NUM_KV_BUFS        = 2;                                     // double buffer: prefetch tile i+1
     static_assert(KV_TILE_SIZE % NUM_WARPS == 0 && ROWS_PER_WAVE % INDICES_PER_TDM == 0);
-    static_assert((size_t)ROWS_PER_WAVE * KV_ROW_LDS_BYTES <= (size_t)SEG_BYTES);
+    static_assert((size_t)NUM_KV_BUFS * KV_BUF_BYTES <= (size_t)SEG_BYTES);
     static_assert(D_TILE_SIZE * sizeof(D_ATTN) == 1024, "TDM pad_interval=7 assumes a 1024B / 256-DWORD row");
 
     static constexpr size_t smem_size_bytes() { return (size_t)NUM_WARPS * SEG_BYTES; }  // 4 * 64KB = 256KB

@@ -291,12 +291,13 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
 
     const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
 
-    auto load_kv_tile = [&](int tile_idx) {
-        constexpr int lds_step = T::INDICES_PER_TDM * T::KV_ROW_LDS_BYTES;
-
+    auto load_row_ids = [&](int tile_idx) {
         const int idx_byte_off = (tile_idx * T::KV_TILE_SIZE + warp_id * T::ROWS_PER_WAVE) * (int)sizeof(int);
-        const u32x16_t row_ids = llvm_amdgcn_s_buffer_load_v16i32(kv_indices_rsrc, idx_byte_off, /*aux=*/0);
-        s_wait_kmcnt(0_I);
+        return llvm_amdgcn_s_buffer_load_v16i32(kv_indices_rsrc, idx_byte_off, /*aux=*/0);
+    };
+
+    auto issue_kv_tile = [&](const u32x16_t& row_ids) {
+        constexpr int lds_step = T::INDICES_PER_TDM * T::KV_ROW_LDS_BYTES;
 
         static_for<T::TDM_LOADS_PER_WAVE>([&](auto d) {
             constexpr int ld = d.value;
@@ -328,10 +329,27 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
         });
     };
 
+    if (num_kv_tiles <= 0) return;
+
+    int tdm_buf_delta = T::KV_BUF_BYTES;   // alternates +/- to flip the TDM destination buffer
+    int rd_buf_delta  = T::KV_BUF_BYTES;   // alternates +/- to flip the read buffer
+
+    u32x16_t row_ids = load_row_ids(0);
+    s_wait_kmcnt(0_I);
+    issue_kv_tile(row_ids);
+    row_ids = load_row_ids(1);
+
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
-        load_kv_tile(tile_idx);
         s_wait_tensorcnt(0_I);
         __builtin_amdgcn_s_barrier();
+
+        if (tile_idx + 1 < num_kv_tiles) {
+            s_wait_kmcnt(0_I);
+            tdm_kv.move(0_I, 0_I, 0_I, 0_I, 0_I, tdm_buf_delta);
+            tdm_buf_delta = -tdm_buf_delta;
+            issue_kv_tile(row_ids);
+            row_ids = load_row_ids(tile_idx + 2);
+        }
 
         v_k[0] = load<T::VEC_KV>(s_kv[2 * PARITY], u_rk);
         static_for<T::GEMM0_STAGE_N>([&](auto j) {
@@ -378,7 +396,8 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
             v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v[cur], v_o_stages[stage_n]);
         });
 
-        __builtin_amdgcn_s_barrier();
+        static_for<T::NUM_WARPS>([&](auto i) { s_kv[i.value].ptr += rd_buf_delta; });
+        rd_buf_delta = -rd_buf_delta;
     }
 }
 
