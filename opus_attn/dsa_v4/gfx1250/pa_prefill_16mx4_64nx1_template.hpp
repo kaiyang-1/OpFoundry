@@ -175,62 +175,32 @@ __device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
     opus::static_for<o_len>([&](auto i) { v_o[i.value] *= scale; });
 }
 
-template<int THR_X, int THR_Y>
-__device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr, opus::u32_t neg_inf_vgpr,
-                                          opus::u32_t& x_ref, opus::u32_t& y_ref) {
-    uint32_t x_mask, y_mask;
-    asm volatile(
-        "v_cmp_lt_i32_e64 %0, %6, %7\n\t"
-        "v_cmp_lt_i32_e64 %1, %6, %9\n\t"
-        "v_cndmask_b32_e64 %2, %4, %8, %0\n\t"
-        "v_cndmask_b32_e64 %3, %5, %8, %1\n\t"
-        : "=s"(x_mask), "=s"(y_mask), "=v"(x_ref), "=v"(y_ref)
-        : "v"(x_ref), "v"(y_ref), "v"(rel_vgpr),
-          "n"(THR_X), "v"(neg_inf_vgpr), "n"(THR_Y)
-        : "vcc"
-    );
-}
-
 template<typename T, typename V>
-__device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile_idx, opus::u32_t neg_inf_v) {
+__device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile_idx, int seg_rot_rows) {
     using D_ACC = typename T::D_ACC;
-    using D_ACC_X2 = opus::vector_t<D_ACC, 2>;
-    using U32_X2 = opus::vector_t<opus::u32_t, 2>;
 
     if ((kv_tile_idx + 1) * T::KV_TILE_SIZE <= valid_kv_len) return;
 
     constexpr int elems_per_stage = (T::W_M * T::W_N) / T::WARP_SIZE;      // 8
     constexpr int lane_hi_kv_step = T::W_N / (T::WARP_SIZE / T::W_M);      // 8
+    static_assert(opus::vector_traits<V>::size() == T::GEMM0_STAGE_N * elems_per_stage);
+    static_assert((T::KV_TILE_SIZE & (T::KV_TILE_SIZE - 1)) == 0);
 
-    const int last_valid_kv_pos = valid_kv_len - 1;
-    const int k_start_pos = kv_tile_idx * T::KV_TILE_SIZE;
-    int lane_id = opus::thread_id_x() % T::WARP_SIZE;
-    const int lane_hi = lane_id / T::W_M;   // {0, 1} on wave32
+    const D_ACC neg_inf = -opus::numeric_limits<D_ACC>::infinity();
+    const int lane_hi = (opus::thread_id_x() % T::WARP_SIZE) / T::W_M;   // {0, 1} on wave32
+    const int rel_base = (valid_kv_len - 1) - kv_tile_idx * T::KV_TILE_SIZE - lane_hi * lane_hi_kv_step;
 
     opus::static_for<T::GEMM0_STAGE_N>([&](auto i_s) {
-        constexpr int stage = i_s.value;
-        const int k_pos = k_start_pos + stage * T::W_N + lane_hi * lane_hi_kv_step;
-        const opus::u32_t rel = static_cast<opus::u32_t>(last_valid_kv_pos - k_pos);
-
-        opus::static_for<elems_per_stage / 2>([&](auto i_pair) {
-            constexpr int reg0  = i_pair.value * 2;
-            constexpr int idx   = stage * elems_per_stage + reg0;
-            constexpr int thr_x = reg0;
-            constexpr int thr_y = reg0 + 1;
-
-            auto pair_acc  = opus::slice(v_s, opus::number<idx>{}, opus::number<idx + 2>{});
-            auto pair_bits = __builtin_bit_cast(U32_X2, pair_acc);
-            opus::u32_t x_ref = pair_bits[0];
-            opus::u32_t y_ref = pair_bits[1];
-            attn_mask_vec2_imm<thr_x, thr_y>(rel, neg_inf_v, x_ref, y_ref);
-            pair_bits[0] = x_ref;
-            pair_bits[1] = y_ref;
-            opus::set_slice(v_s, __builtin_bit_cast(D_ACC_X2, pair_bits), opus::number<idx>{}, opus::number<idx + 2>{});
+        // seg_rot_rows rotates which KV rows a stage holds: odd waves start on the other LDS segment
+        const int rel = rel_base - ((i_s.value * T::W_N + seg_rot_rows) & (T::KV_TILE_SIZE - 1));
+        opus::static_for<elems_per_stage>([&](auto i_reg) {
+            constexpr int idx = i_s.value * elems_per_stage + i_reg.value;
+            v_s[idx] = (i_reg.value > rel) ? neg_inf : v_s[idx];
         });
     });
 }
 
-template<class Traits, int PARITY>
+template<class Traits>
 __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
                                            const void* kv_ptr, int kv_rows,
                                            const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
@@ -248,9 +218,12 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
     int lane_id = thread_id_x() % T::WARP_SIZE;
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
+    // Odd waves start on the other segment to spread LDS traffic.
+    const int seg_rot_bytes = (warp_id & 1) * T::SEG_BYTES;
+    const int seg_rot_rows  = (warp_id & 1) * T::ROWS_PER_SEG;
     smem<D_ATTN> s_kv[T::SEGS_PER_BUF] = {
-        make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf + 0 * T::SEG_BYTES)),
-        make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf + 1 * T::SEG_BYTES)),
+        make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf + seg_rot_bytes)),
+        make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf + (T::SEG_BYTES - seg_rot_bytes))),
     };
 
     const u32x4_t kv_indices_rsrc = make_buffer_rsrc_raw(kv_indices + page_idx_begin, (u32_t)(valid_kv_len * sizeof(int)));
@@ -293,8 +266,6 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
     auto v_s_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>*>(&v_s);
     auto v_p_stages = reinterpret_cast<vector_t<D_ATTN, T::W_M * T::W_K / T::WARP_SIZE>*>(&v_p);
     auto v_o_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::D_TILE_SIZE / T::GEMM1_STAGE_N / T::WARP_SIZE>*>(&v_o);
-
-    const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
 
     auto load_row_ids = [&](int tile_idx) {
         const int idx_byte_off = (tile_idx * T::KV_TILE_SIZE + warp_id * T::ROWS_PER_WAVE) * (int)sizeof(int);
@@ -351,12 +322,12 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
             row_ids = load_row_ids(tile_idx + 2);
         }
 
-        load_k(number<2 * PARITY>{}, 0_I);
+        load_k(0_I, 0_I);
         static_for<T::GEMM0_STAGE_N>([&](auto j) {
-            constexpr int stage = (j.value + 2 * PARITY) % T::GEMM0_STAGE_N;
+            constexpr int stage = j.value;
             constexpr int cur   = j.value & 1;
             if constexpr (j.value + 1 < T::GEMM0_STAGE_N) {
-                load_k(number<(j.value + 1 + 2 * PARITY) % T::GEMM0_STAGE_N>{}, number<(j.value + 1) & 1>{});
+                load_k(number<j.value + 1>{}, number<(j.value + 1) & 1>{});
                 s_wait_dscnt(number<T::k_ds_load_insts>{});
             } else {
                 s_wait_dscnt(0_I);
@@ -366,7 +337,7 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
             v_s_stages[stage] = mma0(v_q, v_k[cur], v_s_stages[stage]);
         });
 
-        attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, neg_inf_v);
+        attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, seg_rot_rows);
         D_ACC row_max = max(m_row, attn_row_max<T>(v_s) * temperature_scale);
         D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
@@ -379,14 +350,14 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
         scale_output_tile<T>(v_o, rescale_m);
 
         constexpr int GEMM1_STAGES = T::GEMM1_STAGE_N * T::GEMM1_STAGE_K;
-        tr_load_v(0_I, number<PARITY>{}, 0_I);
+        tr_load_v(0_I, 0_I, 0_I);
         static_for<GEMM1_STAGES>([&](auto s) {
             constexpr int stage_n = s.value % T::GEMM1_STAGE_N;
-            constexpr int stage_k = PARITY ? 1 - (s.value / T::GEMM1_STAGE_N) : s.value / T::GEMM1_STAGE_N;
+            constexpr int stage_k = s.value / T::GEMM1_STAGE_N;
             constexpr int cur     = s.value & 1;
             if constexpr (s.value + 1 < GEMM1_STAGES) {
                 constexpr int n_sn = (s.value + 1) % T::GEMM1_STAGE_N;
-                constexpr int n_sk = PARITY ? 1 - ((s.value + 1) / T::GEMM1_STAGE_N) : (s.value + 1) / T::GEMM1_STAGE_N;
+                constexpr int n_sk = (s.value + 1) / T::GEMM1_STAGE_N;
                 tr_load_v(number<n_sn>{}, number<n_sk>{}, number<(s.value + 1) & 1>{});
                 s_wait_dscnt(number<T::v_ds_load_insts>{});
             } else {
@@ -444,8 +415,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
         const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
         const int valid_kv_len   = kargs.kv_indptr_prefix[q_token_idx + 1] - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
-        if (warp_id & 1) pa_prefill_accum_le2_tiles<Traits, 1>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
-        else             pa_prefill_accum_le2_tiles<Traits, 0>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+        pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
     }
     __builtin_amdgcn_s_barrier();
 
@@ -454,8 +424,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
         const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
         const int valid_kv_len   = kargs.kv_indptr_extend[q_token_idx + 1] - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
-        if (warp_id & 1) pa_prefill_accum_le2_tiles<Traits, 1>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
-        else             pa_prefill_accum_le2_tiles<Traits, 0>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+        pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
     }
 
     // ──── Sink finalization, normalize O, and store to gmem ────
