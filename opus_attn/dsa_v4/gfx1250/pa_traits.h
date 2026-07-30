@@ -41,7 +41,7 @@ struct pa_16mx4_64nx1_traits {
     static constexpr int GEMM0_E_K = D_TILE_SIZE / W_K;
 
     // GEMM1: O = P @ V
-    static constexpr int GEMM1_STAGE_N = 4;
+    static constexpr int GEMM1_STAGE_N = 2;
     static constexpr int GEMM1_STAGE_K = 2;
     static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
     static constexpr int GEMM1_E_N = (D_TILE_SIZE / GEMM1_STAGE_N) / W_N;
@@ -62,12 +62,20 @@ struct pa_16mx4_64nx1_traits {
     static constexpr int TDM_LOADS_PER_WAVE = ROWS_PER_WAVE / INDICES_PER_TDM;       // 2 gather loads/wave
     static constexpr int KV_ROW_LDS_BYTES   = D_TILE_SIZE * sizeof(D_ATTN) + 16;    // padded row stride (16B/row)
     static constexpr int KV_ROW_PAD_SIZE    = 16 / sizeof(D_ATTN);
+    static constexpr int KV_ROW_LDS_ELEMS   = D_TILE_SIZE + KV_ROW_PAD_SIZE;         // padded row stride in elements
+
+    // LDS segmentation
     static constexpr int SEG_BYTES          = 64 * 1024;
-    static constexpr int KV_BUF_BYTES       = ROWS_PER_WAVE * KV_ROW_LDS_BYTES;      // one tile's rows per wave
+    static constexpr int WAVES_PER_SEG      = 2;
+    static constexpr int SEGS_PER_BUF       = NUM_WARPS / WAVES_PER_SEG;             // 2 segments hold one KV tile
+    static constexpr int ROWS_PER_SEG       = WAVES_PER_SEG * ROWS_PER_WAVE;         // 32 KV rows per segment
+    static constexpr int WAVE_LDS_BYTES     = ROWS_PER_WAVE * KV_ROW_LDS_BYTES;      // one wave's slice of a segment
+    static constexpr int KV_BUF_BYTES       = SEGS_PER_BUF * SEG_BYTES;              // double-buffer stride
     static constexpr int NUM_KV_BUFS        = 2;                                     // double buffer: prefetch tile i+1
+
     static_assert(KV_TILE_SIZE % NUM_WARPS == 0 && ROWS_PER_WAVE % INDICES_PER_TDM == 0);
-    static_assert((size_t)NUM_KV_BUFS * KV_BUF_BYTES <= (size_t)SEG_BYTES);
+    static_assert((size_t)WAVES_PER_SEG * WAVE_LDS_BYTES <= (size_t)SEG_BYTES);
     static_assert(D_TILE_SIZE * sizeof(D_ATTN) == 1024, "TDM pad_interval=7 assumes a 1024B / 256-DWORD row");
 
-    static constexpr size_t smem_size_bytes() { return (size_t)NUM_WARPS * SEG_BYTES; }  // 4 * 64KB = 256KB
+    static constexpr size_t smem_size_bytes() { return (size_t)NUM_KV_BUFS * KV_BUF_BYTES; }  // 2 * 2 * 64KB = 256KB
 };

@@ -53,18 +53,21 @@ __device__ inline auto make_layout_q(int warp_id, int lane_id, int stride_q_h) {
 
 template<class T>
 __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h) {
+    constexpr int dwordx32_rpt = 4 * 32 / sizeof(typename T::D_ATTN) / T::VEC_O;
+
     constexpr auto o_block_shape = opus::make_tuple(
         opus::number<T::GEMM1_E_M>{},
         opus::number<T::T_M>{},
         opus::number<T::W_M>{},
         opus::number<T::GEMM1_STAGE_N>{},
+        opus::number<T::GEMM1_E_N / dwordx32_rpt>{},
         opus::number<T::WARP_SIZE / T::W_M>{},
-        opus::number<T::GEMM1_E_N>{},
+        opus::number<dwordx32_rpt>{},
         opus::number<T::VEC_O>{});
 
     constexpr auto o_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::y_dim{}));
 
     return opus::make_layout(
         o_block_shape,
@@ -98,22 +101,26 @@ __device__ inline auto make_layout_rv(int lane_id) {
     constexpr int lane_n = 2;
     constexpr int lane_k = lane_per_grp / lane_n;
 
+    constexpr int dwordx32_rpt = 4 * 32 / sizeof(typename T::D_ATTN) / T::VEC_KV;
+
     constexpr auto v_block_shape = opus::make_tuple(
+        opus::number<T::GEMM1_E_N / dwordx32_rpt>{},
+        opus::number<lane_n>{},
+        opus::number<dwordx32_rpt>{},
+        opus::number<T::W_K / (T::WARP_SIZE / lane_per_grp) / T::VEC_KV>{},
         opus::number<T::WARP_SIZE / lane_per_grp>{},
         opus::number<lane_k>{},
-        opus::number<lane_n>{},
-        opus::number<T::GEMM1_E_N>{},
         opus::number<T::VEC_KV>{});
     
     constexpr auto v_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}));
     
     return opus::make_layout(
         v_block_shape,
-        opus::unfold_x_stride(v_block_dim, v_block_shape, opus::tuple{opus::number<T::D_TILE_SIZE + T::KV_ROW_PAD_SIZE>{}, opus::number<T::D_TILE_SIZE / T::GEMM1_STAGE_N / lane_n>{}, 1_I}),
-        opus::unfold_p_coord(v_block_dim, opus::tuple{lane_id / lane_per_grp, (lane_id % lane_per_grp) % lane_k, (lane_id % lane_per_grp) / lane_k}));
+        opus::unfold_x_stride(v_block_dim, v_block_shape, opus::tuple{opus::number<T::VEC_KV>{}, opus::number<T::D_TILE_SIZE + T::KV_ROW_PAD_SIZE>{}, 1_I}),
+        opus::unfold_p_coord(v_block_dim, opus::tuple{(lane_id % lane_per_grp) / lane_k, lane_id / lane_per_grp, (lane_id % lane_per_grp) % lane_k}));
 }
 
 template<int Lo, int Hi, typename V, typename Op>
@@ -241,11 +248,9 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
     int lane_id = thread_id_x() % T::WARP_SIZE;
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    smem<D_ATTN> s_kv[T::NUM_WARPS] = {
+    smem<D_ATTN> s_kv[T::SEGS_PER_BUF] = {
         make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf + 0 * T::SEG_BYTES)),
         make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf + 1 * T::SEG_BYTES)),
-        make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf + 2 * T::SEG_BYTES)),
-        make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf + 3 * T::SEG_BYTES)),
     };
 
     const u32x4_t kv_indices_rsrc = make_buffer_rsrc_raw(kv_indices + page_idx_begin, (u32_t)(valid_kv_len * sizeof(int)));
@@ -260,7 +265,7 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
     };
 
     auto tdm_kv = make_tdm<D_ATTN, kv_gather_cfg>(
-        smem_kv_buf + warp_id * T::SEG_BYTES,
+        smem_kv_buf + (warp_id / T::WAVES_PER_SEG) * T::SEG_BYTES + (warp_id % T::WAVES_PER_SEG) * T::WAVE_LDS_BYTES,
         reinterpret_cast<const D_ATTN*>(kv_ptr),
         /*lds_off=*/ 0,
         /*td0=*/ T::D_TILE_SIZE,
@@ -311,22 +316,17 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
         tdm_kv.move(0_I, 0_I, 0_I, 0_I, 0_I, number<-(T::TDM_LOADS_PER_WAVE - 1) * lds_step>{});
     };
 
+    auto load_k = [&](auto sn, auto buf) {
+        constexpr int kv_row  = sn.value * T::W_N;
+        constexpr int seg     = kv_row / T::ROWS_PER_SEG;
+        constexpr int row_off = (kv_row % T::ROWS_PER_SEG) * T::KV_ROW_LDS_ELEMS;
+        v_k[buf.value] = load<T::VEC_KV>(s_kv[seg], u_rk + number<row_off>{});
+    };
+
     auto tr_load_v = [&](auto sn, auto sk, auto buf) {
         constexpr int stage_n = sn.value;
         constexpr int stage_k = sk.value;
-        constexpr int b       = buf.value;
-
-        auto v_v0 = tr_load<T::VEC_KV>(s_kv[2 * stage_k],     u_rv + number<stage_n * (T::D_TILE_SIZE / 4)>{});
-        auto v_v1 = tr_load<T::VEC_KV>(s_kv[2 * stage_k + 1], u_rv + number<stage_n * (T::D_TILE_SIZE / 4)>{});
-
-        constexpr int chunk  = T::VEC_KV;
-        constexpr int groups = opus::vector_traits<decltype(v_v0)>::size() / chunk;
-        static_for<groups>([&](auto g) {
-            static_for<chunk>([&](auto i) {
-                v_v[b][2 * chunk * g.value + i.value]         = v_v0[chunk * g.value + i.value];
-                v_v[b][2 * chunk * g.value + chunk + i.value] = v_v1[chunk * g.value + i.value];
-            });
-        });
+        v_v[buf.value] = tr_load<T::VEC_KV>(s_kv[stage_k], u_rv + number<stage_n * (T::D_TILE_SIZE / T::GEMM1_STAGE_N)>{});
     };
 
     if (num_kv_tiles <= 0) return;
@@ -351,12 +351,12 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
             row_ids = load_row_ids(tile_idx + 2);
         }
 
-        v_k[0] = load<T::VEC_KV>(s_kv[2 * PARITY], u_rk);
+        load_k(number<2 * PARITY>{}, 0_I);
         static_for<T::GEMM0_STAGE_N>([&](auto j) {
             constexpr int stage = (j.value + 2 * PARITY) % T::GEMM0_STAGE_N;
             constexpr int cur   = j.value & 1;
             if constexpr (j.value + 1 < T::GEMM0_STAGE_N) {
-                v_k[(j.value + 1) & 1] = load<T::VEC_KV>(s_kv[(j.value + 1 + 2 * PARITY) % T::GEMM0_STAGE_N], u_rk);
+                load_k(number<(j.value + 1 + 2 * PARITY) % T::GEMM0_STAGE_N>{}, number<(j.value + 1) & 1>{});
                 s_wait_dscnt(number<T::k_ds_load_insts>{});
             } else {
                 s_wait_dscnt(0_I);
@@ -396,7 +396,7 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
             v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v[cur], v_o_stages[stage_n]);
         });
 
-        static_for<T::NUM_WARPS>([&](auto i) { s_kv[i.value].ptr += rd_buf_delta; });
+        static_for<T::SEGS_PER_BUF>([&](auto i) { s_kv[i.value].ptr += rd_buf_delta; });
         rd_buf_delta = -rd_buf_delta;
     }
 }
