@@ -1,9 +1,5 @@
 // Paged sparse attention kernel template for D=512 on gfx1250 (wave32 / WMMA).
-// 16mx4_64nx1 variant (T_M=4, T_N=1).
-//
-// Placeholder — no implementation yet.
-//
-// Include this header from per-variant .cc files that instantiate specific traits.
+// 16mx4_64nx1 variant (T_M=4, T_N=1); include from a .cc that instantiates the traits.
 #pragma once
 
 #include <opus/opus.hpp>
@@ -181,8 +177,8 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
 
     if ((kv_tile_idx + 1) * T::KV_TILE_SIZE <= valid_kv_len) return;
 
-    constexpr int elems_per_stage = (T::W_M * T::W_N) / T::WARP_SIZE;      // 8
-    constexpr int lane_hi_kv_step = T::W_N / (T::WARP_SIZE / T::W_M);      // 8
+    constexpr int elems_per_stage = (T::W_M * T::W_N) / T::WARP_SIZE;
+    constexpr int lane_hi_kv_step = T::W_N / (T::WARP_SIZE / T::W_M);
     static_assert(opus::vector_traits<V>::size() == T::GEMM0_STAGE_N * elems_per_stage);
     static_assert((T::KV_TILE_SIZE & (T::KV_TILE_SIZE - 1)) == 0);
 
@@ -191,7 +187,7 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
     const int rel_base = (valid_kv_len - 1) - kv_tile_idx * T::KV_TILE_SIZE - lane_hi * lane_hi_kv_step;
 
     opus::static_for<T::GEMM0_STAGE_N>([&](auto i_s) {
-        // seg_rot_rows rotates which KV rows a stage holds: odd waves start on the other LDS segment
+        // odd waves hold the rotated KV rows
         const int rel = rel_base - ((i_s.value * T::W_N + seg_rot_rows) & (T::KV_TILE_SIZE - 1));
         opus::static_for<elems_per_stage>([&](auto i_reg) {
             constexpr int idx = i_s.value * elems_per_stage + i_reg.value;
@@ -201,7 +197,7 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
 }
 
 template<class Traits>
-__device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
+__device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kargs kargs,
                                            const void* kv_ptr, int kv_rows,
                                            const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
                                            char* smem_kv_buf,
@@ -215,15 +211,34 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
 
+    if (num_kv_tiles <= 0) return;
+
     int lane_id = thread_id_x() % T::WARP_SIZE;
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    // Odd waves start on the other segment to spread LDS traffic.
+    // Odd waves start on the other LDS half to spread traffic.
     const int seg_rot_bytes = (warp_id & 1) * T::SEG_BYTES;
     const int seg_rot_rows  = (warp_id & 1) * T::ROWS_PER_SEG;
-    smem<D_ATTN> s_kv[T::SEGS_PER_BUF] = {
+
+    // Three tile slots: QK(t+2) runs before PV(t+1), so t, t+1 and the in-flight t+2 coexist.
+    smem<D_ATTN> s_qk[T::SEGS_PER_BUF] = {
         make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf + seg_rot_bytes)),
         make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf + (T::SEG_BYTES - seg_rot_bytes))),
+    };
+    smem<D_ATTN> s_pv[T::SEGS_PER_BUF] = { s_qk[0], s_qk[1] };
+
+    constexpr int SLOT_BYTES = T::KV_BUF_BYTES;
+    constexpr int WRAP_BYTES = -(T::NUM_KV_BUFS - 1) * T::KV_BUF_BYTES;
+    int qk_slot = 0, pv_slot = 0, tdm_slot = 0;
+
+    auto slot_step = [](int& slot) {
+        const bool wrap = (slot == T::NUM_KV_BUFS - 1);
+        slot = wrap ? 0 : slot + 1;
+        return wrap ? WRAP_BYTES : SLOT_BYTES;
+    };
+    auto advance = [&](auto& s, int& slot) {
+        const int delta = slot_step(slot);
+        static_for<T::SEGS_PER_BUF>([&](auto i) { s[i.value].ptr += delta; });
     };
 
     const u32x4_t kv_indices_rsrc = make_buffer_rsrc_raw(kv_indices + page_idx_begin, (u32_t)(valid_kv_len * sizeof(int)));
@@ -261,24 +276,25 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
 
     vector_t<D_ATTN, T::GEMM0_E_N * T::GEMM0_E_K * T::W_N * T::W_K / T::WARP_SIZE> v_k[2];
     vector_t<D_ATTN, T::GEMM1_E_N * T::GEMM1_E_K * T::W_N * T::W_K / T::WARP_SIZE> v_v[2];
-    vector_t<D_ACC, T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE> v_s;
+    vector_t<D_ACC, T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE> v_s[2];
     vector_t<D_ATTN, T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE> v_p;
-    auto v_s_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>*>(&v_s);
     auto v_p_stages = reinterpret_cast<vector_t<D_ATTN, T::W_M * T::W_K / T::WARP_SIZE>*>(&v_p);
     auto v_o_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::D_TILE_SIZE / T::GEMM1_STAGE_N / T::WARP_SIZE>*>(&v_o);
+
+    u32x16_t row_ids;   // indices for the next TDM gather
 
     auto load_row_ids = [&](int tile_idx) {
         const int idx_byte_off = (tile_idx * T::KV_TILE_SIZE + warp_id * T::ROWS_PER_WAVE) * (int)sizeof(int);
         return llvm_amdgcn_s_buffer_load_v16i32(kv_indices_rsrc, idx_byte_off, /*aux=*/0);
     };
 
-    auto issue_kv_tile = [&](const u32x16_t& row_ids) {
+    auto issue_kv_tile = [&](const u32x16_t& ids) {
         constexpr int lds_step = T::INDICES_PER_TDM * T::KV_ROW_LDS_BYTES;
 
         static_for<T::TDM_LOADS_PER_WAVE>([&](auto d) {
             constexpr int ld = d.value;
             static_for<T::INDICES_PER_TDM>([&](auto r) {
-                tdm_kv.set_gather_row_index(r.value, __builtin_amdgcn_readfirstlane(row_ids[ld * T::INDICES_PER_TDM + r.value]));
+                tdm_kv.set_gather_row_index(r.value, __builtin_amdgcn_readfirstlane(ids[ld * T::INDICES_PER_TDM + r.value]));
             });
             tdm_kv.load();
             if constexpr (ld + 1 < T::TDM_LOADS_PER_WAVE)
@@ -291,85 +307,153 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
         constexpr int kv_row  = sn.value * T::W_N;
         constexpr int seg     = kv_row / T::ROWS_PER_SEG;
         constexpr int row_off = (kv_row % T::ROWS_PER_SEG) * T::KV_ROW_LDS_ELEMS;
-        v_k[buf.value] = load<T::VEC_KV>(s_kv[seg], u_rk + number<row_off>{});
+        v_k[buf.value] = load<T::VEC_KV>(s_qk[seg], u_rk + number<row_off>{});
     };
 
     auto tr_load_v = [&](auto sn, auto sk, auto buf) {
         constexpr int stage_n = sn.value;
         constexpr int stage_k = sk.value;
-        v_v[buf.value] = tr_load<T::VEC_KV>(s_kv[stage_k], u_rv + number<stage_n * (T::D_TILE_SIZE / T::GEMM1_STAGE_N)>{});
+        v_v[buf.value] = tr_load<T::VEC_KV>(s_pv[stage_k], u_rv + number<stage_n * (T::D_TILE_SIZE / T::GEMM1_STAGE_N)>{});
     };
 
-    if (num_kv_tiles <= 0) return;
+    // Online softmax state, sliced into the GEMM stage loops below.
+    constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
+    constexpr index_t s_len = T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE;
+    D_ACC row_max;
+    bool all_below;
 
-    int tdm_buf_delta = T::KV_BUF_BYTES;   // alternates +/- to flip the TDM destination buffer
-    int rd_buf_delta  = T::KV_BUF_BYTES;   // alternates +/- to flip the read buffer
+    // S = Q @ K^T into v_s[dst], then step s_qk. FUSE_SOFTMAX folds the softmax tail of v_s[prev]
+    // into the stages. v_k[0] arrives prefetched; the last stage starts the next V read.
+    auto compute_qk = [&](auto dst, auto prev, auto fuse_softmax) __attribute__((always_inline)) {
+        auto v_s_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>*>(&v_s[dst.value]);
+        static_for<T::GEMM0_STAGE_N>([&](auto j) {
+            constexpr int stage = j.value;
+            constexpr int buf   = j.value & 1;
+            s_wait_dscnt(0_I);
+            __builtin_amdgcn_sched_barrier(0);
+            clear(v_s_stages[stage]);
+            v_s_stages[stage] = mma0(v_q, v_k[buf], v_s_stages[stage]);
+            if constexpr (stage + 1 < T::GEMM0_STAGE_N) load_k(number<stage + 1>{}, number<(stage + 1) & 1>{});
+            else                                        tr_load_v(0_I, 0_I, 0_I);
+            if constexpr (decltype(fuse_softmax)::value) {
+                if constexpr (stage == 0) attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[prev.value]);
+                if constexpr (stage == 1) l_row += attn_row_sum<T>(v_s[prev.value]);
+                if constexpr (stage == 2) v_p = cast<D_ATTN>(v_s[prev.value]);
+            }
+        });
+        advance(s_qk, qk_slot);
+    };
 
-    u32x16_t row_ids = load_row_ids(0);
+    // O += P @ V of v_p, then step s_pv. FUSE_SOFTMAX folds the softmax head of v_s[cur] into the
+    // stages; the last stage's barrier publishes the next tile and frees the slot the next TDM takes.
+    auto compute_pv = [&](auto cur, auto fuse_softmax) __attribute__((always_inline)) {
+        constexpr int GEMM1_STAGES = T::GEMM1_STAGE_N * T::GEMM1_STAGE_K;
+        static_for<GEMM1_STAGES>([&](auto sg) {
+            constexpr int stage_n = sg.value % T::GEMM1_STAGE_N;
+            constexpr int stage_k = sg.value / T::GEMM1_STAGE_N;
+            constexpr int buf     = sg.value & 1;
+            s_wait_dscnt(0_I);
+            __builtin_amdgcn_sched_barrier(0);
+            v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v[buf], v_o_stages[stage_n]);
+            if constexpr (sg.value + 1 < GEMM1_STAGES) {
+                constexpr int n_sn = (sg.value + 1) % T::GEMM1_STAGE_N;
+                constexpr int n_sk = (sg.value + 1) / T::GEMM1_STAGE_N;
+                tr_load_v(number<n_sn>{}, number<n_sk>{}, number<(sg.value + 1) & 1>{});
+            } else if constexpr (decltype(fuse_softmax)::value) {
+                s_wait_tensorcnt(0_I);
+                __builtin_amdgcn_s_barrier();
+                load_k(0_I, 0_I);
+            }
+            if constexpr (decltype(fuse_softmax)::value) {
+                if constexpr (sg.value == 0) {
+                    row_max = attn_row_max<T>(v_s[cur.value]) * temperature_scale;
+                    all_below = __builtin_amdgcn_ballot_w32((row_max - m_row) <= RESCALE_THRESHOLD)
+                             == __builtin_amdgcn_read_exec_lo();
+                    row_max = all_below ? m_row : max(m_row, row_max);
+                }
+                if constexpr (sg.value == 1) attn_row_scale_sub<T>(v_s[cur.value], temperature_scale, row_max);
+                if constexpr (sg.value == 2) attn_exp2_slice<T, 0, s_len / 2>(v_s[cur.value]);
+                if constexpr (sg.value == 3) {   // only valid once every mma1 has landed in v_o
+                    if (!all_below) {
+                        const D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+                        m_row = row_max;
+                        l_row *= rescale_m;
+                        scale_output_tile<T>(v_o, rescale_m);
+                    }
+                }
+            }
+        });
+        advance(s_pv, pv_slot);
+    };
+
+    // Gather a tile into the next slot, prefetch the row indices after it.
+    auto issue_tile = [&](int tile) {
+        s_wait_kmcnt(0_I);
+        tdm_kv.move(0_I, 0_I, 0_I, 0_I, 0_I, slot_step(tdm_slot));
+        issue_kv_tile(row_ids);
+        row_ids = load_row_ids(tile + 1);
+    };
+
+    // Prologue
+    row_ids = load_row_ids(0);
     s_wait_kmcnt(0_I);
     issue_kv_tile(row_ids);
     row_ids = load_row_ids(1);
+    s_wait_tensorcnt(0_I);
+    __builtin_amdgcn_s_barrier();
+    if (num_kv_tiles > 1) issue_tile(1);
+    load_k(0_I, 0_I);
+    compute_qk(0_I, 0_I, false_type{});
 
-    for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
-        s_wait_tensorcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+    // Hand-off a compute_pv would give: publish tile 1, start its first K read.
+    s_wait_tensorcnt(0_I);
+    __builtin_amdgcn_s_barrier();
+    load_k(0_I, 0_I);
 
-        if (tile_idx + 1 < num_kv_tiles) {
-            s_wait_kmcnt(0_I);
-            tdm_kv.move(0_I, 0_I, 0_I, 0_I, 0_I, tdm_buf_delta);
-            tdm_buf_delta = -tdm_buf_delta;
-            issue_kv_tile(row_ids);
-            row_ids = load_row_ids(tile_idx + 2);
-        }
-
-        load_k(0_I, 0_I);
-        static_for<T::GEMM0_STAGE_N>([&](auto j) {
-            constexpr int stage = j.value;
-            constexpr int cur   = j.value & 1;
-            if constexpr (j.value + 1 < T::GEMM0_STAGE_N) {
-                load_k(number<j.value + 1>{}, number<(j.value + 1) & 1>{});
-                s_wait_dscnt(number<T::k_ds_load_insts>{});
-            } else {
-                s_wait_dscnt(0_I);
-            }
-            __builtin_amdgcn_sched_barrier(0);
-            clear(v_s_stages[stage]);
-            v_s_stages[stage] = mma0(v_q, v_k[cur], v_s_stages[stage]);
-        });
-
-        attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, seg_rot_rows);
-        D_ACC row_max = max(m_row, attn_row_max<T>(v_s) * temperature_scale);
-        D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+    // Softmax head of tile 0, no GEMM to ride along yet.
+    row_max = attn_row_max<T>(v_s[0]) * temperature_scale;
+    all_below = __builtin_amdgcn_ballot_w32((row_max - m_row) <= RESCALE_THRESHOLD)
+             == __builtin_amdgcn_read_exec_lo();
+    row_max = all_below ? m_row : max(m_row, row_max);
+    attn_row_scale_sub<T>(v_s[0], temperature_scale, row_max);
+    attn_exp2_slice<T, 0, s_len / 2>(v_s[0]);
+    if (!all_below) {
+        const D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_row_scale_sub<T>(v_s, temperature_scale, row_max);
-        constexpr index_t s_len = vector_traits<decltype(v_s)>::size();
-        attn_exp2_slice<T, 0, s_len>(v_s);
         l_row *= rescale_m;
-        l_row += attn_row_sum<T>(v_s);
-        v_p = cast<D_ATTN>(v_s);
         scale_output_tile<T>(v_o, rescale_m);
-
-        constexpr int GEMM1_STAGES = T::GEMM1_STAGE_N * T::GEMM1_STAGE_K;
-        tr_load_v(0_I, 0_I, 0_I);
-        static_for<GEMM1_STAGES>([&](auto s) {
-            constexpr int stage_n = s.value % T::GEMM1_STAGE_N;
-            constexpr int stage_k = s.value / T::GEMM1_STAGE_N;
-            constexpr int cur     = s.value & 1;
-            if constexpr (s.value + 1 < GEMM1_STAGES) {
-                constexpr int n_sn = (s.value + 1) % T::GEMM1_STAGE_N;
-                constexpr int n_sk = (s.value + 1) / T::GEMM1_STAGE_N;
-                tr_load_v(number<n_sn>{}, number<n_sk>{}, number<(s.value + 1) & 1>{});
-                s_wait_dscnt(number<T::v_ds_load_insts>{});
-            } else {
-                s_wait_dscnt(0_I);
-            }
-            __builtin_amdgcn_sched_barrier(0);
-            v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v[cur], v_o_stages[stage_n]);
-        });
-
-        static_for<T::SEGS_PER_BUF>([&](auto i) { s_kv[i.value].ptr += rd_buf_delta; });
-        rd_buf_delta = -rd_buf_delta;
     }
+
+    // Main loop
+    int t = 1;
+    for (; t + 3 < num_kv_tiles; t += 2) {
+        issue_tile(t + 1);
+        compute_qk(1_I, 0_I, true_type{});       // QK(t)   + tail(t-1)
+        compute_pv(1_I, true_type{});            // PV(t-1) + head(t)
+        issue_tile(t + 2);
+        compute_qk(0_I, 1_I, true_type{});       // QK(t+1) + tail(t)
+        compute_pv(0_I, true_type{});            // PV(t)   + head(t+1)
+    }
+
+    // Epilogue
+    issue_tile(t + 1);
+    compute_qk(1_I, 0_I, true_type{});        // QK(t)   + tail(t-1)
+    compute_pv(1_I, true_type{});             // PV(t-1) + head(t)
+    issue_tile(t + 2);
+    compute_qk(0_I, 1_I, true_type{});        // QK(t+1) + tail(t)
+    compute_pv(0_I, true_type{});             // PV(t)   + head(t+1)
+    compute_qk(1_I, 0_I, true_type{});        // QK(t+2) + tail(t+1), no tile left to gather
+    attn_mask_oob_score<T>(v_s[1], valid_kv_len, t + 2, seg_rot_rows);
+    compute_pv(1_I, true_type{});             // PV(t+1) + head(t+2)
+
+    // No compute_qk left to start the last V read.
+    tr_load_v(0_I, 0_I, 0_I);
+
+    // Softmax tail of the last tile.
+    attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[1]);
+    l_row += attn_row_sum<T>(v_s[1]);
+    v_p = cast<D_ATTN>(v_s[1]);
+    compute_pv(0_I, false_type{});            // PV(t+2)
 }
 
 } // namespace pa_16mx4_64nx1
@@ -405,29 +489,28 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
     v_q = load<T::VEC_Q>(g_q, u_q);
     s_wait_loadcnt(0_I);
 
-    // Initialize shared attention state
     clear(v_o);
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
 
-    // ── Prefix segment: kv_indices_prefix index into unified_kv[total_pages] ──
+    // Prefix segment: indices point into unified_kv[total_pages]
     {
         const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
         const int valid_kv_len   = kargs.kv_indptr_prefix[q_token_idx + 1] - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
-        pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+        pa_prefill_accum_pipelined<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
     }
     __builtin_amdgcn_s_barrier();
-
-    // ── Extend segment: kv_indices_extend index into kv[total_tokens] ──
+#if 1
+    // Extend segment: indices point into kv[total_tokens]
     {
         const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
         const int valid_kv_len   = kargs.kv_indptr_extend[q_token_idx + 1] - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
-        pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+        pa_prefill_accum_pipelined<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
     }
-
-    // ──── Sink finalization, normalize O, and store to gmem ────
+#endif
+    // Sink finalization, normalize O, store to gmem
     const int sink_head_idx = h_block_start + warp_id * T::Q_TILE_SIZE + (lane_id % T::W_M);
     auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
     D_ACC sink_log2 = load(g_attn_sink, sink_head_idx)[0] * LOG2_E;
