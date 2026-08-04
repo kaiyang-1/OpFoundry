@@ -11,6 +11,11 @@ using opus::operator""_I;
 
 namespace pa_16mx4_64nx1 {
 
+constexpr int MFMA_MASK    = 0x08;
+constexpr int VALU_MASK    = 0x02;
+constexpr int EXP_MASK     = 0x400;
+constexpr int DS_READ_MASK = 0x100;
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wundefined-inline"
 OPUS_D opus::u32x16_t llvm_amdgcn_s_buffer_load_v16i32(opus::u32x4_t rsrc, int offset, int aux)
@@ -336,9 +341,31 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
             if constexpr (stage + 1 < T::GEMM0_STAGE_N) load_k(number<stage + 1>{}, number<(stage + 1) & 1>{});
             else                                        tr_load_v(0_I, 0_I, 0_I);
             if constexpr (decltype(fuse_softmax)::value) {
-                if constexpr (stage == 0) attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[prev.value]);
-                if constexpr (stage == 1) l_row += attn_row_sum<T>(v_s[prev.value]);
-                if constexpr (stage == 2) v_p = cast<D_ATTN>(v_s[prev.value]);
+                if constexpr (stage == 0) {
+                    attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[prev.value]);
+                    static_for<16>([&](auto) {
+                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
+                        __builtin_amdgcn_sched_group_barrier(EXP_MASK, 1, 0);
+                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
+                    });
+                }
+                if constexpr (stage == 1) {
+                    l_row += attn_row_sum<T>(v_s[prev.value]);
+                    static_for<16>([&](auto) {
+                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
+                        __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
+                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
+                    });
+                }
+                if constexpr (stage == 2) {
+                    v_p = cast<D_ATTN>(v_s[prev.value]);
+                    asm volatile("" : "+v"(v_p) ::);
+                    static_for<16>([&](auto) {
+                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
+                        __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
+                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
+                    });
+                }
             }
         });
         advance(s_qk, qk_slot);
@@ -370,9 +397,28 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
                     all_below = __builtin_amdgcn_ballot_w32((row_max - m_row) <= RESCALE_THRESHOLD)
                              == __builtin_amdgcn_read_exec_lo();
                     row_max = all_below ? m_row : max(m_row, row_max);
+                    static_for<16>([&](auto) {
+                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
+                        __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
+                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
+                    });
                 }
-                if constexpr (sg.value == 1) attn_row_scale_sub<T>(v_s[cur.value], temperature_scale, row_max);
-                if constexpr (sg.value == 2) attn_exp2_slice<T, 0, s_len / 2>(v_s[cur.value]);
+                if constexpr (sg.value == 1) {
+                    attn_row_scale_sub<T>(v_s[cur.value], temperature_scale, row_max);
+                    static_for<16>([&](auto) {
+                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
+                        __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
+                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
+                    });
+                }
+                if constexpr (sg.value == 2) {
+                    attn_exp2_slice<T, 0, s_len / 2>(v_s[cur.value]);
+                    static_for<16>([&](auto) {
+                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
+                        __builtin_amdgcn_sched_group_barrier(EXP_MASK, 1, 0);
+                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
+                    });
+                }
                 if constexpr (sg.value == 3) {   // only valid once every mma1 has landed in v_o
                     if (!all_below) {
                         const D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
