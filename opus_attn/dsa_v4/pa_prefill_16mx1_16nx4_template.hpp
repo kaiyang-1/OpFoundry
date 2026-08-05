@@ -4,6 +4,7 @@
 
 #include <opus/opus.hpp>
 #include "pa_defs.h"
+#include "pa_global_load.hpp"
 #include <bit>
 #include <cstdint>
 
@@ -314,7 +315,7 @@ __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile
 
 template<class Traits, class VQ, class VO>
 __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_kargs kargs,
-                                                const void* kv_ptr, int kv_rows,
+                                                const void* kv_ptr,
                                                 const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
                                                 char* smem_kv, char* smem_ml, char* smem_p,
                                                 VQ& v_q, VO& v_o,
@@ -330,7 +331,7 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_kargs kargs,
     asm volatile("" : "+v"(lane_id));  // break CSE
     int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    auto g_kv = make_gmem(reinterpret_cast<const D_ATTN*>(kv_ptr), kv_rows * kargs.stride_kv_page * sizeof(D_ATTN));
+    auto p_kv = reinterpret_cast<const D_ATTN*>(kv_ptr);
     auto g_kv_indices = make_gmem(kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
 
     auto s_kv = make_smem(reinterpret_cast<D_ATTN*>(smem_kv));
@@ -364,14 +365,14 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_kargs kargs,
     auto v_p_warps = reinterpret_cast<vector_t<D_ATTN, s_len>*>(&v_p);
 
     auto load_kv_page = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE); };
-    auto kv_token_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_page; };
+    auto kv_token_offset = [&](int token_idx) { return static_cast<int64_t>(token_idx) * kargs.stride_kv_page; };
 
     auto kv_page = load_kv_page(0);
 
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
-        async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv + T::NUM_WARPS * T::smem_d_rpt * (T::smem_linear_wave + T::smem_padding_32B));
+        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[0]), s_kv.ptr, u_gkv, u_skv);
+        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[1]), s_kv.ptr, u_gkv, u_skv + T::NUM_WARPS * T::smem_d_rpt * (T::smem_linear_wave + T::smem_padding_32B));
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
         kv_page = load_kv_page(tile_idx + 1);
@@ -454,7 +455,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
+        pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
     }
 
     __builtin_amdgcn_s_barrier();
@@ -466,7 +467,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
+        pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
     }
 
     // ──── Sink finalization, normalize O, and store to gmem ────

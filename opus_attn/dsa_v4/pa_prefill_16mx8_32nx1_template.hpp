@@ -4,6 +4,7 @@
 
 #include <opus/opus.hpp>
 #include "pa_defs.h"
+#include "pa_global_load.hpp"
 #include <bit>
 #include <cstdint>
 
@@ -346,7 +347,7 @@ __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile
 
 template<class Traits>
 __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
-                                           const void* kv_ptr, int kv_rows,
+                                           const void* kv_ptr,
                                            const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
                                            char* smem_kv_buf,
                                            opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
@@ -363,7 +364,7 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
     asm volatile("" : "+v"(lane_id));  // break CSE
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    auto g_kv = make_gmem(reinterpret_cast<const D_ATTN*>(kv_ptr), kv_rows * kargs.stride_kv_page * sizeof(D_ATTN));
+    auto p_kv = reinterpret_cast<const D_ATTN*>(kv_ptr);
     auto g_kv_indices = make_gmem(kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
 
     auto s_kv = make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf));
@@ -395,7 +396,7 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
     constexpr index_t s_len = vector_traits<typename decltype(mma0)::vtype_c>::size();
 
     auto load_kv_page = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
-    auto kv_token_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_page; };
+    auto kv_token_offset = [&](int token_idx) { return static_cast<int64_t>(token_idx) * kargs.stride_kv_page; };   // 64-bit: KV cache may exceed 4 GB
     auto skv_slice = [](auto slice_idx) {
         constexpr int s = decltype(slice_idx)::value;
         return number<(s / 2) * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B) + (s % 2) * T::SLICE_D>{};
@@ -438,7 +439,7 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
 
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         const int kv_page = load_kv_page(tile_idx);
-        async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page), u_skv);
+        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page), s_kv.ptr, u_gkv, u_skv);
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
@@ -469,7 +470,7 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
 
 template<class Traits, bool OddTail>
 __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
-                                           const void* kv_ptr, int kv_rows,
+                                           const void* kv_ptr,
                                            const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
                                            char* smem_kv_buf,
                                            opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
@@ -488,7 +489,7 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
     const int stagger = warp_id / 4;
 
     // Global memory tensors
-    auto g_kv = make_gmem(reinterpret_cast<const D_ATTN*>(kv_ptr), kv_rows * kargs.stride_kv_page * sizeof(D_ATTN));
+    auto p_kv = reinterpret_cast<const D_ATTN*>(kv_ptr);
     auto g_kv_indices = make_gmem(kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
 
     // Shared memory for KV tiles
@@ -536,7 +537,7 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
 
     // Tile traversal helpers
     auto load_kv_page = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
-    auto kv_token_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_page; };
+    auto kv_token_offset = [&](int token_idx) { return static_cast<int64_t>(token_idx) * kargs.stride_kv_page; };   // 64-bit: KV cache may exceed 4 GB
     auto skv_slice = [](auto slice_idx) {
         constexpr int s = decltype(slice_idx)::value;
         return number<(s / 2) * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B) + (s % 2) * T::SLICE_D>{};
@@ -582,13 +583,13 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
 
     // Prologue
     int pg = load_kv_page(0);
-    async_load<T::VEC_KV>(g_kv, s_kv[0].ptr, u_gkv + kv_token_offset(pg), u_skv);
+    global_load<T::VEC_KV>(p_kv + kv_token_offset(pg), s_kv[0].ptr, u_gkv, u_skv);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
     pg = load_kv_page(1);
-    async_load<T::VEC_KV>(g_kv, s_kv[0].ptr, u_gkv + kv_token_offset(pg), u_skv + kv_slot_offset);
+    global_load<T::VEC_KV>(p_kv + kv_token_offset(pg), s_kv[0].ptr, u_gkv, u_skv + kv_slot_offset);
     __builtin_amdgcn_sched_barrier(0);
     kv_page[0] = load_kv_page(2);
     v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk);
@@ -624,7 +625,7 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
     for (int j = 1; j < num_kv_tiles - 3; j += 2) {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
+        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[1] = load_kv_page(j + 2);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
@@ -681,7 +682,7 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
 
         // Cluster 4:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv + kv_slot_offset);
+        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[1]), s_kv[1].ptr, u_gkv, u_skv + kv_slot_offset);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[0] = load_kv_page(j + 3);
         v_k[0] = load<T::VEC_KV>(s_kv[1], u_rk);
@@ -743,7 +744,7 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
     if constexpr (OddTail) {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
+        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
         v_k[1] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
@@ -860,7 +861,7 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
     } else {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
+        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[1] = load_kv_page(num_kv_tiles - 1);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
@@ -911,7 +912,7 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
 
         // Cluster 4:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv + kv_slot_offset);
+        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[1]), s_kv[1].ptr, u_gkv, u_skv + kv_slot_offset);
         v_k[0] = load<T::VEC_KV>(s_kv[1], u_rk);
         v_k[1] = load<T::VEC_KV>(s_kv[1], u_rk + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
@@ -1076,13 +1077,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
     }
 
@@ -1096,13 +1097,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
     }
 

@@ -2,6 +2,7 @@
 
 #include <opus/opus.hpp>
 #include "pa_defs.h"
+#include "pa_global_load.hpp"
 #include <bit>
 #include <cstdint>
 
@@ -537,7 +538,7 @@ __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile
 template<class Traits, class VQN, class VQR, class VO>
 __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
         pa_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
-        int kv_rows, const int* kv_indices,
+        const int* kv_indices,
         int page_idx_begin, int valid_kv_len, int num_kv_tiles,
         char* smem_kv,
         VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
@@ -554,8 +555,8 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     // Global memory views
-    auto g_k_nope     = make_gmem(reinterpret_cast<const D_NOPE*>(kv_nope_ptr), kv_rows * kargs.stride_kv_nope_page * sizeof(D_NOPE));
-    auto g_k_rope     = make_gmem(reinterpret_cast<const D_ROPE*>(kv_rope_ptr), kv_rows * kargs.stride_kv_rope_page * sizeof(D_ROPE));
+    auto p_k_nope     = reinterpret_cast<const D_NOPE*>(kv_nope_ptr);
+    auto p_k_rope     = reinterpret_cast<const D_ROPE*>(kv_rope_ptr);
     auto g_kv_indices = make_gmem(kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
 
     // Shared memory regions
@@ -617,8 +618,8 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
 
     // Tile traversal helpers
     auto load_kv_page   = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
-    auto kv_nope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_nope_page; };
-    auto kv_rope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_rope_page; };
+    auto kv_nope_offset = [&](int token_idx) { return static_cast<int64_t>(token_idx) * kargs.stride_kv_nope_page; };
+    auto kv_rope_offset = [&](int token_idx) { return static_cast<int64_t>(token_idx) * kargs.stride_kv_rope_page; };
 
     auto compute_qk_nope = [&](auto& s, auto& q, auto& k, auto& scale_q, auto& v_k_mxscl) {
         clear(s);
@@ -673,8 +674,8 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
 
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         const int kv_page = load_kv_page(tile_idx);
-        async_load<T::VEC_KV_NOPE>(g_k_nope, s_k_nope.ptr, u_gk_nope + kv_nope_offset(kv_page), u_sk_nope);
-        async_load<T::VEC_KV_ROPE>(g_k_rope, s_k_rope.ptr, u_gk_rope + kv_rope_offset(kv_page), u_sk_rope);
+        global_load<T::VEC_KV_NOPE>(p_k_nope + kv_nope_offset(kv_page), s_k_nope.ptr, u_gk_nope, u_sk_nope);
+        global_load<T::VEC_KV_ROPE>(p_k_rope + kv_rope_offset(kv_page), s_k_rope.ptr, u_gk_rope, u_sk_rope);
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
@@ -736,7 +737,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
 template<class Traits, bool OddTail, class VQN, class VQR, class VO>
 __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         pa_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
-        int kv_rows, const int* kv_indices,
+        const int* kv_indices,
         int page_idx_begin, int valid_kv_len, int num_kv_tiles,
         char* smem_kv,
         VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
@@ -754,8 +755,8 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
     const int stagger = warp_id / 4;
 
     // Global memory views
-    auto g_k_nope     = make_gmem(reinterpret_cast<const D_NOPE*>(kv_nope_ptr), kv_rows * kargs.stride_kv_nope_page * sizeof(D_NOPE));
-    auto g_k_rope     = make_gmem(reinterpret_cast<const D_ROPE*>(kv_rope_ptr), kv_rows * kargs.stride_kv_rope_page * sizeof(D_ROPE));
+    auto p_k_nope     = reinterpret_cast<const D_NOPE*>(kv_nope_ptr);
+    auto p_k_rope     = reinterpret_cast<const D_ROPE*>(kv_rope_ptr);
     auto g_kv_indices = make_gmem(kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
 
     // Shared memory regions
@@ -831,13 +832,13 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
     // Tile traversal helpers
     int kv_page[2];
     auto load_kv_page   = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
-    auto kv_nope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_nope_page; };
-    auto kv_rope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_rope_page; };
+    auto kv_nope_offset = [&](int token_idx) { return static_cast<int64_t>(token_idx) * kargs.stride_kv_nope_page; };
+    auto kv_rope_offset = [&](int token_idx) { return static_cast<int64_t>(token_idx) * kargs.stride_kv_rope_page; };
 
     auto async_load_kv = [&](auto slot_n, int token_idx) {
         constexpr int sl = decltype(slot_n)::value;
-        async_load<T::VEC_KV_NOPE>(g_k_nope, s_k_nope.ptr, u_gk_nope + kv_nope_offset(token_idx), u_sk_nope + number<sl * (T::smem_kv_bytes() / sizeof(D_NOPE))>{});
-        async_load<T::VEC_KV_ROPE>(g_k_rope, s_k_rope.ptr, u_gk_rope + kv_rope_offset(token_idx), u_sk_rope + number<sl * (T::smem_kv_bytes() / sizeof(D_ROPE))>{});
+        global_load<T::VEC_KV_NOPE>(p_k_nope + kv_nope_offset(token_idx), s_k_nope.ptr, u_gk_nope, u_sk_nope + number<sl * (T::smem_kv_bytes() / sizeof(D_NOPE))>{});
+        global_load<T::VEC_KV_ROPE>(p_k_rope + kv_rope_offset(token_idx), s_k_rope.ptr, u_gk_rope, u_sk_rope + number<sl * (T::smem_kv_bytes() / sizeof(D_ROPE))>{});
     };
 
     auto load_mxscl = [&](auto slot_off) {
@@ -1490,7 +1491,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
 
         if (num_kv_tiles <= 2) {
             pa_prefill_16mx8_32nx1_fp8_le2_tiles<Traits>(
-                kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.total_pages, kargs.kv_indices_prefix,
+                kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
                 v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
@@ -1498,7 +1499,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
             pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true>(
-                kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.total_pages, kargs.kv_indices_prefix,
+                kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
                 v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
@@ -1506,7 +1507,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
             pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false>(
-                kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.total_pages, kargs.kv_indices_prefix,
+                kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
                 v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
@@ -1525,7 +1526,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
 
         if (num_kv_tiles <= 2) {
             pa_prefill_16mx8_32nx1_fp8_le2_tiles<Traits>(
-                kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.total_tokens, kargs.kv_indices_extend,
+                kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
                 v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
@@ -1533,7 +1534,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
             pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true>(
-                kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.total_tokens, kargs.kv_indices_extend,
+                kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
                 v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
@@ -1541,7 +1542,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
             pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false>(
-                kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.total_tokens, kargs.kv_indices_extend,
+                kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
                 v_q_nope, v_q_rope, scale_q, v_o, m_row, l_row,
