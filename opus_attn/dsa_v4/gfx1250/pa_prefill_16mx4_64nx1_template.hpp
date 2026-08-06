@@ -11,11 +11,6 @@ using opus::operator""_I;
 
 namespace pa_16mx4_64nx1 {
 
-constexpr int MFMA_MASK    = 0x08;
-constexpr int VALU_MASK    = 0x02;
-constexpr int EXP_MASK     = 0x400;
-constexpr int DS_READ_MASK = 0x100;
-
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wundefined-inline"
 OPUS_D opus::u32x16_t llvm_amdgcn_s_buffer_load_v16i32(opus::u32x4_t rsrc, int offset, int aux)
@@ -286,26 +281,44 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
     auto v_p_stages = reinterpret_cast<vector_t<D_ATTN, T::W_M * T::W_K / T::WARP_SIZE>*>(&v_p);
     auto v_o_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::D_TILE_SIZE / T::GEMM1_STAGE_N / T::WARP_SIZE>*>(&v_o);
 
-    u32x16_t row_ids;   // indices for the next TDM gather
+    // Online softmax state, sliced into the GEMM stage loops below.
+    constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
+    constexpr index_t s_len = T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE;
+    D_ACC row_max;
+    bool all_below;
+
+    u32x16_t row_ids;
 
     auto load_row_ids = [&](int tile_idx) {
         const int idx_byte_off = (tile_idx * T::KV_TILE_SIZE + warp_id * T::ROWS_PER_WAVE) * (int)sizeof(int);
         return llvm_amdgcn_s_buffer_load_v16i32(kv_indices_rsrc, idx_byte_off, /*aux=*/0);
     };
 
-    auto issue_kv_tile = [&](const u32x16_t& ids) {
+    auto issue_kv_tile = [&](const u32x16_t& ids, int tile_idx, auto clamp_tail) {
         constexpr int lds_step = T::INDICES_PER_TDM * T::KV_ROW_LDS_BYTES;
+        [[maybe_unused]] const int wave_valid = valid_kv_len - (tile_idx * T::KV_TILE_SIZE + warp_id * T::ROWS_PER_WAVE);
 
         static_for<T::TDM_LOADS_PER_WAVE>([&](auto d) {
             constexpr int ld = d.value;
             static_for<T::INDICES_PER_TDM>([&](auto r) {
-                tdm_kv.set_gather_row_index(r.value, __builtin_amdgcn_readfirstlane(ids[ld * T::INDICES_PER_TDM + r.value]));
+                constexpr int slot = ld * T::INDICES_PER_TDM + r.value;
+                u32_t id = ids[slot];
+                if constexpr (decltype(clamp_tail)::value) id = slot < wave_valid ? id : (u32_t)kv_rows;
+                tdm_kv.set_gather_row_index(r.value, __builtin_amdgcn_readfirstlane(id));
             });
             tdm_kv.load();
             if constexpr (ld + 1 < T::TDM_LOADS_PER_WAVE)
                 tdm_kv.move(0_I, 0_I, 0_I, 0_I, 0_I, number<lds_step>{});
         });
         tdm_kv.move(0_I, 0_I, 0_I, 0_I, 0_I, number<-(T::TDM_LOADS_PER_WAVE - 1) * lds_step>{});
+    };
+
+    // Gather a tile into the next slot, prefetch the row indices after it.
+    auto issue_tile = [&](int tile, auto clamp_tail) {
+        s_wait_kmcnt(0_I);
+        tdm_kv.move(0_I, 0_I, 0_I, 0_I, 0_I, slot_step(tdm_slot));
+        issue_kv_tile(row_ids, tile, clamp_tail);
+        row_ids = load_row_ids(tile + 1);
     };
 
     auto load_k = [&](auto sn, auto buf) {
@@ -321,12 +334,6 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
         v_v[buf.value] = tr_load<T::VEC_KV>(s_pv[stage_k], u_rv + number<stage_n * (T::D_TILE_SIZE / T::GEMM1_STAGE_N)>{});
     };
 
-    // Online softmax state, sliced into the GEMM stage loops below.
-    constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
-    constexpr index_t s_len = T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE;
-    D_ACC row_max;
-    bool all_below;
-
     // S = Q @ K^T into v_s[dst], then step s_qk. FUSE_SOFTMAX folds the softmax tail of v_s[prev]
     // into the stages. v_k[0] arrives prefetched; the last stage starts the next V read.
     auto compute_qk = [&](auto dst, auto prev, auto fuse_softmax) __attribute__((always_inline)) {
@@ -341,31 +348,9 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
             if constexpr (stage + 1 < T::GEMM0_STAGE_N) load_k(number<stage + 1>{}, number<(stage + 1) & 1>{});
             else                                        tr_load_v(0_I, 0_I, 0_I);
             if constexpr (decltype(fuse_softmax)::value) {
-                if constexpr (stage == 0) {
-                    attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[prev.value]);
-                    static_for<16>([&](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(EXP_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                    });
-                }
-                if constexpr (stage == 1) {
-                    l_row += attn_row_sum<T>(v_s[prev.value]);
-                    static_for<16>([&](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                    });
-                }
-                if constexpr (stage == 2) {
-                    v_p = cast<D_ATTN>(v_s[prev.value]);
-                    asm volatile("" : "+v"(v_p) ::);
-                    static_for<16>([&](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                    });
-                }
+                if constexpr (stage == 0) attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[prev.value]);
+                if constexpr (stage == 1) l_row += attn_row_sum<T>(v_s[prev.value]);
+                if constexpr (stage == 2) v_p = cast<D_ATTN>(v_s[prev.value]);
             }
         });
         advance(s_qk, qk_slot);
@@ -397,28 +382,9 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
                     all_below = __builtin_amdgcn_ballot_w32((row_max - m_row) <= RESCALE_THRESHOLD)
                              == __builtin_amdgcn_read_exec_lo();
                     row_max = all_below ? m_row : max(m_row, row_max);
-                    static_for<16>([&](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                    });
                 }
-                if constexpr (sg.value == 1) {
-                    attn_row_scale_sub<T>(v_s[cur.value], temperature_scale, row_max);
-                    static_for<16>([&](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                    });
-                }
-                if constexpr (sg.value == 2) {
-                    attn_exp2_slice<T, 0, s_len / 2>(v_s[cur.value]);
-                    static_for<16>([&](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(EXP_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                    });
-                }
+                if constexpr (sg.value == 1) attn_row_scale_sub<T>(v_s[cur.value], temperature_scale, row_max);
+                if constexpr (sg.value == 2) attn_exp2_slice<T, 0, s_len / 2>(v_s[cur.value]);
                 if constexpr (sg.value == 3) {   // only valid once every mma1 has landed in v_o
                     if (!all_below) {
                         const D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
@@ -432,24 +398,17 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
         advance(s_pv, pv_slot);
     };
 
-    // Gather a tile into the next slot, prefetch the row indices after it.
-    auto issue_tile = [&](int tile) {
-        s_wait_kmcnt(0_I);
-        tdm_kv.move(0_I, 0_I, 0_I, 0_I, 0_I, slot_step(tdm_slot));
-        issue_kv_tile(row_ids);
-        row_ids = load_row_ids(tile + 1);
-    };
-
     // Prologue
     row_ids = load_row_ids(0);
     s_wait_kmcnt(0_I);
-    issue_kv_tile(row_ids);
+    issue_kv_tile(row_ids, 0, true_type{});
     row_ids = load_row_ids(1);
     s_wait_tensorcnt(0_I);
     __builtin_amdgcn_s_barrier();
-    if (num_kv_tiles > 1) issue_tile(1);
+    issue_tile(1, true_type{});
     load_k(0_I, 0_I);
     compute_qk(0_I, 0_I, false_type{});
+    attn_mask_oob_score<T>(v_s[0], valid_kv_len, 0, seg_rot_rows);
 
     // Hand-off a compute_pv would give: publish tile 1, start its first K read.
     s_wait_tensorcnt(0_I);
@@ -473,33 +432,30 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
     // Main loop
     int t = 1;
     for (; t + 3 < num_kv_tiles; t += 2) {
-        issue_tile(t + 1);
+        issue_tile(t + 1, false_type{});
         compute_qk(1_I, 0_I, true_type{});       // QK(t)   + tail(t-1)
         compute_pv(1_I, true_type{});            // PV(t-1) + head(t)
-        issue_tile(t + 2);
+        issue_tile(t + 2, false_type{});
         compute_qk(0_I, 1_I, true_type{});       // QK(t+1) + tail(t)
         compute_pv(0_I, true_type{});            // PV(t)   + head(t+1)
     }
 
     // Epilogue
-    issue_tile(t + 1);
-    compute_qk(1_I, 0_I, true_type{});        // QK(t)   + tail(t-1)
-    compute_pv(1_I, true_type{});             // PV(t-1) + head(t)
-    issue_tile(t + 2);
-    compute_qk(0_I, 1_I, true_type{});        // QK(t+1) + tail(t)
-    compute_pv(0_I, true_type{});             // PV(t)   + head(t+1)
-    compute_qk(1_I, 0_I, true_type{});        // QK(t+2) + tail(t+1), no tile left to gather
-    attn_mask_oob_score<T>(v_s[1], valid_kv_len, t + 2, seg_rot_rows);
-    compute_pv(1_I, true_type{});             // PV(t+1) + head(t+2)
+    #pragma clang loop unroll(disable)
+    for (; t < num_kv_tiles; ++t) {
+        issue_tile(t + 1, true_type{});
+        compute_qk(1_I, 0_I, true_type{});       // QK(t) + tail(t-1)
+        attn_mask_oob_score<T>(v_s[1], valid_kv_len, t, seg_rot_rows);
+        compute_pv(1_I, true_type{});            // PV(t-1) + head(t)
+        v_s[0] = v_s[1];
+    }
+    // Softmax tail of the last tile, with no GEMM left to ride along.
+    attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[0]);
+    l_row += attn_row_sum<T>(v_s[0]);
+    v_p = cast<D_ATTN>(v_s[0]);
 
-    // No compute_qk left to start the last V read.
     tr_load_v(0_I, 0_I, 0_I);
-
-    // Softmax tail of the last tile.
-    attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[1]);
-    l_row += attn_row_sum<T>(v_s[1]);
-    v_p = cast<D_ATTN>(v_s[1]);
-    compute_pv(0_I, false_type{});            // PV(t+2)
+    compute_pv(0_I, false_type{});            // PV of the tile that ended the chain
 }
 
 } // namespace pa_16mx4_64nx1
