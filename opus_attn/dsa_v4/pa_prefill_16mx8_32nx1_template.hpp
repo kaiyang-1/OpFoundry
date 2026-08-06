@@ -1048,7 +1048,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     const int h_block_start = h_block_idx * T::NUM_WARPS * T::Q_TILE_SIZE;
-    const int64_t qo_gmem_offset = (int64_t)q_token_idx * kargs.stride_qo_n + (int64_t)h_block_start * kargs.stride_qo_h;
+    const int64_t qo_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_qo_n + static_cast<int64_t>(h_block_start) * kargs.stride_qo_h;
 
     __shared__ char smem_kv_buf[T::smem_size_bytes()];
 
