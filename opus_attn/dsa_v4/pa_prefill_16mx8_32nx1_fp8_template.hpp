@@ -1447,8 +1447,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE;
-    const int64_t q_nope_gmem_offset = (int64_t)q_token_idx * kargs.stride_q_nope_n + (int64_t)h_block_start * kargs.stride_q_nope_h;
-    const int64_t q_rope_gmem_offset = (int64_t)q_token_idx * kargs.stride_q_rope_n + (int64_t)h_block_start * kargs.stride_q_rope_h;
+    const int64_t q_nope_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_q_nope_n + static_cast<int64_t>(h_block_start) * kargs.stride_q_nope_h;
+    const int64_t q_rope_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_q_rope_n + static_cast<int64_t>(h_block_start) * kargs.stride_q_rope_h;
 
     // Load Q tile from global memory to registers
     auto g_q_nope = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.q_nope_ptr) + q_nope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_nope_h * sizeof(D_NOPE));
@@ -1561,7 +1561,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     scale_output_tile<T>(v_o, o_scale);
 
     using D_OUT = typename T::D_OUT;
-    const int64_t o_gmem_offset = (int64_t)q_token_idx * kargs.stride_o_n + (int64_t)h_block_start * kargs.stride_o_h;
+    const int64_t o_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_o_n + static_cast<int64_t>(h_block_start) * kargs.stride_o_h;
     auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
     int lane_id_o = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id_o));

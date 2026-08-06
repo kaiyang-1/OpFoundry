@@ -425,7 +425,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     const int lane_id = thread_id_x() % T::WARP_SIZE;
 
     const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE;
-    const int64_t qo_gmem_offset = (int64_t)q_token_idx * kargs.stride_qo_n + (int64_t)h_block_start * kargs.stride_qo_h;
+    const int64_t qo_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_qo_n + static_cast<int64_t>(h_block_start) * kargs.stride_qo_h;
 
     __shared__ char smem_kv[T::smem_kv_tile_elems * sizeof(D_ATTN)]; // for KV tiles
     __shared__ char smem_ml[2 * T::T_N * T::W_M * sizeof(D_ACC)];  // for inter-warp reduction
