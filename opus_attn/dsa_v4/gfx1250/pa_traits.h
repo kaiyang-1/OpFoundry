@@ -77,3 +77,67 @@ struct pa_16mx4_64nx1_traits {
 
     static constexpr size_t smem_size_bytes() { return (size_t)SEG_BYTES + NUM_KV_BUFS * KV_BUF_BYTES; }
 };
+
+template<int Q_TILE_SIZE_ = 16,
+         int KV_TILE_SIZE_ = 64,
+         int NUM_WARPS_ = 4,
+         typename D_NOPE_ = fp8_t,
+         typename D_ROPE_ = bf16_t,
+         typename D_OUT_ = bf16_t>
+struct pa_16mx4_64nx1_fp8_traits {
+    static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int NUM_WARPS = NUM_WARPS_;
+
+    static constexpr int WARP_SIZE = 32;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+
+    // Packed DSA hdim split
+    static constexpr int D_NOPE_SIZE = 448;
+    static constexpr int D_NOPE_PADDED_SIZE = 512;
+    static constexpr int D_ROPE_SIZE = 64;
+    static constexpr int D_HEAD_SIZE = D_NOPE_SIZE + D_ROPE_SIZE;
+
+    using D_NOPE = D_NOPE_;
+    using D_ROPE = D_ROPE_;
+    using D_ATTN = D_NOPE_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    // Wave grid
+    static constexpr int T_M = NUM_WARPS;
+    static constexpr int T_N = 1;
+    static constexpr int T_K = 1;
+
+    // WMMA base tile: NoPE QK^T runs on scaled f8f6f4 16x16x128, RoPE QK^T and PV on bf16 16x16x32.
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K_NOPE = 128;
+    static constexpr int W_K_ROPE = 32;
+
+    // GEMM0: S = Q @ K^T
+    static constexpr int GEMM0_STAGE_N = 4;
+    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM0_E_N = (KV_TILE_SIZE / GEMM0_STAGE_N) / W_N;
+    static constexpr int GEMM0_NOPE_E_K = D_NOPE_PADDED_SIZE / W_K_NOPE;
+    static constexpr int GEMM0_ROPE_E_K = D_ROPE_SIZE / W_K_ROPE;
+
+    // GEMM1: O = P @ V, with V dequantized to bf16 ahead of the PV WMMA.
+    static constexpr int GEMM1_STAGE_N = 2;
+    static constexpr int GEMM1_STAGE_K = 2;
+    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM1_E_N = (D_HEAD_SIZE / GEMM1_STAGE_N) / W_N;
+    static constexpr int GEMM1_E_K = (KV_TILE_SIZE / GEMM1_STAGE_K) / W_K_ROPE;
+
+    static constexpr int VEC_NOPE  = 16;
+    static constexpr int VEC_ROPE  = 8;
+    static constexpr int VEC_MXSCL = 4;
+    static constexpr int VEC_O     = 8;
+
+    // ds_load instruction count per GEMM0 / GEMM1 stage
+    static constexpr int k_nope_ds_load_insts = (GEMM0_E_N * GEMM0_NOPE_E_K * W_N * W_K_NOPE) / (WARP_SIZE * VEC_NOPE);
+    static constexpr int k_rope_ds_load_insts = (GEMM0_E_N * GEMM0_ROPE_E_K * W_N * W_K_ROPE) / (WARP_SIZE * VEC_ROPE);
+    static constexpr int v_ds_load_insts      = (GEMM1_E_N * GEMM1_E_K * W_N * W_K_ROPE) / (WARP_SIZE * VEC_ROPE);
+
+    static constexpr size_t smem_size_bytes() { return 0; }
+};

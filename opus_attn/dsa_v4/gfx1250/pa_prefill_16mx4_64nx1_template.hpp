@@ -410,12 +410,11 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
     compute_qk(0_I, 0_I, false_type{});
     attn_mask_oob_score<T>(v_s[0], valid_kv_len, 0, seg_rot_rows);
 
-    // Hand-off a compute_pv would give: publish tile 1, start its first K read.
     s_wait_tensorcnt(0_I);
     __builtin_amdgcn_s_barrier();
     load_k(0_I, 0_I);
 
-    // Softmax head of tile 0, no GEMM to ride along yet.
+    // Softmax head of tile 0
     row_max = attn_row_max<T>(v_s[0]) * temperature_scale;
     all_below = __builtin_amdgcn_ballot_w32((row_max - m_row) <= RESCALE_THRESHOLD)
              == __builtin_amdgcn_read_exec_lo();
@@ -502,8 +501,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
         pa_prefill_accum_pipelined<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
     }
+
     __builtin_amdgcn_s_barrier();
-#if 1
+
     // Extend segment: indices point into kv[total_tokens]
     {
         const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
@@ -511,7 +511,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
         pa_prefill_accum_pipelined<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
     }
-#endif
+
     // Sink finalization, normalize O, store to gmem
     const int sink_head_idx = h_block_start + warp_id * T::Q_TILE_SIZE + (lane_id % T::W_M);
     auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
