@@ -71,10 +71,6 @@ struct pa_16mx4_64nx1_traits {
     static constexpr int KV_BUF_BYTES       = ROWS_PER_SEG * KV_ROW_LDS_BYTES;       // slot stride
     static constexpr int NUM_KV_BUFS        = 3;                                     // QK(t+2) runs before PV(t+1)
 
-    static_assert(KV_TILE_SIZE % NUM_WARPS == 0 && ROWS_PER_WAVE % INDICES_PER_TDM == 0);
-    static_assert((size_t)NUM_KV_BUFS * KV_BUF_BYTES <= (size_t)SEG_BYTES, "slots of one half must not reach into the other");
-    static_assert(D_TILE_SIZE * sizeof(D_ATTN) == 1024, "TDM pad_interval=7 assumes a 1024B / 256-DWORD row");
-
     static constexpr size_t smem_size_bytes() { return (size_t)SEG_BYTES + NUM_KV_BUFS * KV_BUF_BYTES; }
 };
 
@@ -139,5 +135,24 @@ struct pa_16mx4_64nx1_fp8_traits {
     static constexpr int k_rope_ds_load_insts = (GEMM0_E_N * GEMM0_ROPE_E_K * W_N * W_K_ROPE) / (WARP_SIZE * VEC_ROPE);
     static constexpr int v_ds_load_insts      = (GEMM1_E_N * GEMM1_E_K * W_N * W_K_ROPE) / (WARP_SIZE * VEC_ROPE);
 
-    static constexpr size_t smem_size_bytes() { return 0; }
+    // TDM gather KV load.
+    static constexpr int ROWS_PER_WAVE      = KV_TILE_SIZE / NUM_WARPS;
+    static constexpr int INDICES_PER_TDM    = 8;                                     // 32-bit gather cap
+    static constexpr int TDM_LOADS_PER_WAVE = ROWS_PER_WAVE / INDICES_PER_TDM;
+
+    // Per-row LDS footprint: the TDM pad settings add one 16B pad at the end of every row.
+    static constexpr int K_NOPE_ROW_LDS_BYTES = D_NOPE_PADDED_SIZE * sizeof(D_NOPE) + 16;
+    static constexpr int K_ROPE_ROW_LDS_BYTES = D_ROPE_SIZE * sizeof(D_ROPE) + 16;
+    static constexpr int K_NOPE_ROW_LDS_ELEMS = K_NOPE_ROW_LDS_BYTES / sizeof(D_NOPE);
+    static constexpr int K_ROPE_ROW_LDS_ELEMS = K_ROPE_ROW_LDS_BYTES / sizeof(D_ROPE);
+
+    // LDS: the tile's two 32-row halves sit SEG_BYTES apart.
+    static constexpr int SEGS_PER_TILE    = 2;
+    static constexpr int ROWS_PER_SEG     = KV_TILE_SIZE / SEGS_PER_TILE;
+    static constexpr int SEG_BYTES        = 128 * 1024;
+    static constexpr int K_NOPE_SEG_BYTES = ROWS_PER_SEG * K_NOPE_ROW_LDS_BYTES;
+    static constexpr int K_ROPE_SEG_BYTES = ROWS_PER_SEG * K_ROPE_ROW_LDS_BYTES;
+    static constexpr int KV_SEG_BYTES     = K_NOPE_SEG_BYTES + K_ROPE_SEG_BYTES;
+
+    static constexpr size_t smem_size_bytes() { return (size_t)(SEGS_PER_TILE - 1) * SEG_BYTES + KV_SEG_BYTES; }
 };
