@@ -145,6 +145,8 @@ struct pa_16mx4_64nx1_fp8_traits {
     static constexpr int K_ROPE_ROW_LDS_BYTES = D_ROPE_SIZE * sizeof(D_ROPE) + 16;
     static constexpr int K_NOPE_ROW_LDS_ELEMS = K_NOPE_ROW_LDS_BYTES / sizeof(D_NOPE);
     static constexpr int K_ROPE_ROW_LDS_ELEMS = K_ROPE_ROW_LDS_BYTES / sizeof(D_ROPE);
+    static constexpr int V_ROW_LDS_BYTES = D_HEAD_SIZE * sizeof(D_ROPE) + 16;
+    static constexpr int V_ROW_LDS_ELEMS = V_ROW_LDS_BYTES / sizeof(D_ROPE);
 
     // LDS: the tile's two 32-row halves sit SEG_BYTES apart.
     static constexpr int SEGS_PER_TILE    = 2;
@@ -152,7 +154,11 @@ struct pa_16mx4_64nx1_fp8_traits {
     static constexpr int SEG_BYTES        = 128 * 1024;
     static constexpr int K_NOPE_SEG_BYTES = ROWS_PER_SEG * K_NOPE_ROW_LDS_BYTES;
     static constexpr int K_ROPE_SEG_BYTES = ROWS_PER_SEG * K_ROPE_ROW_LDS_BYTES;
-    static constexpr int KV_SEG_BYTES     = K_NOPE_SEG_BYTES + K_ROPE_SEG_BYTES;
+    static constexpr int K_SEG_BYTES      = K_NOPE_SEG_BYTES + K_ROPE_SEG_BYTES;
+    static constexpr int V_SEG_BYTES      = ROWS_PER_SEG * V_ROW_LDS_BYTES;
+    static constexpr int SEG_USED_BYTES   = K_SEG_BYTES > V_SEG_BYTES ? K_SEG_BYTES : V_SEG_BYTES;
 
-    static constexpr size_t smem_size_bytes() { return (size_t)(SEGS_PER_TILE - 1) * SEG_BYTES + KV_SEG_BYTES; }
+    static_assert(SEG_USED_BYTES <= SEG_BYTES, "a segment's rows must not reach into the next segment");
+
+    static constexpr size_t smem_size_bytes() { return (size_t)(SEGS_PER_TILE - 1) * SEG_BYTES + SEG_USED_BYTES; }
 };
