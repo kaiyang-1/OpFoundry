@@ -88,8 +88,8 @@ __device__ inline auto make_layout_q_mxscl(int warp_id, int lane_id, int stride_
         opus::unfold_p_coord(q_block_dim, opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
 }
 
-template<class T, int RowLdsElems>
-__device__ inline auto make_layout_rkv_nope(int lane_id) {
+template<class T>
+__device__ inline auto make_layout_rk_nope(int lane_id) {
     constexpr auto k_block_shape = opus::make_tuple(
         opus::number<T::GEMM0_E_N>{},
         opus::number<T::W_N>{},
@@ -104,7 +104,7 @@ __device__ inline auto make_layout_rkv_nope(int lane_id) {
 
     return opus::make_layout(
         k_block_shape,
-        opus::unfold_x_stride(k_block_dim, k_block_shape, opus::tuple{opus::number<RowLdsElems>{}, 1_I}),
+        opus::unfold_x_stride(k_block_dim, k_block_shape, opus::tuple{opus::number<T::K_NOPE_ROW_LDS_ELEMS>{}, 1_I}),
         opus::unfold_p_coord(k_block_dim, opus::tuple{lane_id % T::W_N, lane_id / T::W_N}));
 }
 
@@ -147,6 +147,27 @@ __device__ inline auto make_layout_rk_mxscl(int lane_id) {
         k_block_shape,
         opus::unfold_x_stride(k_block_dim, k_block_shape, opus::tuple{opus::number<T::K_NOPE_ROW_LDS_ELEMS>{}, 1_I}),
         opus::unfold_p_coord(k_block_dim, opus::tuple{lane_id % T::W_N, lane_id / T::W_N}));
+}
+
+template<class T>
+__device__ inline auto make_layout_rv_nope(int lane_id) {
+    constexpr int MXSCL_BLOCK_SIZE = 32;
+
+    constexpr auto v_block_shape = opus::make_tuple(
+        opus::number<T::GEMM0_E_N>{},
+        opus::number<T::W_N>{},
+        opus::number<T::D_NOPE_SIZE / MXSCL_BLOCK_SIZE>{},
+        opus::number<T::WARP_SIZE / T::W_N>{},
+        opus::number<T::VEC_NOPE>{});
+
+    constexpr auto v_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout(
+        v_block_shape,
+        opus::unfold_x_stride(v_block_dim, v_block_shape, opus::tuple{opus::number<T::V_ROW_LDS_ELEMS>{}, 1_I}),
+        opus::unfold_p_coord(v_block_dim, opus::tuple{lane_id % T::W_N, lane_id / T::W_N}));
 }
 
 template<class T>
@@ -344,10 +365,10 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
     };
     constexpr int OWN_V_ROW = (1 ^ SLOT_SWAP) * T::W_N * T::V_ROW_LDS_ELEMS;
 
-    auto u_rk_nope  = make_layout_rkv_nope<T, T::K_NOPE_ROW_LDS_ELEMS>(lane_id);
+    auto u_rk_nope  = make_layout_rk_nope<T>(lane_id);
     auto u_rk_rope  = make_layout_rkv_rope<T, T::K_ROPE_ROW_LDS_ELEMS>(lane_id);
     auto u_rk_mxscl = make_layout_rk_mxscl<T>(lane_id);
-    auto u_rv_nope  = make_layout_rkv_nope<T, T::V_ROW_LDS_ELEMS>(lane_id);
+    auto u_rv_nope  = make_layout_rv_nope<T>(lane_id);
     auto u_rv_rope  = make_layout_rkv_rope<T, T::V_ROW_LDS_ELEMS>(lane_id);
     auto u_rv       = make_layout_rv<T>(lane_id);
 
@@ -370,7 +391,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
     vector_t<D_NOPE, T::GEMM0_E_N * T::W_N * (T::D_NOPE_PADDED_SIZE / 32) / T::WARP_SIZE> v_k_mxscl;   // 32 = E8M0 block
     vector_t<D_ACC, T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE> v_s;
     vector_t<D_ROPE, T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE> v_p;
-    vector_t<D_ROPE, T::GEMM0_E_N * T::W_N * T::D_NOPE_PADDED_SIZE / T::WARP_SIZE> v_v_nope;
+    vector_t<D_ROPE, T::GEMM0_E_N * T::W_N * T::D_NOPE_SIZE / T::WARP_SIZE> v_v_nope;
     vector_t<D_ROPE, T::GEMM1_E_N * T::GEMM1_E_K * T::W_N * T::W_K_ROPE / T::WARP_SIZE> v_v;
 
     auto v_p_stages = reinterpret_cast<vector_t<D_ROPE, T::W_M * T::W_K_ROPE / T::WARP_SIZE>*>(&v_p);
@@ -478,12 +499,12 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
             v_s_stages[slot] = mma0_rope(v_k_rope, v_q_rope, v_s_stages[slot]);
 
             if constexpr (j.value == T::GEMM0_STAGE_N - 1) {
-                constexpr int MXSCL_BLOCK_SIZE  = 32;
-                constexpr index_t mxscl_per_row = T::D_NOPE_PADDED_SIZE / MXSCL_BLOCK_SIZE;   // 16 E8M0 bytes
+                constexpr int MXSCL_BLOCK_SIZE = 32;
+                constexpr index_t mxscl_valid  = T::D_NOPE_SIZE / MXSCL_BLOCK_SIZE;
 
                 auto* src = reinterpret_cast<vector_t<u32_t, 2>*>(&v_k_nope);
                 auto* dst = reinterpret_cast<vector_t<D_ROPE, 8>*>(&v_v_nope);
-                static_for<mxscl_per_row>([&](auto b) {
+                static_for<mxscl_valid>([&](auto b) {
                     constexpr int dw   = b.value / 8;
                     constexpr int half = (b.value / 4) % 2;
                     constexpr int byte = b.value % 4;
