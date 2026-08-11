@@ -87,6 +87,7 @@ struct pa_16mx4_64nx1_fp8_traits {
 
     static constexpr int WARP_SIZE = 32;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+    static constexpr int MXSCL_BLOCK_SIZE = 32;
 
     // Packed DSA hdim split
     static constexpr int D_NOPE_SIZE = 448;
@@ -154,10 +155,14 @@ struct pa_16mx4_64nx1_fp8_traits {
     static constexpr int SEG_BYTES        = 128 * 1024;
     static constexpr int K_NOPE_SEG_BYTES = ROWS_PER_SEG * K_NOPE_ROW_LDS_BYTES;
     static constexpr int K_ROPE_SEG_BYTES = ROWS_PER_SEG * K_ROPE_ROW_LDS_BYTES;
-    static constexpr int K_SEG_BYTES      = K_NOPE_SEG_BYTES + K_ROPE_SEG_BYTES;
-    static constexpr int V_SEG_BYTES      = ROWS_PER_SEG * V_ROW_LDS_BYTES;
-    static constexpr int SEG_USED_BYTES   = K_SEG_BYTES > V_SEG_BYTES ? K_SEG_BYTES : V_SEG_BYTES;
+    static constexpr int K_SLOT_BYTES     = K_NOPE_SEG_BYTES + K_ROPE_SEG_BYTES;
+    static constexpr int V_SLOT_BYTES     = ROWS_PER_SEG * V_ROW_LDS_BYTES;
 
+    static constexpr int NUM_K_BUFS     = 2;
+    static constexpr int NUM_V_BUFS     = 2;
+    static constexpr int V_REGION_OFF   = NUM_K_BUFS * K_SLOT_BYTES;
+
+    static constexpr int SEG_USED_BYTES = V_REGION_OFF + NUM_V_BUFS * V_SLOT_BYTES;
     static_assert(SEG_USED_BYTES <= SEG_BYTES, "a segment's rows must not reach into the next segment");
 
     static constexpr size_t smem_size_bytes() { return (size_t)(SEGS_PER_TILE - 1) * SEG_BYTES + SEG_USED_BYTES; }

@@ -68,13 +68,11 @@ __device__ inline auto make_layout_q_rope(int warp_id, int lane_id, int stride_q
 
 template<class T>
 __device__ inline auto make_layout_q_mxscl(int warp_id, int lane_id, int stride_q_nope_h) {
-    constexpr int MXSCL_BLOCK_SIZE = 32;
-
     constexpr auto q_block_shape = opus::make_tuple(
         opus::number<T::GEMM0_E_M>{},
         opus::number<T::T_M>{},
         opus::number<T::W_M>{},
-        opus::number<T::W_M * T::D_NOPE_PADDED_SIZE / MXSCL_BLOCK_SIZE / (T::WARP_SIZE * T::VEC_MXSCL)>{},
+        opus::number<T::W_M * T::D_NOPE_PADDED_SIZE / T::MXSCL_BLOCK_SIZE / (T::WARP_SIZE * T::VEC_MXSCL)>{},
         opus::number<T::WARP_SIZE / T::W_M>{},
         opus::number<T::VEC_MXSCL>{});
 
@@ -130,12 +128,10 @@ __device__ inline auto make_layout_rkv_rope(int lane_id) {
 
 template<class T>
 __device__ inline auto make_layout_rk_mxscl(int lane_id) {
-    constexpr int MXSCL_BLOCK_SIZE = 32;
-
     constexpr auto k_block_shape = opus::make_tuple(
         opus::number<T::GEMM0_E_N>{},
         opus::number<T::W_N>{},
-        opus::number<T::W_N * T::D_NOPE_PADDED_SIZE / MXSCL_BLOCK_SIZE / (T::WARP_SIZE * T::VEC_MXSCL)>{},
+        opus::number<T::W_N * T::D_NOPE_PADDED_SIZE / T::MXSCL_BLOCK_SIZE / (T::WARP_SIZE * T::VEC_MXSCL)>{},
         opus::number<T::WARP_SIZE / T::W_N>{},
         opus::number<T::VEC_MXSCL>{});
     
@@ -151,12 +147,10 @@ __device__ inline auto make_layout_rk_mxscl(int lane_id) {
 
 template<class T>
 __device__ inline auto make_layout_rv_nope(int lane_id) {
-    constexpr int MXSCL_BLOCK_SIZE = 32;
-
     constexpr auto v_block_shape = opus::make_tuple(
         opus::number<T::GEMM0_E_N>{},
         opus::number<T::W_N>{},
-        opus::number<T::D_NOPE_SIZE / MXSCL_BLOCK_SIZE>{},
+        opus::number<T::D_NOPE_SIZE / T::MXSCL_BLOCK_SIZE>{},
         opus::number<T::WARP_SIZE / T::W_N>{},
         opus::number<T::VEC_NOPE>{});
 
@@ -232,13 +226,25 @@ __device__ inline void zero_nope_pad(V& v_nope) {
 
 template<class T, class V>
 __device__ inline void zero_mxscl_pad(V& v_mxscl, bool upper_half) {
-    constexpr int MXSCL_BLOCK_SIZE = 32;
     constexpr opus::index_t len = opus::vector_traits<V>::size();
-    constexpr opus::index_t pad = (T::D_NOPE_PADDED_SIZE - T::D_NOPE_SIZE) / MXSCL_BLOCK_SIZE;
+    constexpr opus::index_t pad = (T::D_NOPE_PADDED_SIZE - T::D_NOPE_SIZE) / T::MXSCL_BLOCK_SIZE;
     opus::static_for<pad>([&](auto i) {
         constexpr opus::index_t idx = len - pad + i.value;
         v_mxscl[idx] = upper_half ? static_cast<typename T::D_NOPE>(0) : v_mxscl[idx];
     });
+}
+
+template<opus::index_t Vec, opus::index_t Lo, opus::index_t Hi, class Sm, class V, class Layout>
+__device__ inline void store_slice(Sm& sm, const V& x, const Layout& u) {
+    using LT = opus::layout_load_traits<Layout, Vec>;
+    static_assert(Lo <= Hi && Hi <= LT::r_elem.value, "store_slice: range outside the layout's issue space");
+    constexpr opus::index_t elems = Vec * Sm::vector_size;
+    auto offsets = opus::layout_to_offsets<Vec>(u);
+    opus::static_for([&](auto i) {
+        typename Sm::template vector_type<Vec> v_;
+        opus::static_for<elems>([&](auto j) { v_[j.value] = x[i.value * elems + j.value]; });
+        sm.template store<Vec>(v_, offsets[i.value]);
+    }, opus::number<Lo>{}, opus::number<Hi>{});
 }
 
 template<int Lo, int Hi, typename V, typename Op>
@@ -358,17 +364,38 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
         make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + rope_stage(2))),
         make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + rope_stage(3))),
     };
-    const int v_rot_bytes = (seg_base_rows / T::ROWS_PER_SEG) * T::SEG_BYTES;
-    smem<D_ROPE> s_v[T::GEMM1_STAGE_K] = {
-        make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + v_rot_bytes)),
-        make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + (T::SEG_BYTES - v_rot_bytes))),
+    const int v_seg_off = (seg_base_rows / T::ROWS_PER_SEG) * T::SEG_BYTES;
+    smem<D_ROPE> s_vw[T::GEMM1_STAGE_K] = {
+        make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + T::V_REGION_OFF + v_seg_off)),
+        make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + T::V_REGION_OFF + (T::SEG_BYTES - v_seg_off))),
     };
+    smem<D_ROPE> s_vr[T::GEMM1_STAGE_K] = { s_vw[0], s_vw[1] };
     constexpr int OWN_V_ROW = (1 ^ SLOT_SWAP) * T::W_N * T::V_ROW_LDS_ELEMS;
+
+    int k_slot = 0, tdm_slot = 0, vw_slot = 0, vr_slot = 0;
+    auto k_step = [](int& s) {
+        const bool wrap = (s == T::NUM_K_BUFS - 1);
+        s = wrap ? 0 : s + 1;
+        return wrap ? -(T::NUM_K_BUFS - 1) * T::K_SLOT_BYTES : T::K_SLOT_BYTES;
+    };
+    auto v_step = [](int& s) {
+        const bool wrap = (s == T::NUM_V_BUFS - 1);
+        s = wrap ? 0 : s + 1;
+        return wrap ? -(T::NUM_V_BUFS - 1) * T::V_SLOT_BYTES : T::V_SLOT_BYTES;
+    };
+    auto advance_k = [&]() {
+        const int d = k_step(k_slot);
+        static_for<T::GEMM0_STAGE_N>([&](auto i) { s_k_nope[i.value].ptr += d; s_k_rope[i.value].ptr += d; });
+    };
+    auto advance_v = [&](auto& s, int& slot) {
+        const int d = v_step(slot);
+        static_for<T::GEMM1_STAGE_K>([&](auto i) { s[i.value].ptr += d; });
+    };
 
     auto u_rk_nope  = make_layout_rk_nope<T>(lane_id);
     auto u_rk_rope  = make_layout_rkv_rope<T, T::K_ROPE_ROW_LDS_ELEMS>(lane_id);
     auto u_rk_mxscl = make_layout_rk_mxscl<T>(lane_id);
-    auto u_rv_nope  = make_layout_rv_nope<T>(lane_id);
+    auto u_rv_nope  = make_layout_rv_nope<T>(lane_id) + number<OWN_V_ROW>{};
     auto u_rv_rope  = make_layout_rkv_rope<T, T::V_ROW_LDS_ELEMS>(lane_id);
     auto u_rv       = make_layout_rv<T>(lane_id);
 
@@ -386,16 +413,23 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
         seq<T::W_M, T::W_N, T::W_K_ROPE>{},
         wmma_adaptor_swap_ab{});
 
-    vector_t<D_NOPE, T::GEMM0_E_N * T::GEMM0_NOPE_E_K * T::W_N * T::W_K_NOPE / T::WARP_SIZE> v_k_nope;
-    vector_t<D_ROPE, T::GEMM0_E_N * T::GEMM0_ROPE_E_K * T::W_N * T::W_K_ROPE / T::WARP_SIZE> v_k_rope;
-    vector_t<D_NOPE, T::GEMM0_E_N * T::W_N * (T::D_NOPE_PADDED_SIZE / 32) / T::WARP_SIZE> v_k_mxscl;   // 32 = E8M0 block
-    vector_t<D_ACC, T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE> v_s;
+    // K/V register fragments
+    vector_t<D_NOPE, T::GEMM0_E_N * T::GEMM0_NOPE_E_K * T::W_N * T::W_K_NOPE / T::WARP_SIZE> v_k_nope[2];
+    vector_t<D_ROPE, T::GEMM0_E_N * T::GEMM0_ROPE_E_K * T::W_N * T::W_K_ROPE / T::WARP_SIZE> v_k_rope[2];
+    vector_t<D_NOPE, T::GEMM0_E_N * T::W_N * (T::D_NOPE_PADDED_SIZE / T::MXSCL_BLOCK_SIZE) / T::WARP_SIZE> v_k_mxscl[2];
+    vector_t<D_ACC, T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE> v_s[2];
     vector_t<D_ROPE, T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE> v_p;
     vector_t<D_ROPE, T::GEMM0_E_N * T::W_N * T::D_NOPE_SIZE / T::WARP_SIZE> v_v_nope;
-    vector_t<D_ROPE, T::GEMM1_E_N * T::GEMM1_E_K * T::W_N * T::W_K_ROPE / T::WARP_SIZE> v_v;
+    vector_t<D_ROPE, T::GEMM1_E_N * T::GEMM1_E_K * T::W_N * T::W_K_ROPE / T::WARP_SIZE> v_v[2];
 
     auto v_p_stages = reinterpret_cast<vector_t<D_ROPE, T::W_M * T::W_K_ROPE / T::WARP_SIZE>*>(&v_p);
     auto v_o_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::D_HEAD_SIZE / T::GEMM1_STAGE_N / T::WARP_SIZE>*>(&v_o);
+
+    // Online softmax state
+    constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
+    constexpr index_t s_len = T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE;
+    D_ACC row_max;
+    bool all_below;
 
     const u32x4_t kv_indices_rsrc = make_buffer_rsrc_raw(kv_indices + page_idx_begin, (u32_t)(valid_kv_len * sizeof(int)));
 
@@ -470,94 +504,193 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
         tdm_k_rope.move(0_I, 0_I, 0_I, 0_I, 0_I, number<-(T::TDM_LOADS_PER_WAVE - 1) * rope_lds_step>{});
     };
 
-    auto compute_qk = [&]() __attribute__((always_inline)) {
+    u32x16_t row_ids;
+
+    // Gather a tile into the next K slot, then prefetch the row indices of the tile after it.
+    auto issue_tile = [&](int tile, auto clamp_tail) {
+        s_wait_kmcnt(0_I);
+        const int d = k_step(tdm_slot);
+        tdm_k_nope.move(0_I, 0_I, 0_I, 0_I, 0_I, d);
+        tdm_k_rope.move(0_I, 0_I, 0_I, 0_I, 0_I, d);
+        issue_kv_tile(row_ids, tile, clamp_tail);
+        row_ids = load_row_ids(tile + 1);
+    };
+
+    auto load_k = [&](auto j, auto buf) {
+        v_k_nope[buf.value]  = load<T::VEC_NOPE>(s_k_nope[j.value], u_rk_nope);
+        v_k_mxscl[buf.value] = load<T::VEC_MXSCL>(s_k_nope[j.value], u_rk_mxscl + T::D_NOPE_SIZE);
+        v_k_rope[buf.value]  = load<T::VEC_ROPE>(s_k_rope[j.value], u_rk_rope);
+    };
+
+    auto tr_load_v = [&](auto sn, auto sk, auto buf) {
+        v_v[buf.value] = tr_load<T::VEC_ROPE>(s_vr[sk.value], u_rv + number<sn.value * (T::D_HEAD_SIZE / T::GEMM1_STAGE_N)>{});
+    };
+
+    constexpr int V_NOPE_ISSUES = layout_load_traits<remove_cvref_t<decltype(u_rv_nope)>, T::VEC_NOPE>::r_elem.value;
+    auto store_v_nope = [&](auto lo, auto hi) {
+        store_slice<T::VEC_NOPE, lo.value, hi.value>(s_vw[1], v_v_nope, u_rv_nope);
+        if constexpr (hi.value == V_NOPE_ISSUES) advance_v(s_vw, vw_slot);
+    };
+
+    auto compute_qk = [&](auto dst, auto prev, auto fuse_softmax) __attribute__((always_inline)) {
         constexpr index_t scale_dwords = vector_traits<VQS>::size() * sizeof(D_NOPE) / sizeof(int);
         using scale_t   = vector_t<int, scale_dwords>;
         using s_stage_t = vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>;
 
-        auto* v_s_stages = reinterpret_cast<s_stage_t*>(&v_s);
+        auto* v_s_stages = reinterpret_cast<s_stage_t*>(&v_s[dst.value]);
         auto& scale_q    = reinterpret_cast<scale_t&>(v_q_mxscl);
 
         static_for<T::GEMM0_STAGE_N>([&](auto j) {
             constexpr int slot = j.value ^ SLOT_SWAP;
-            v_k_nope  = load<T::VEC_NOPE>(s_k_nope[j.value], u_rk_nope);
-            v_k_mxscl = load<T::VEC_MXSCL>(s_k_nope[j.value], u_rk_mxscl + T::D_NOPE_SIZE);
-            v_k_rope  = load<T::VEC_ROPE>(s_k_rope[j.value], u_rk_rope);
+            constexpr int buf  = j.value & 1;
             s_wait_dscnt(0_I);
-            zero_nope_pad<T>(v_k_nope);
-            zero_mxscl_pad<T>(v_k_mxscl, lane_id >= T::W_N);
+            __builtin_amdgcn_sched_barrier(0);
+            zero_nope_pad<T>(v_k_nope[buf]);
+            zero_mxscl_pad<T>(v_k_mxscl[buf], lane_id >= T::W_N);
 
-            auto& scale_k = reinterpret_cast<scale_t&>(v_k_mxscl);
+            auto& scale_k = reinterpret_cast<scale_t&>(v_k_mxscl[buf]);
 
             clear(v_s_stages[slot]);
             static_for<T::GEMM0_NOPE_E_K>([&](auto ek) {
                 constexpr int sel = ek.value % 2;
                 constexpr int dw  = ek.value / 2;
-                v_s_stages[slot] = mma0_nope.step_k(ek, v_k_nope, v_q_nope, v_s_stages[slot],
+                v_s_stages[slot] = mma0_nope.step_k(ek, v_k_nope[buf], v_q_nope, v_s_stages[slot],
                                                     scale_k[dw], scale_q[dw], number<sel>{}, number<sel>{});
             });
-            v_s_stages[slot] = mma0_rope(v_k_rope, v_q_rope, v_s_stages[slot]);
+            v_s_stages[slot] = mma0_rope(v_k_rope[buf], v_q_rope, v_s_stages[slot]);
 
-            if constexpr (j.value == T::GEMM0_STAGE_N - 1) {
-                constexpr int MXSCL_BLOCK_SIZE = 32;
-                constexpr index_t mxscl_valid  = T::D_NOPE_SIZE / MXSCL_BLOCK_SIZE;
+            if constexpr (j.value + 1 < T::GEMM0_STAGE_N) {
+                load_k(number<j.value + 1>{}, number<(j.value + 1) & 1>{});
+            } else {
+                if constexpr (decltype(fuse_softmax)::value) tr_load_v(0_I, 0_I, 0_I);
+                store<T::VEC_ROPE>(s_vw[1], v_k_rope[buf], u_rv_rope + number<OWN_V_ROW + T::D_NOPE_SIZE>{});
 
-                auto* src = reinterpret_cast<vector_t<u32_t, 2>*>(&v_k_nope);
-                auto* dst = reinterpret_cast<vector_t<D_ROPE, 8>*>(&v_v_nope);
+                constexpr index_t mxscl_valid = T::D_NOPE_SIZE / T::MXSCL_BLOCK_SIZE;
+
+                auto* src = reinterpret_cast<vector_t<u32_t, 2>*>(&v_k_nope[buf]);
+                auto* dst_v = reinterpret_cast<vector_t<D_ROPE, 8>*>(&v_v_nope);
                 static_for<mxscl_valid>([&](auto b) {
                     constexpr int dw   = b.value / 8;
                     constexpr int half = (b.value / 4) % 2;
                     constexpr int byte = b.value % 4;
                     constexpr int sel  = ((byte & 1) << 2) | (byte & 2) | half;
-                    dst[2 * b.value + 0] = __builtin_amdgcn_cvt_scale_pk8_bf16_fp8(src[2 * b.value + 0], scale_k[dw], sel);
-                    dst[2 * b.value + 1] = __builtin_amdgcn_cvt_scale_pk8_bf16_fp8(src[2 * b.value + 1], scale_k[dw], sel);
+                    dst_v[2 * b.value + 0] = __builtin_amdgcn_cvt_scale_pk8_bf16_fp8(src[2 * b.value + 0], scale_k[dw], sel);
+                    dst_v[2 * b.value + 1] = __builtin_amdgcn_cvt_scale_pk8_bf16_fp8(src[2 * b.value + 1], scale_k[dw], sel);
                 });
             }
+            if constexpr (decltype(fuse_softmax)::value) {
+                if constexpr (j.value == 0) attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[prev.value]);
+                if constexpr (j.value == 1) l_row += attn_row_sum<T>(v_s[prev.value]);
+                if constexpr (j.value == 2) v_p = cast<D_ROPE>(v_s[prev.value]);
+            }
         });
+        advance_k();
     };
 
-    auto compute_pv = [&]() __attribute__((always_inline)) {
-        static_for<T::GEMM1_STAGE_N * T::GEMM1_STAGE_K>([&](auto sg) {
+    auto compute_pv = [&](auto cur, auto fuse_softmax) __attribute__((always_inline)) {
+        constexpr int GEMM1_STAGES = T::GEMM1_STAGE_N * T::GEMM1_STAGE_K;
+        static_for<GEMM1_STAGES>([&](auto sg) {
             constexpr int stage_n = sg.value % T::GEMM1_STAGE_N;
             constexpr int stage_k = sg.value / T::GEMM1_STAGE_N;
-            v_v = tr_load<T::VEC_ROPE>(s_v[stage_k], u_rv + number<stage_n * (T::D_HEAD_SIZE / T::GEMM1_STAGE_N)>{});
+            constexpr int buf     = sg.value & 1;
             s_wait_dscnt(0_I);
-            v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v, v_o_stages[stage_n]);
+            __builtin_amdgcn_sched_barrier(0);
+            v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v[buf], v_o_stages[stage_n]);
+
+            if constexpr (sg.value + 1 < GEMM1_STAGES) {
+                constexpr int n_sn = (sg.value + 1) % T::GEMM1_STAGE_N;
+                constexpr int n_sk = (sg.value + 1) / T::GEMM1_STAGE_N;
+                tr_load_v(number<n_sn>{}, number<n_sk>{}, number<(sg.value + 1) & 1>{});
+            }
+
+            if constexpr (decltype(fuse_softmax)::value) {
+                store_v_nope(number<sg.value * V_NOPE_ISSUES / GEMM1_STAGES>{}, number<(sg.value + 1) * V_NOPE_ISSUES / GEMM1_STAGES>{});
+
+                if constexpr (sg.value == 0) {
+                    row_max = attn_row_max<T>(v_s[cur.value]) * temperature_scale;
+                    all_below = __builtin_amdgcn_ballot_w32((row_max - m_row) <= RESCALE_THRESHOLD)
+                             == __builtin_amdgcn_read_exec_lo();
+                    row_max = all_below ? m_row : max(m_row, row_max);
+                }
+                if constexpr (sg.value == 1) attn_row_scale_sub<T>(v_s[cur.value], temperature_scale, row_max);
+                if constexpr (sg.value == 2) attn_exp2_slice<T, 0, s_len / 2>(v_s[cur.value]);
+                if constexpr (sg.value == 3) {
+                    s_wait_tensorcnt(0_I);
+                    s_wait_dscnt(0_I);
+                    __builtin_amdgcn_s_barrier();
+                    load_k(0_I, 0_I);
+
+                    // only valid once every mma1 has landed in v_o
+                    if (!all_below) {
+                        const D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+                        m_row = row_max;
+                        l_row *= rescale_m;
+                        scale_output_tile<T>(v_o, rescale_m);
+                    }
+                }
+            }
         });
+        advance_v(s_vr, vr_slot);
     };
 
-    for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
-        const u32x16_t row_ids = load_row_ids(tile_idx);
-        s_wait_kmcnt(0_I);
-        if (tile_idx + 1 < num_kv_tiles) issue_kv_tile(row_ids, tile_idx, false_type{});
-        else                             issue_kv_tile(row_ids, tile_idx, true_type{});
+    // Prologue
+    row_ids = load_row_ids(0);
+    s_wait_kmcnt(0_I);
+    issue_kv_tile(row_ids, 0, true_type{});
+    row_ids = load_row_ids(1);
+    s_wait_tensorcnt(0_I);
+    __builtin_amdgcn_s_barrier();
+    issue_tile(1, true_type{});
+    load_k(0_I, 0_I);
+    compute_qk(0_I, 0_I, false_type{});
+    attn_mask_oob_score<T>(v_s[0], valid_kv_len, 0, seg_base_rows);
+    store_v_nope(0_I, number<V_NOPE_ISSUES>{});
 
-        s_wait_tensorcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+    s_wait_tensorcnt(0_I);
+    s_wait_dscnt(0_I);
+    __builtin_amdgcn_s_barrier();
+    load_k(0_I, 0_I);
 
-        compute_qk();
-
-        __builtin_amdgcn_s_barrier();
-        store<T::VEC_NOPE>(s_v[1], v_v_nope, u_rv_nope + number<OWN_V_ROW>{});
-        store<T::VEC_ROPE>(s_v[1], v_k_rope, u_rv_rope + number<OWN_V_ROW + T::D_NOPE_SIZE>{});
-
-        attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, seg_base_rows);
-        constexpr index_t s_len = vector_traits<decltype(v_s)>::size();
-        const D_ACC row_max   = max(m_row, attn_row_max<T>(v_s) * temperature_scale);
+    row_max = attn_row_max<T>(v_s[0]) * temperature_scale;
+    all_below = __builtin_amdgcn_ballot_w32((row_max - m_row) <= RESCALE_THRESHOLD)
+             == __builtin_amdgcn_read_exec_lo();
+    row_max = all_below ? m_row : max(m_row, row_max);
+    attn_row_scale_sub<T>(v_s[0], temperature_scale, row_max);
+    attn_exp2_slice<T, 0, s_len / 2>(v_s[0]);
+    if (!all_below) {
         const D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        attn_row_scale_sub<T>(v_s, temperature_scale, row_max);
-        attn_exp2_slice<T, 0, s_len>(v_s);
-        l_row = l_row * rescale_m + attn_row_sum<T>(v_s);
-        v_p = cast<D_ROPE>(v_s);
+        l_row *= rescale_m;
         scale_output_tile<T>(v_o, rescale_m);
-
-        s_wait_dscnt(0_I);
-        __builtin_amdgcn_s_barrier();
-
-        compute_pv();
-        __builtin_amdgcn_s_barrier();
     }
+
+    // Main loop
+    int t = 1;
+    for (; t + 3 < num_kv_tiles; t += 2) {
+        issue_tile(t + 1, false_type{});
+        compute_qk(1_I, 0_I, true_type{});       // QK(t)   + tail(t-1)
+        compute_pv(1_I, true_type{});            // PV(t-1) + head(t)
+        issue_tile(t + 2, false_type{});
+        compute_qk(0_I, 1_I, true_type{});       // QK(t+1) + tail(t)
+        compute_pv(0_I, true_type{});            // PV(t)   + head(t+1)
+    }
+
+    // Epilogue
+    #pragma clang loop unroll(disable)
+    for (; t < num_kv_tiles; ++t) {
+        issue_tile(t + 1, true_type{});
+        compute_qk(1_I, 0_I, true_type{});       // QK(t) + tail(t-1)
+        attn_mask_oob_score<T>(v_s[1], valid_kv_len, t, seg_base_rows);
+        compute_pv(1_I, true_type{});            // PV(t-1) + head(t)
+        v_s[0] = v_s[1];
+    }
+    // Softmax tail of the last tile, with no GEMM left to ride along.
+    attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[0]);
+    l_row += attn_row_sum<T>(v_s[0]);
+    v_p = cast<D_ROPE>(v_s[0]);
+
+    tr_load_v(0_I, 0_I, 0_I);
+    compute_pv(0_I, false_type{});
 }
 
 } // namespace pa_16mx4_64nx1_fp8
