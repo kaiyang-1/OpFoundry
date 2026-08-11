@@ -296,7 +296,7 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
     });
 }
 
-template<class Traits, class VQN, class VQR, class VQS, class VO>
+template<class Traits, int SLOT_SWAP, class VQN, class VQR, class VQS, class VO>
 __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8_kargs kargs,
                                            const void* kv_nope_ptr, const void* kv_rope_ptr, int kv_rows,
                                            const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
@@ -317,17 +317,14 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     //   wave 0: 0 1 2 3   wave 1: 2 3 0 1   wave 2: 1 0 3 2   wave 3: 3 2 1 0
-    const int wave_rot     = ((warp_id & 1) << 1) | (warp_id >> 1);
-    const int seg_rot_rows = wave_rot * T::W_N;
+    const int wave_rot      = ((warp_id & 1) << 1) | SLOT_SWAP;
+    const int seg_rot_rows  = wave_rot * T::W_N;
     const int seg_base_rows = (seg_rot_rows / T::ROWS_PER_SEG) * T::ROWS_PER_SEG;
     auto stage_row  = [&](int j) { return (j * T::W_N) ^ seg_rot_rows; };
     auto nope_stage = [&](int j) { const int r = stage_row(j);
         return (r / T::ROWS_PER_SEG) * T::SEG_BYTES + (r % T::ROWS_PER_SEG) * T::K_NOPE_ROW_LDS_BYTES; };
     auto rope_stage = [&](int j) { const int r = stage_row(j);
         return (r / T::ROWS_PER_SEG) * T::SEG_BYTES + T::K_NOPE_SEG_BYTES + (r % T::ROWS_PER_SEG) * T::K_ROPE_ROW_LDS_BYTES; };
-    auto v_stage    = [&](int j) { const int r = stage_row(j);
-        return (r / T::ROWS_PER_SEG) * T::SEG_BYTES + (r % T::ROWS_PER_SEG) * T::V_ROW_LDS_BYTES; };
-
     smem<D_NOPE> s_k_nope[T::GEMM0_STAGE_N] = {
         make_smem(reinterpret_cast<D_NOPE*>(smem_kv_buf + nope_stage(0))),
         make_smem(reinterpret_cast<D_NOPE*>(smem_kv_buf + nope_stage(1))),
@@ -340,13 +337,12 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
         make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + rope_stage(2))),
         make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + rope_stage(3))),
     };
-    smem<D_ROPE> s_v = make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + v_stage(T::GEMM0_STAGE_N - 1)));
-
-    const int pv_rot_bytes = (seg_base_rows / T::ROWS_PER_SEG) * T::SEG_BYTES;
-    smem<D_ROPE> s_pv[T::GEMM1_STAGE_K] = {
-        make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + pv_rot_bytes)),
-        make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + (T::SEG_BYTES - pv_rot_bytes))),
+    const int v_rot_bytes = (seg_base_rows / T::ROWS_PER_SEG) * T::SEG_BYTES;
+    smem<D_ROPE> s_v[T::GEMM1_STAGE_K] = {
+        make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + v_rot_bytes)),
+        make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + (T::SEG_BYTES - v_rot_bytes))),
     };
+    constexpr int OWN_V_ROW = (1 ^ SLOT_SWAP) * T::W_N * T::V_ROW_LDS_ELEMS;
 
     auto u_rk_nope  = make_layout_rkv_nope<T, T::K_NOPE_ROW_LDS_ELEMS>(lane_id);
     auto u_rk_rope  = make_layout_rkv_rope<T, T::K_ROPE_ROW_LDS_ELEMS>(lane_id);
@@ -400,8 +396,9 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
     };
 
     // Wave w gathers tile rows [w * ROWS_PER_WAVE, +ROWS_PER_WAVE), which land in one segment.
-    const int wave_seg = (warp_id * T::ROWS_PER_WAVE / T::ROWS_PER_SEG) * T::SEG_BYTES;
-    const int wave_row = (warp_id * T::ROWS_PER_WAVE) % T::ROWS_PER_SEG;
+    const int wave_gather_row = warp_id * T::ROWS_PER_WAVE;
+    const int wave_seg = (wave_gather_row / T::ROWS_PER_SEG) * T::SEG_BYTES;
+    const int wave_row = wave_gather_row % T::ROWS_PER_SEG;
 
     auto tdm_k_nope = make_tdm<D_NOPE, k_nope_gather_cfg>(
         smem_kv_buf + wave_seg + wave_row * T::K_NOPE_ROW_LDS_BYTES,
@@ -420,7 +417,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
         /*s0=*/ kargs.stride_kv_rope_page);
 
     auto load_row_ids = [&](int tile_idx) {
-        const int idx_byte_off = (tile_idx * T::KV_TILE_SIZE + warp_id * T::ROWS_PER_WAVE) * (int)sizeof(int);
+        const int idx_byte_off = (tile_idx * T::KV_TILE_SIZE + wave_gather_row) * (int)sizeof(int);
         return llvm_amdgcn_s_buffer_load_v16i32(kv_indices_rsrc, idx_byte_off, /*aux=*/0);
     };
 
@@ -428,7 +425,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
     constexpr int rope_lds_step = T::INDICES_PER_TDM * T::K_ROPE_ROW_LDS_BYTES;
 
     auto issue_kv_tile = [&](const u32x16_t& ids, int tile_idx, auto clamp_tail) {
-        [[maybe_unused]] const int wave_valid = valid_kv_len - (tile_idx * T::KV_TILE_SIZE + warp_id * T::ROWS_PER_WAVE);
+        [[maybe_unused]] const int wave_valid = valid_kv_len - (tile_idx * T::KV_TILE_SIZE + wave_gather_row);
 
         static_for<T::TDM_LOADS_PER_WAVE>([&](auto d) {
             constexpr int ld = d.value;
@@ -452,8 +449,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
         tdm_k_rope.move(0_I, 0_I, 0_I, 0_I, 0_I, number<-(T::TDM_LOADS_PER_WAVE - 1) * rope_lds_step>{});
     };
 
-    auto compute_qk = [&](auto slot_swap) __attribute__((always_inline)) {
-        constexpr int SLOT_SWAP = decltype(slot_swap)::value;
+    auto compute_qk = [&]() __attribute__((always_inline)) {
         constexpr index_t scale_dwords = vector_traits<VQS>::size() * sizeof(D_NOPE) / sizeof(int);
         using scale_t   = vector_t<int, scale_dwords>;
         using s_stage_t = vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>;
@@ -503,7 +499,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
         static_for<T::GEMM1_STAGE_N * T::GEMM1_STAGE_K>([&](auto sg) {
             constexpr int stage_n = sg.value % T::GEMM1_STAGE_N;
             constexpr int stage_k = sg.value / T::GEMM1_STAGE_N;
-            v_v = tr_load<T::VEC_ROPE>(s_pv[stage_k], u_rv + number<stage_n * (T::D_HEAD_SIZE / T::GEMM1_STAGE_N)>{});
+            v_v = tr_load<T::VEC_ROPE>(s_v[stage_k], u_rv + number<stage_n * (T::D_HEAD_SIZE / T::GEMM1_STAGE_N)>{});
             s_wait_dscnt(0_I);
             v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v, v_o_stages[stage_n]);
         });
@@ -518,12 +514,11 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
         s_wait_tensorcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
-        if (wave_rot & 1) compute_qk(number<1>{});
-        else              compute_qk(number<0>{});
+        compute_qk();
 
         __builtin_amdgcn_s_barrier();
-        store<T::VEC_NOPE>(s_v, v_v_nope, u_rv_nope);
-        store<T::VEC_ROPE>(s_v, v_k_rope, u_rv_rope + T::D_NOPE_SIZE);
+        store<T::VEC_NOPE>(s_v[1], v_v_nope, u_rv_nope + number<OWN_V_ROW>{});
+        store<T::VEC_ROPE>(s_v[1], v_k_rope, u_rv_rope + number<OWN_V_ROW + T::D_NOPE_SIZE>{});
 
         attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, seg_base_rows);
         constexpr index_t s_len = vector_traits<decltype(v_s)>::size();
@@ -589,25 +584,27 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
 
-    // Prefix segment: indices point into unified_kv_{nope,rope}[total_pages]
-    {
-        const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
-        const int valid_kv_len   = kargs.kv_indptr_prefix[q_token_idx + 1] - page_idx_begin;
-        const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
-        pa_prefill_accum_pipelined<Traits>(kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.total_pages,
-                                           kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles,
-                                           smem_kv_buf, v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row, temperature_scale);
-    }
-    __builtin_amdgcn_s_barrier();
-    // Extend segment: indices point into kv_{nope,rope}[total_tokens]
-    {
-        const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
-        const int valid_kv_len   = kargs.kv_indptr_extend[q_token_idx + 1] - page_idx_begin;
-        const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
-        pa_prefill_accum_pipelined<Traits>(kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.total_tokens,
-                                           kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles,
-                                           smem_kv_buf, v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row, temperature_scale);
-    }
+    auto run_kv_segments = [&](auto slot_swap) __attribute__((always_inline)) {
+        constexpr int SLOT_SWAP = decltype(slot_swap)::value;
+        #pragma clang loop unroll(disable)
+        for (int seg = 0; seg < 2; ++seg) {
+            if (seg) __builtin_amdgcn_s_barrier();
+            const int*  kv_indptr  = seg ? kargs.kv_indptr_extend    : kargs.kv_indptr_prefix;
+            const int*  kv_indices = seg ? kargs.kv_indices_extend   : kargs.kv_indices_prefix;
+            const void* nope_ptr   = seg ? kargs.kv_nope_ptr         : kargs.unified_kv_nope_ptr;
+            const void* rope_ptr   = seg ? kargs.kv_rope_ptr         : kargs.unified_kv_rope_ptr;
+            const int   kv_rows    = seg ? kargs.total_tokens        : kargs.total_pages;
+
+            const int page_idx_begin = kv_indptr[q_token_idx];
+            const int valid_kv_len   = kv_indptr[q_token_idx + 1] - page_idx_begin;
+            const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+            pa_prefill_accum_pipelined<Traits, SLOT_SWAP>(kargs, nope_ptr, rope_ptr, kv_rows,
+                                                          kv_indices, page_idx_begin, valid_kv_len, num_kv_tiles,
+                                                          smem_kv_buf, v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row, temperature_scale);
+        }
+    };
+    if (warp_id >> 1) run_kv_segments(number<1>{});
+    else              run_kv_segments(number<0>{});
 
     // Fold the per-head sink into the denominator, normalize O, store it out.
     const int sink_head_idx = h_block_start + warp_id * T::Q_TILE_SIZE + (lane_id % T::W_M);
