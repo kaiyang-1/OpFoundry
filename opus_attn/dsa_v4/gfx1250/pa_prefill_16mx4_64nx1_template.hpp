@@ -135,8 +135,8 @@ __device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
     D_ACC row_max = max(opus::numeric_limits<D_ACC>::lowest(),
                         tree_reduce<0, s_len>(v_s, [](D_ACC x, D_ACC y) { return max(x, y); }));
 
-    opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
-    return max(std::bit_cast<float>(res16.x), std::bit_cast<float>(res16.y));
+    int res16 = __builtin_amdgcn_permlane_xor(std::bit_cast<int>(row_max), 16, 32);
+    return max(row_max, std::bit_cast<float>(res16));
 }
 
 template<typename T, typename V>
@@ -161,8 +161,8 @@ __device__ inline typename T::D_ACC attn_row_sum(const V& v_s) {
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
     D_ACC row_sum = tree_reduce<0, s_len>(v_s, [](D_ACC x, D_ACC y) { return x + y; });
 
-    opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
-    return std::bit_cast<float>(res16.x) + std::bit_cast<float>(res16.y);
+    int res16 = __builtin_amdgcn_permlane_xor(std::bit_cast<int>(row_sum), 16, 32);
+    return row_sum + std::bit_cast<float>(res16);
 }
 
 template<typename T, typename V>

@@ -228,10 +228,9 @@ template<class T, class V>
 __device__ inline void zero_mxscl_pad(V& v_mxscl, bool upper_half) {
     constexpr opus::index_t len = opus::vector_traits<V>::size();
     constexpr opus::index_t pad = (T::D_NOPE_PADDED_SIZE - T::D_NOPE_SIZE) / T::MXSCL_BLOCK_SIZE;
-    opus::static_for<pad>([&](auto i) {
-        constexpr opus::index_t idx = len - pad + i.value;
-        v_mxscl[idx] = upper_half ? static_cast<typename T::D_NOPE>(0) : v_mxscl[idx];
-    });
+    const opus::u32_t keep = upper_half ? (0xFFFFFFFFu >> (8 * pad)) : 0xFFFFFFFFu;
+    auto* dw = reinterpret_cast<opus::u32_t*>(&v_mxscl);
+    dw[len / 4 - 1] &= keep;
 }
 
 template<opus::index_t Vec, opus::index_t Lo, opus::index_t Hi, class Sm, class V, class Layout>
@@ -263,8 +262,8 @@ __device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
     D_ACC row_max = max(opus::numeric_limits<D_ACC>::lowest(),
                         tree_reduce<0, s_len>(v_s, [](D_ACC x, D_ACC y) { return max(x, y); }));
 
-    opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
-    return max(std::bit_cast<float>(res16.x), std::bit_cast<float>(res16.y));
+    int res16 = __builtin_amdgcn_permlane_xor(std::bit_cast<int>(row_max), 16, 32);
+    return max(row_max, std::bit_cast<float>(res16));
 }
 
 template<typename T, typename V>
@@ -289,8 +288,8 @@ __device__ inline typename T::D_ACC attn_row_sum(const V& v_s) {
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
     D_ACC row_sum = tree_reduce<0, s_len>(v_s, [](D_ACC x, D_ACC y) { return x + y; });
 
-    opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
-    return std::bit_cast<float>(res16.x) + std::bit_cast<float>(res16.y);
+    int res16 = __builtin_amdgcn_permlane_xor(std::bit_cast<int>(row_sum), 16, 32);
+    return row_sum + std::bit_cast<float>(res16);
 }
 
 template<typename T, typename V>
@@ -520,6 +519,8 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
         v_k_nope[buf.value]  = load<T::VEC_NOPE>(s_k_nope[j.value], u_rk_nope);
         v_k_mxscl[buf.value] = load<T::VEC_MXSCL>(s_k_nope[j.value], u_rk_mxscl + T::D_NOPE_SIZE);
         v_k_rope[buf.value]  = load<T::VEC_ROPE>(s_k_rope[j.value], u_rk_rope);
+        zero_nope_pad<T>(v_k_nope[buf.value]);
+        zero_mxscl_pad<T>(v_k_mxscl[buf.value], lane_id >= T::W_N);
     };
 
     auto tr_load_v = [&](auto sn, auto sk, auto buf) {
@@ -545,8 +546,6 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
             constexpr int buf  = j.value & 1;
             s_wait_dscnt(0_I);
             __builtin_amdgcn_sched_barrier(0);
-            zero_nope_pad<T>(v_k_nope[buf]);
-            zero_mxscl_pad<T>(v_k_mxscl[buf], lane_id >= T::W_N);
 
             auto& scale_k = reinterpret_cast<scale_t&>(v_k_mxscl[buf]);
 
