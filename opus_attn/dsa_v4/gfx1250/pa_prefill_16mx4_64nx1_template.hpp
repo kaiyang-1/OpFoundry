@@ -18,11 +18,17 @@ constexpr int DS_READ_MASK = 0x100;
 constexpr int EXP_MASK     = 0x400;
 constexpr int TDM_MASK     = 0x800;
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wundefined-inline"
-OPUS_D opus::u32x16_t llvm_amdgcn_s_buffer_load_v16i32(opus::u32x4_t rsrc, int offset, int aux)
-    __asm("llvm.amdgcn.s.buffer.load.v16i32");
-#pragma clang diagnostic pop
+OPUS_D opus::u32x16_t s_buffer_load_b512(opus::u32x4_t rsrc, int soffset) {
+    opus::u32x16_t ids;
+    asm volatile("s_buffer_load_b512 %0, %1, %2 offset:0x0 nv"
+                 : "=&s"(ids)
+                 : "s"(rsrc), "s"(soffset));
+    return ids;
+}
+
+OPUS_D void s_wait_kmcnt_for(opus::u32x16_t& ids) {
+    asm volatile("s_wait_kmcnt 0x0" : "+s"(ids));
+}
 
 OPUS_D opus::u32x4_t make_buffer_rsrc_raw(const void* ptr, opus::u32_t num_bytes,
                                           opus::u32_t config = opus::buffer_default_config()) {
@@ -299,7 +305,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
 
     auto load_row_ids = [&](int tile_idx) {
         const int idx_byte_off = (tile_idx * T::KV_TILE_SIZE + warp_id * T::ROWS_PER_WAVE) * (int)sizeof(int);
-        return llvm_amdgcn_s_buffer_load_v16i32(kv_indices_rsrc, idx_byte_off, /*aux=*/0);
+        return s_buffer_load_b512(kv_indices_rsrc, idx_byte_off);
     };
 
     auto issue_kv_tile = [&](const u32x16_t& ids, int tile_idx, auto clamp_tail) {
@@ -323,7 +329,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
 
     // Gather a tile into the next slot, prefetch the row indices after it.
     auto issue_tile = [&](int tile, auto clamp_tail) {
-        s_wait_kmcnt(0_I);
+        s_wait_kmcnt_for(row_ids);
         tdm_kv.move(0_I, 0_I, 0_I, 0_I, 0_I, slot_step(tdm_off));
         issue_kv_tile(row_ids, tile, clamp_tail);
         row_ids = load_row_ids(tile + 1);
@@ -490,11 +496,6 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
                 }
                 if constexpr (sg.value == 1) {
                     attn_row_scale_sub<T>(v_s[cur.value], temperature_scale, row_max);
-                    auto v_s_stages = reinterpret_cast<vector_t<D_ACC, 8>*>(&v_s[cur.value]);
-                    asm volatile("" : "+v"(v_s_stages[0]) ::);
-                    asm volatile("" : "+v"(v_s_stages[1]) ::);
-                    asm volatile("" : "+v"(v_s_stages[2]) ::);
-                    asm volatile("" : "+v"(v_s_stages[3]) ::);
                     __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
                     __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
                     static_for<8>([](auto) {
@@ -514,22 +515,6 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
                 }
                 if constexpr (sg.value == 2) {
                     attn_exp2_slice<T, 0, s_len / 2>(v_s[cur.value]);
-                    asm volatile("" : "+v"(v_s[cur.value][0]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][1]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][2]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][3]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][4]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][5]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][6]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][7]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][8]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][9]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][10]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][11]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][12]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][13]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][14]) ::);
-                    asm volatile("" : "+v"(v_s[cur.value][15]) ::);
                     static_for<8>([](auto) {
                         __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
                         __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
@@ -560,7 +545,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
 
     // Prologue
     row_ids = load_row_ids(0);
-    s_wait_kmcnt(0_I);
+    s_wait_kmcnt_for(row_ids);
     issue_kv_tile(row_ids, 0, true_type{});
     row_ids = load_row_ids(1);
     s_wait_tensorcnt(0_I);
