@@ -67,9 +67,9 @@ struct pa_16mx4_64nx1_traits {
     static constexpr int SEGS_PER_BUF       = NUM_WARPS / WAVES_PER_SEG;
     static constexpr int ROWS_PER_SEG       = WAVES_PER_SEG * ROWS_PER_WAVE;
     static constexpr int WAVE_LDS_BYTES     = ROWS_PER_WAVE * KV_ROW_LDS_BYTES;
-    static constexpr int SEG_BYTES          = 128 * 1024;
+    static constexpr int SEG_BYTES          = 160 * 1024;
     static constexpr int KV_BUF_BYTES       = ROWS_PER_SEG * KV_ROW_LDS_BYTES;       // slot stride
-    static constexpr int NUM_KV_BUFS        = 3;                                     // QK(t+2) runs before PV(t+1)
+    static constexpr int NUM_KV_BUFS        = 4;                                     // QK(t) gathers t+2, so t-1, t, t+1, t+2 coexist
 
     static constexpr size_t smem_size_bytes() { return (size_t)SEG_BYTES + NUM_KV_BUFS * KV_BUF_BYTES; }
 };

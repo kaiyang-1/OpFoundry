@@ -284,7 +284,6 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
     const int seg_rot_bytes = (warp_id & 1) * T::SEG_BYTES;
     const int seg_rot_rows  = (warp_id & 1) * T::ROWS_PER_SEG;
 
-    // Three tile slots: QK(t+2) runs before PV(t+1), so t, t+1 and the in-flight t+2 coexist.
     smem<D_ATTN> s_qk[T::SEGS_PER_BUF] = {
         make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf + seg_rot_bytes)),
         make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf + (T::SEG_BYTES - seg_rot_bytes))),
@@ -439,8 +438,18 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
                 __builtin_amdgcn_sched_group_barrier(TDM_MASK,     1, 0);   // tensor_load_to_lds #1
             }
 
-            if constexpr (stage + 1 < T::GEMM0_STAGE_N) load_k(number<stage + 1>{}, number<(stage + 1) & 1>{});
-            else                                        tr_load_v(0_I, 0_I, 0_I);
+            if constexpr (stage + 1 < T::GEMM0_STAGE_N) {
+                load_k(number<stage + 1>{}, number<(stage + 1) & 1>{});
+
+                if constexpr (!decltype(fuse_softmax)::value) {
+                    static_for<10>([](auto) {
+                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
+                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 3, 0);
+                    });
+                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
+                    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
+                }
+            }
 
             if constexpr (decltype(fuse_softmax)::value) {
                 if constexpr (stage == 0) {
@@ -497,6 +506,8 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
                     });
                 }
                 if constexpr (stage == 3) {
+                    tr_load_v(0_I, 0_I, 0_I);
+
                     __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
                     __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
                     __builtin_amdgcn_sched_group_barrier(SALU_MASK, 6, 0);
@@ -533,15 +544,15 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
                 constexpr int n_sn = (sg.value + 1) % T::GEMM1_STAGE_N;
                 constexpr int n_sk = (sg.value + 1) / T::GEMM1_STAGE_N;
                 tr_load_v(number<n_sn>{}, number<n_sk>{}, number<(sg.value + 1) & 1>{});
-            } else if constexpr (decltype(fuse_softmax)::value) {
-                s_wait_tensorcnt(0_I);
-                __builtin_amdgcn_s_barrier();
-                load_k(0_I, 0_I);
-                constexpr int K_ANCHOR_STRIDE = T::GEMM0_E_K / T::GEMM0_STAGE_N;
-                auto ks = reinterpret_cast<vector_t<D_ATTN, T::W_N * T::W_K / T::WARP_SIZE>*>(&v_k[0]);
-                #pragma unroll
-                for (int i = 0; i < T::GEMM0_E_K; i += K_ANCHOR_STRIDE)
-                    asm volatile("" : "+v"(ks[i]) ::);
+
+                if constexpr (!decltype(fuse_softmax)::value) {
+                    static_for<10>([](auto) {
+                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
+                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 3, 0);
+                    });
+                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
+                    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
+                }
             }
 
             if constexpr (decltype(fuse_softmax)::value) {
@@ -610,12 +621,28 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
                     __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    2, 0);
                 }
                 if constexpr (sg.value == 3) {   // only valid once every mma1 has landed in v_o
+                    s_wait_tensorcnt(number<T::TDM_LOADS_PER_WAVE>{});
+                    __builtin_amdgcn_s_barrier();
+                    load_k(0_I, 0_I);
+                    
+                    __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
+                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
+                    __builtin_amdgcn_sched_group_barrier(SALU_MASK, 2, 0);
                     static_for<10>([](auto) {
                         __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
                         __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 3, 0);
                     });
                     __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
                     __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
+                    static_for<4>([](auto) {
+                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
+                    });
+
+                    constexpr int K_ANCHOR_STRIDE = T::GEMM0_E_K / T::GEMM0_STAGE_N;
+                    auto ks = reinterpret_cast<vector_t<D_ATTN, T::W_N * T::W_K / T::WARP_SIZE>*>(&v_k[0]);
+                    #pragma unroll
+                    for (int i = 0; i < T::GEMM0_E_K; i += K_ANCHOR_STRIDE)
+                        asm volatile("" : "+v"(ks[i]) ::);
                     
                     if (!all_below) {
                         const D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
@@ -631,17 +658,18 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
     };
 
     // Prologue
-    row_ids = load_row_ids(0);
-    s_wait_kmcnt_for(row_ids);
-    issue_kv_tile(row_ids, 0, true_type{});
+    u32x16_t head_ids = load_row_ids(0);
+    s_wait_kmcnt_for(head_ids);
     row_ids = load_row_ids(1);
-    s_wait_tensorcnt(0_I);
+    issue_kv_tile(head_ids, 0, true_type{});
+    issue_tile(1, true_type{});
+    s_wait_tensorcnt(number<T::TDM_LOADS_PER_WAVE>{});
     __builtin_amdgcn_s_barrier();
     load_k(0_I, 0_I);
-    compute_qk(0_I, 0_I, false_type{}, 1, true_type{});
+    compute_qk(0_I, 0_I, false_type{}, 2, true_type{});
     attn_mask_oob_score<T>(v_s[0], valid_kv_len, 0, seg_rot_rows);
 
-    s_wait_tensorcnt(0_I);
+    s_wait_tensorcnt(number<T::TDM_LOADS_PER_WAVE>{});
     __builtin_amdgcn_s_barrier();
     load_k(0_I, 0_I);
 
@@ -662,17 +690,17 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
 
     // Main loop
     int t = 1;
-    for (; t + 3 < num_kv_tiles; t += 2) {
-        compute_qk(1_I, 0_I, true_type{}, t + 1, false_type{});   // QK(t)   + tail(t-1) + gather(t+1)
+    for (; t + 4 < num_kv_tiles; t += 2) {
+        compute_qk(1_I, 0_I, true_type{}, t + 2, false_type{});   // QK(t)   + tail(t-1) + gather(t+2)
         compute_pv(1_I, true_type{});                             // PV(t-1) + head(t)
-        compute_qk(0_I, 1_I, true_type{}, t + 2, false_type{});   // QK(t+1) + tail(t)   + gather(t+2)
+        compute_qk(0_I, 1_I, true_type{}, t + 3, false_type{});   // QK(t+1) + tail(t)   + gather(t+3)
         compute_pv(0_I, true_type{});                             // PV(t)   + head(t+1)
     }
 
     // Epilogue
     #pragma clang loop unroll(disable)
     for (; t < num_kv_tiles; ++t) {
-        compute_qk(1_I, 0_I, true_type{}, t + 1, true_type{});    // QK(t) + tail(t-1) + gather(t+1)
+        compute_qk(1_I, 0_I, true_type{}, t + 2, true_type{});    // QK(t) + tail(t-1) + gather(t+2)
         attn_mask_oob_score<T>(v_s[1], valid_kv_len, t, seg_rot_rows);
         compute_pv(1_I, true_type{});                             // PV(t-1) + head(t)
         v_s[0] = v_s[1];
