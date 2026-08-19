@@ -11,13 +11,6 @@ using opus::operator""_I;
 
 namespace pa_16mx4_64nx1 {
 
-constexpr int VALU_MASK    = 0x002;
-constexpr int SALU_MASK    = 0x004;
-constexpr int MFMA_MASK    = 0x008;
-constexpr int DS_READ_MASK = 0x100;
-constexpr int EXP_MASK     = 0x400;
-constexpr int TDM_MASK     = 0x800;
-
 OPUS_D opus::u32x16_t s_buffer_load_b512(opus::u32x4_t rsrc, int soffset) {
     opus::u32x16_t ids;
     asm volatile("s_buffer_load_b512 %0, %1, %2 offset:0x0 nv"
@@ -131,57 +124,6 @@ __device__ inline auto make_layout_rv(int lane_id) {
         opus::unfold_x_stride(v_block_dim, v_block_shape, opus::tuple{opus::number<T::VEC_KV>{}, opus::number<T::D_TILE_SIZE + T::KV_ROW_PAD_SIZE>{}, 1_I}),
         opus::unfold_p_coord(v_block_dim, opus::tuple{(lane_id % lane_per_grp) / lane_k, lane_id / lane_per_grp, (lane_id % lane_per_grp) % lane_k}));
 }
-
-template<int REG, int SLICE_REGS, typename V>
-__device__ inline V pin_tile(V v) {
-    using D = typename opus::vector_traits<V>::dtype;
-    constexpr int slice_elems = SLICE_REGS * 4 / (int)sizeof(D);
-    constexpr int slices      = opus::vector_traits<V>::size() / slice_elems;
-    static_assert(slices * slice_elems == opus::vector_traits<V>::size());
-
-    auto s = reinterpret_cast<opus::vector_t<D, slice_elems>*>(&v);
-    opus::static_for<slices>([&](auto i) {
-        s[i.value] = __builtin_amdgcn_pin_vgpr(s[i.value], REG + i.value * SLICE_REGS);
-    });
-    return v;
-}
-
-template<class T>
-struct pin_layout {
-    using D_ATTN = typename T::D_ATTN;
-    using D_ACC  = typename T::D_ACC;
-
-    // Widths one WMMA consumes as a unit, which is the granularity a pin has to
-    // name: pinning a whole tile and reading it back in pieces leaves the pieces
-    // with no place of their own.
-    static constexpr int B_REGS   = T::W_N * T::W_K / T::WARP_SIZE * (int)sizeof(D_ATTN) / 4;
-    static constexpr int ACC_REGS = T::W_M * T::W_N / T::WARP_SIZE * (int)sizeof(D_ACC) / 4;
-
-    static constexpr int Q_REGS  = T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE * (int)sizeof(D_ATTN) / 4;
-    static constexpr int O_REGS  = T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE * (int)sizeof(D_ACC) / 4;
-    static constexpr int KV_REGS = T::GEMM0_E_N * T::GEMM0_E_K * T::W_N * T::W_K / T::WARP_SIZE * (int)sizeof(D_ATTN) / 4;
-    static constexpr int O_STAGE_REGS = O_REGS / T::GEMM1_STAGE_N;
-
-    static constexpr int S_REGS = T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE * (int)sizeof(D_ACC) / 4;
-    static constexpr int P_REGS = T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE * (int)sizeof(D_ATTN) / 4;
-
-    static constexpr int Q   = 0;               // v0   .. v127
-    static constexpr int O   = Q + Q_REGS;      // v128 .. v383
-    static constexpr int KV0 = O + O_REGS;      // v384 .. v511
-    static constexpr int KV1 = KV0 + KV_REGS;   // v512 .. v639
-    static constexpr int S0  = KV1 + KV_REGS;   // v640 .. v671
-    static constexpr int S1  = S0 + S_REGS;     // v672 .. v703
-    static constexpr int P   = S1 + S_REGS;     // v704 .. v719
-    static constexpr int M    = P + P_REGS;     // v720, the running row max
-    static constexpr int LSUM = M + 1;          // v721, the running row sum
-    static constexpr int RMAX = LSUM + 1;       // v722, this tile's row max
-
-    static_assert(P_REGS == T::GEMM1_STAGE_K * B_REGS, "v_p must tile into WMMA operands");
-    static_assert(S_REGS == T::GEMM0_STAGE_N * ACC_REGS, "v_s must tile into WMMA accumulators");
-    static_assert(T::GEMM0_E_N * T::GEMM0_E_K == T::GEMM1_E_N * T::GEMM1_E_K,
-                  "K and V must be the same width to share a slot");
-    static_assert(RMAX + 1 <= 1024, "the layout must fit the gfx1250 VGPR file");
-};
 
 template<int Lo, int Hi, typename V, typename Op>
 __device__ inline auto tree_reduce(const V& v, Op op) {
@@ -345,24 +287,9 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
     auto v_p_stages = reinterpret_cast<vector_t<D_ATTN, T::W_M * T::W_K / T::WARP_SIZE>*>(&v_p);
     auto v_o_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::D_TILE_SIZE / T::GEMM1_STAGE_N / T::WARP_SIZE>*>(&v_o);
 
-    using L = pin_layout<T>;
-    auto pin_o = [&] { v_o = pin_tile<L::O, L::ACC_REGS>(v_o); };
-
-    auto anchor_s = [&](auto buf, auto lo, auto hi) {
-        constexpr int per_stage = T::W_M * T::W_N / T::WARP_SIZE;
-        auto* e = reinterpret_cast<D_ACC*>(&v_s[buf.value]);
-        #pragma unroll
-        for (int i = lo.value * per_stage; i < hi.value * per_stage; ++i)
-            asm volatile("" : "+v"(e[i]) ::);
-    };
-    constexpr auto S_ALL  = number<T::GEMM0_STAGE_N>{};
-    constexpr auto S_HALF = number<T::GEMM0_STAGE_N / 2>{};
-
     // Online softmax state, sliced into the GEMM stage loops below.
     constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
     constexpr index_t s_len = T::Q_TILE_SIZE * T::KV_TILE_SIZE / T::WARP_SIZE;
-    static_assert(s_len / 2 % (T::W_M * T::W_N / T::WARP_SIZE) == 0,
-                  "a softmax half must end on a v_s stage boundary for anchor_s to cover it");
     D_ACC row_max;
     bool all_below;
 
@@ -404,15 +331,13 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
         constexpr int kv_row  = sn.value * T::W_N;
         constexpr int seg     = kv_row / T::ROWS_PER_SEG;
         constexpr int row_off = (kv_row % T::ROWS_PER_SEG) * T::KV_ROW_LDS_ELEMS;
-        constexpr int reg     = buf.value ? L::KV1 : L::KV0;
-        v_k[buf.value] = pin_tile<reg, L::B_REGS>(load<T::VEC_KV>(s_qk[seg], u_rk + number<row_off>{}));
+        v_k[buf.value] = load<T::VEC_KV>(s_qk[seg], u_rk + number<row_off>{});
     };
 
     auto tr_load_v = [&](auto sn, auto sk, auto buf) {
         constexpr int stage_n = sn.value;
         constexpr int stage_k = sk.value;
-        constexpr int reg     = buf.value ? L::KV1 : L::KV0;
-        v_v[buf.value] = pin_tile<reg, L::B_REGS>(tr_load<T::VEC_KV>(s_pv[stage_k], u_rv + number<stage_n * (T::D_TILE_SIZE / T::GEMM1_STAGE_N)>{}));
+        v_v[buf.value] = tr_load<T::VEC_KV>(s_pv[stage_k], u_rv + number<stage_n * (T::D_TILE_SIZE / T::GEMM1_STAGE_N)>{});
     };
 
     auto compute_qk = [&](auto dst, auto prev, auto fuse_softmax, int tile, auto clamp_tail) __attribute__((always_inline)) {
@@ -420,106 +345,30 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
         static_for<T::GEMM0_STAGE_N>([&](auto j) {
             constexpr int stage = j.value;
             constexpr int buf   = j.value & 1;
-            __builtin_amdgcn_sched_barrier(0);
-            s_wait_dscnt(0_I);
-            __builtin_amdgcn_sched_barrier(0);
 
-            constexpr int s_reg = (dst.value ? L::S1 : L::S0) + stage * L::ACC_REGS;
             clear(v_s_stages[stage]);
-            v_s_stages[stage] = pin_tile<s_reg, L::ACC_REGS>(mma0(v_q, v_k[buf], v_s_stages[stage]));
+            v_s_stages[stage] = mma0(v_q, v_k[buf], v_s_stages[stage]);
 
             if constexpr (stage == 0) {
                 issue_tile(tile, clamp_tail);
-                __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                __builtin_amdgcn_sched_group_barrier(SALU_MASK,    6, 0);   // ring step + D# lds_addr
-                __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                __builtin_amdgcn_sched_group_barrier(TDM_MASK,     1, 0);   // tensor_load_to_lds #0
-                __builtin_amdgcn_sched_group_barrier(SALU_MASK,    5, 0);   // lds bump + 2nd D#
-                __builtin_amdgcn_sched_group_barrier(TDM_MASK,     1, 0);   // tensor_load_to_lds #1
             }
 
             if constexpr (stage + 1 < T::GEMM0_STAGE_N) {
                 load_k(number<stage + 1>{}, number<(stage + 1) & 1>{});
-
-                if constexpr (!decltype(fuse_softmax)::value) {
-                    static_for<10>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 3, 0);
-                    });
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                }
             }
 
             if constexpr (decltype(fuse_softmax)::value) {
                 if constexpr (stage == 0) {
                     attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[prev.value]);
-                    anchor_s(prev, S_HALF, S_ALL);
-                    static_for<8>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(EXP_MASK,     1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                        __builtin_amdgcn_sched_group_barrier(EXP_MASK,     1, 0);
-                    });
-                    static_for<4>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,     1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK,  2, 0);
-                    });
                 }
                 if constexpr (stage == 1) {
                     l_row += attn_row_sum<T>(v_s[prev.value]);
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                    __builtin_amdgcn_sched_group_barrier(VALU_MASK,    2, 0);
-                    static_for<7>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(VALU_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                        __builtin_amdgcn_sched_group_barrier(VALU_MASK,    1, 0);
-                    });
-                    static_for<4>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                        __builtin_amdgcn_sched_group_barrier(VALU_MASK,    1, 0);
-                    });
-                    static_for<4>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                    });
                 }
                 if constexpr (stage == 2) {
-                    v_p = pin_tile<L::P, L::B_REGS>(cast<D_ATTN>(v_s[prev.value]));
-                    #pragma unroll
-                    for (int k = 0; k < T::GEMM1_STAGE_K; ++k) asm volatile("" : "+v"(v_p_stages[k]) ::);
-                    static_for<10>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 3, 0);
-                    });
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
-                    __builtin_amdgcn_sched_group_barrier(VALU_MASK,    1, 0);
-                    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
-                    static_for<5>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(VALU_MASK, 3, 0);
-                    });
+                    v_p = cast<D_ATTN>(v_s[prev.value]);
                 }
                 if constexpr (stage == 3) {
                     tr_load_v(0_I, 0_I, 0_I);
-
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                    __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
-                    __builtin_amdgcn_sched_group_barrier(SALU_MASK, 6, 0);
-                    static_for<10>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 3, 0);
-                    });
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                    static_for<4>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                    });
                 }
             }
         });
@@ -533,26 +382,12 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
             constexpr int stage_k = sg.value / T::GEMM1_STAGE_N;
             constexpr int buf     = sg.value & 1;
 
-            __builtin_amdgcn_sched_barrier(0);
-            s_wait_dscnt(0_I);
-            __builtin_amdgcn_sched_barrier(0);
-
-            v_o_stages[stage_n] = pin_tile<L::O + stage_n * L::O_STAGE_REGS, L::ACC_REGS>(
-                mma1(v_p_stages[stage_k], v_v[buf], v_o_stages[stage_n]));
+            v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v[buf], v_o_stages[stage_n]);
 
             if constexpr (sg.value + 1 < GEMM1_STAGES) {
                 constexpr int n_sn = (sg.value + 1) % T::GEMM1_STAGE_N;
                 constexpr int n_sk = (sg.value + 1) / T::GEMM1_STAGE_N;
                 tr_load_v(number<n_sn>{}, number<n_sk>{}, number<(sg.value + 1) & 1>{});
-
-                if constexpr (!decltype(fuse_softmax)::value) {
-                    static_for<10>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 3, 0);
-                    });
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                }
             }
 
             if constexpr (decltype(fuse_softmax)::value) {
@@ -560,96 +395,24 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
                     row_max = attn_row_max<T>(v_s[cur.value]) * temperature_scale;
                     all_below = __builtin_amdgcn_ballot_w32((row_max - m_row) <= RESCALE_THRESHOLD)
                              == __builtin_amdgcn_read_exec_lo();
-                    row_max = __builtin_amdgcn_pin_vgpr(all_below ? m_row : max(m_row, row_max), L::RMAX);
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
-                    __builtin_amdgcn_sched_group_barrier(VALU_MASK,    1, 0);
-                    static_for<10>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(VALU_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                        __builtin_amdgcn_sched_group_barrier(VALU_MASK,    1, 0);
-                    });
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
-                    __builtin_amdgcn_sched_group_barrier(VALU_MASK,    1, 0);
-                    static_for<3>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(VALU_MASK, 2, 0);
-                    });
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                    __builtin_amdgcn_sched_group_barrier(SALU_MASK, 2, 0);
-                    __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
+                    row_max = all_below ? m_row : max(m_row, row_max);
                 }
                 if constexpr (sg.value == 1) {
                     attn_row_scale_sub<T>(v_s[cur.value], temperature_scale, row_max);
-                    anchor_s(cur, 0_I, S_ALL);
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                    __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
-                    static_for<8>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(VALU_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(VALU_MASK,    1, 0);
-                    });
-                    static_for<5>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,     1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK,  3, 0);
-                    });
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
                 }
                 if constexpr (sg.value == 2) {
                     attn_exp2_slice<T, 0, s_len / 2>(v_s[cur.value]);
-                    anchor_s(cur, 0_I, S_HALF);
-                    static_for<8>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(EXP_MASK,     1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
-                        __builtin_amdgcn_sched_group_barrier(EXP_MASK,     1, 0);
-                    });
-                    static_for<5>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,     1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK,  3, 0);
-                    });
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 1, 0);
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    2, 0);
                 }
                 if constexpr (sg.value == 3) {   // only valid once every mma1 has landed in v_o
                     s_wait_tensorcnt(number<T::TDM_LOADS_PER_WAVE>{});
                     __builtin_amdgcn_s_barrier();
                     load_k(0_I, 0_I);
-                    
-                    __builtin_amdgcn_sched_group_barrier(VALU_MASK, 1, 0);
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                    __builtin_amdgcn_sched_group_barrier(SALU_MASK, 2, 0);
-                    static_for<10>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                        __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 3, 0);
-                    });
-                    __builtin_amdgcn_sched_group_barrier(MFMA_MASK,    1, 0);
-                    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, 2, 0);
-                    static_for<4>([](auto) {
-                        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                    });
 
-                    constexpr int K_ANCHOR_STRIDE = T::GEMM0_E_K / T::GEMM0_STAGE_N;
-                    auto ks = reinterpret_cast<vector_t<D_ATTN, T::W_N * T::W_K / T::WARP_SIZE>*>(&v_k[0]);
-                    #pragma unroll
-                    for (int i = 0; i < T::GEMM0_E_K; i += K_ANCHOR_STRIDE)
-                        asm volatile("" : "+v"(ks[i]) ::);
-                    
                     if (!all_below) {
                         const D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
                         m_row = row_max;
                         l_row *= rescale_m;
                         scale_output_tile<T>(v_o, rescale_m);
-                        pin_o();
                     }
                 }
             }
@@ -677,7 +440,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
     row_max = attn_row_max<T>(v_s[0]) * temperature_scale;
     all_below = __builtin_amdgcn_ballot_w32((row_max - m_row) <= RESCALE_THRESHOLD)
              == __builtin_amdgcn_read_exec_lo();
-    row_max = __builtin_amdgcn_pin_vgpr(all_below ? m_row : max(m_row, row_max), L::RMAX);
+    row_max = all_below ? m_row : max(m_row, row_max);
     attn_row_scale_sub<T>(v_s[0], temperature_scale, row_max);
     attn_exp2_slice<T, 0, s_len / 2>(v_s[0]);
     if (!all_below) {
@@ -685,7 +448,6 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
         m_row = row_max;
         l_row *= rescale_m;
         scale_output_tile<T>(v_o, rescale_m);
-        pin_o();
     }
 
     // Main loop
@@ -708,7 +470,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
     // Softmax tail of the last tile, with no GEMM left to ride along.
     attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[0]);
     l_row += attn_row_sum<T>(v_s[0]);
-    v_p = pin_tile<L::P, L::B_REGS>(cast<D_ATTN>(v_s[0]));
+    v_p = cast<D_ATTN>(v_s[0]);
 
     tr_load_v(0_I, 0_I, 0_I);
     compute_pv(0_I, false_type{});            // PV of the tile that ended the chain
@@ -744,14 +506,12 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
     constexpr D_ACC LOG2_E = 1.44269504089f;
     const D_ACC temperature_scale = kargs.softmax_scale * LOG2_E;
 
-    using L = pin_layout<T>;
-    v_q = pin_tile<L::Q, L::B_REGS>(load<T::VEC_Q>(g_q, u_q));
+    v_q = load<T::VEC_Q>(g_q, u_q);
     s_wait_loadcnt(0_I);
 
     clear(v_o);
-    v_o = pin_tile<L::O, L::ACC_REGS>(v_o);
-    D_ACC m_row = __builtin_amdgcn_pin_vgpr(opus::numeric_limits<D_ACC>::lowest(), L::M);
-    D_ACC l_row = __builtin_amdgcn_pin_vgpr(D_ACC(0.0f), L::LSUM);
+    D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
+    D_ACC l_row = D_ACC(0.0f);
 
     // Prefix segment: indices point into unified_kv[total_pages]
     {

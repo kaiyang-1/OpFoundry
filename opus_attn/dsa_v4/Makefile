@@ -4,7 +4,7 @@ ARCH            ?= gfx1250
 
 ARCH_MACRO = PA_ARCH_$(shell echo $(ARCH) | tr '[:lower:]' '[:upper:]')
 COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -pthread -O3 -Wall -D$(ARCH_MACRO) --offload-arch=$(ARCH)
-KERNEL_FLAGS = -mllvm -amdgpu-expert-scheduling-mode -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage --no-offload-new-driver -save-temps=obj
+KERNEL_FLAGS = -mllvm -amdgpu-expert-scheduling-mode -mllvm -amdgpu-sched-strategy=coexec -mllvm -amdgpu-anti-hints-for-va-vdst -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage --no-offload-new-driver -save-temps=obj
 
 BUILD = build/$(ARCH)
 OUT   = $(BUILD)/pa_prefill.exe
