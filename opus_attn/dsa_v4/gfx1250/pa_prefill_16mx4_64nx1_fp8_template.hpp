@@ -9,11 +9,17 @@ using opus::operator""_I;
 
 namespace pa_16mx4_64nx1_fp8 {
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wundefined-inline"
-OPUS_D opus::u32x16_t llvm_amdgcn_s_buffer_load_v16i32(opus::u32x4_t rsrc, int offset, int aux)
-    __asm("llvm.amdgcn.s.buffer.load.v16i32");
-#pragma clang diagnostic pop
+OPUS_D opus::u32x16_t s_buffer_load_b512(opus::u32x4_t rsrc, int soffset) {
+    opus::u32x16_t ids;
+    asm volatile("s_buffer_load_b512 %0, %1, %2 offset:0x0 nv"
+                 : "=&s"(ids)
+                 : "s"(rsrc), "s"(soffset));
+    return ids;
+}
+
+OPUS_D void s_wait_kmcnt_for(opus::u32x16_t& ids) {
+    asm volatile("s_wait_kmcnt 0x0" : "+s"(ids));
+}
 
 OPUS_D opus::u32x4_t make_buffer_rsrc_raw(const void* ptr, opus::u32_t num_bytes,
                                           opus::u32_t config = opus::buffer_default_config()) {
@@ -472,7 +478,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
 
     auto load_row_ids = [&](int tile_idx) {
         const int idx_byte_off = (tile_idx * T::KV_TILE_SIZE + wave_gather_row) * (int)sizeof(int);
-        return llvm_amdgcn_s_buffer_load_v16i32(kv_indices_rsrc, idx_byte_off, /*aux=*/0);
+        return s_buffer_load_b512(kv_indices_rsrc, idx_byte_off);
     };
 
     constexpr int nope_lds_step = T::INDICES_PER_TDM * T::K_NOPE_ROW_LDS_BYTES;
@@ -507,7 +513,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
 
     // Gather a tile into the next K slot, then prefetch the row indices of the tile after it.
     auto issue_tile = [&](int tile, auto clamp_tail) {
-        s_wait_kmcnt(0_I);
+        s_wait_kmcnt_for(row_ids);
         const int d = k_step(tdm_slot);
         tdm_k_nope.move(0_I, 0_I, 0_I, 0_I, 0_I, d);
         tdm_k_rope.move(0_I, 0_I, 0_I, 0_I, 0_I, d);
@@ -544,8 +550,6 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
         static_for<T::GEMM0_STAGE_N>([&](auto j) {
             constexpr int slot = j.value ^ SLOT_SWAP;
             constexpr int buf  = j.value & 1;
-            s_wait_dscnt(0_I);
-            __builtin_amdgcn_sched_barrier(0);
 
             auto& scale_k = reinterpret_cast<scale_t&>(v_k_mxscl[buf]);
 
@@ -592,8 +596,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
             constexpr int stage_n = sg.value % T::GEMM1_STAGE_N;
             constexpr int stage_k = sg.value / T::GEMM1_STAGE_N;
             constexpr int buf     = sg.value & 1;
-            s_wait_dscnt(0_I);
-            __builtin_amdgcn_sched_barrier(0);
+
             v_o_stages[stage_n] = mma1(v_p_stages[stage_k], v_v[buf], v_o_stages[stage_n]);
 
             if constexpr (sg.value + 1 < GEMM1_STAGES) {
@@ -633,10 +636,10 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
     };
 
     // Prologue
-    row_ids = load_row_ids(0);
-    s_wait_kmcnt(0_I);
-    issue_kv_tile(row_ids, 0, true_type{});
+    u32x16_t head_ids = load_row_ids(0);
+    s_wait_kmcnt_for(head_ids);
     row_ids = load_row_ids(1);
+    issue_kv_tile(head_ids, 0, true_type{});
     s_wait_tensorcnt(0_I);
     __builtin_amdgcn_s_barrier();
     issue_tile(1, true_type{});
