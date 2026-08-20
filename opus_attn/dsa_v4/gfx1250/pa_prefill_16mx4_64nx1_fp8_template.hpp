@@ -396,6 +396,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
         const int d = v_step(slot);
         static_for<T::GEMM1_STAGE_K>([&](auto i) { s[i.value].ptr += d; });
     };
+    auto tdm_slot_next = [&]() { tdm_slot = (tdm_slot == T::NUM_K_BUFS - 1) ? 0 : tdm_slot + 1; };
 
     auto u_rk_nope  = make_layout_rk_nope<T>(lane_id);
     auto u_rk_rope  = make_layout_rkv_rope<T, T::K_ROPE_ROW_LDS_ELEMS>(lane_id);
@@ -438,75 +439,62 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
 
     const u32x4_t kv_indices_rsrc = make_buffer_rsrc_raw(kv_indices + page_idx_begin, (u32_t)(valid_kv_len * sizeof(int)));
 
-    constexpr tdm_cfg k_nope_gather_cfg{
-        .tile_dim          = { (u32_t)T::D_NOPE_PADDED_SIZE, (u32_t)T::INDICES_PER_TDM },
-        .gather            = true,
-        .gather_index_size = 1,
-        .lds_pad_en        = true,
-        .pad_interval      = 6,
-        .pad_amount        = 3,
-    };
-    constexpr tdm_cfg k_rope_gather_cfg{
-        .tile_dim          = { (u32_t)T::D_ROPE_SIZE, (u32_t)T::INDICES_PER_TDM },
-        .gather            = true,
-        .gather_index_size = 1,
-        .lds_pad_en        = true,
-        .pad_interval      = 4,
-        .pad_amount        = 3,
-    };
+    using k_nope_window = tdm<D_NOPE, seq<T::D_NOPE_PADDED_SIZE, T::INDICES_PER_TDM>,
+                              tdm_traits::gather<32>,
+                              tdm_traits::padding_auto<D_NOPE, T::D_NOPE_PADDED_SIZE>>;
+    using k_rope_window = tdm<D_ROPE, seq<T::D_ROPE_SIZE, T::INDICES_PER_TDM>,
+                              tdm_traits::gather<32>,
+                              tdm_traits::padding_auto<D_ROPE, T::D_ROPE_SIZE>>;
 
     // Wave w gathers tile rows [w * ROWS_PER_WAVE, +ROWS_PER_WAVE), which land in one segment.
     const int wave_gather_row = warp_id * T::ROWS_PER_WAVE;
     const int wave_seg = (wave_gather_row / T::ROWS_PER_SEG) * T::SEG_BYTES;
     const int wave_row = wave_gather_row % T::ROWS_PER_SEG;
 
-    auto tdm_k_nope = make_tdm<D_NOPE, k_nope_gather_cfg>(
-        smem_kv_buf + wave_seg + wave_row * T::K_NOPE_ROW_LDS_BYTES,
+    auto tdm_k_nope = make_tdm<k_nope_window>(
+        (u32_t)reinterpret_cast<uintptr_t>(smem_kv_buf + wave_seg + wave_row * T::K_NOPE_ROW_LDS_BYTES),
         reinterpret_cast<const D_NOPE*>(kv_nope_ptr),
-        /*lds_off=*/ 0,
-        /*td0=*/ T::D_NOPE_PADDED_SIZE,
-        /*td1=*/ kv_rows,
-        /*s0=*/ kargs.stride_kv_nope_page);
+        /*shape0=*/ (u32_t)T::D_NOPE_PADDED_SIZE,
+        /*shape1=*/ (u32_t)kv_rows,
+        /*stride=*/ (u64_t)kargs.stride_kv_nope_page);
 
-    auto tdm_k_rope = make_tdm<D_ROPE, k_rope_gather_cfg>(
-        smem_kv_buf + wave_seg + T::K_NOPE_SEG_BYTES + wave_row * T::K_ROPE_ROW_LDS_BYTES,
+    auto tdm_k_rope = make_tdm<k_rope_window>(
+        (u32_t)reinterpret_cast<uintptr_t>(smem_kv_buf + wave_seg + T::K_NOPE_SEG_BYTES + wave_row * T::K_ROPE_ROW_LDS_BYTES),
         reinterpret_cast<const D_ROPE*>(kv_rope_ptr),
-        /*lds_off=*/ 0,
-        /*td0=*/ T::D_ROPE_SIZE,
-        /*td1=*/ kv_rows,
-        /*s0=*/ kargs.stride_kv_rope_page);
+        /*shape0=*/ (u32_t)T::D_ROPE_SIZE,
+        /*shape1=*/ (u32_t)kv_rows,
+        /*stride=*/ (u64_t)kargs.stride_kv_rope_page);
 
     auto load_row_ids = [&](int tile_idx) {
         const int idx_byte_off = (tile_idx * T::KV_TILE_SIZE + wave_gather_row) * (int)sizeof(int);
         return s_buffer_load_b512(kv_indices_rsrc, idx_byte_off);
     };
 
-    constexpr int nope_lds_step = T::INDICES_PER_TDM * T::K_NOPE_ROW_LDS_BYTES;
-    constexpr int rope_lds_step = T::INDICES_PER_TDM * T::K_ROPE_ROW_LDS_BYTES;
+    constexpr int nope_lds_step  = T::INDICES_PER_TDM * T::K_NOPE_ROW_LDS_ELEMS;
+    constexpr int rope_lds_step  = T::INDICES_PER_TDM * T::K_ROPE_ROW_LDS_ELEMS;
+    constexpr int nope_slot_step = T::K_SLOT_BYTES / (int)sizeof(D_NOPE);
+    constexpr int rope_slot_step = T::K_SLOT_BYTES / (int)sizeof(D_ROPE);
 
     auto issue_kv_tile = [&](const u32x16_t& ids, int tile_idx, auto clamp_tail) {
         [[maybe_unused]] const int wave_valid = valid_kv_len - (tile_idx * T::KV_TILE_SIZE + wave_gather_row);
 
+        const u32_t nope_slot = u32_t(tdm_slot * nope_slot_step);
+        const u32_t rope_slot = u32_t(tdm_slot * rope_slot_step);
+
         static_for<T::TDM_LOADS_PER_WAVE>([&](auto d) {
             constexpr int ld = d.value;
+            u32_t idx[T::INDICES_PER_TDM];
             static_for<T::INDICES_PER_TDM>([&](auto r) {
                 constexpr int slot = ld * T::INDICES_PER_TDM + r.value;
                 u32_t id = ids[slot];
                 if constexpr (decltype(clamp_tail)::value) id = slot < wave_valid ? id : (u32_t)kv_rows;
-                id = __builtin_amdgcn_readfirstlane(id);
-                tdm_k_nope.set_gather_row_index(r.value, id);
-                tdm_k_rope.set_gather_row_index(r.value, id);
+                idx[r.value] = __builtin_amdgcn_readfirstlane(id);
             });
-            tdm_k_nope.load();
-            tdm_k_rope.load();
-            if constexpr (ld + 1 < T::TDM_LOADS_PER_WAVE) {
-                tdm_k_nope.move(0_I, 0_I, 0_I, 0_I, 0_I, number<nope_lds_step>{});
-                tdm_k_rope.move(0_I, 0_I, 0_I, 0_I, 0_I, number<rope_lds_step>{});
-            }
+            tdm_k_nope.set_indices(idx, T::INDICES_PER_TDM);
+            tdm_k_rope.set_indices(idx, T::INDICES_PER_TDM);
+            tdm_k_nope.async_load(nope_slot + u32_t(ld * nope_lds_step));
+            tdm_k_rope.async_load(rope_slot + u32_t(ld * rope_lds_step));
         });
-        // Rewind the LDS window so the next tile starts at this wave's first row again.
-        tdm_k_nope.move(0_I, 0_I, 0_I, 0_I, 0_I, number<-(T::TDM_LOADS_PER_WAVE - 1) * nope_lds_step>{});
-        tdm_k_rope.move(0_I, 0_I, 0_I, 0_I, 0_I, number<-(T::TDM_LOADS_PER_WAVE - 1) * rope_lds_step>{});
     };
 
     u32x16_t row_ids;
@@ -514,9 +502,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
     // Gather a tile into the next K slot, then prefetch the row indices of the tile after it.
     auto issue_tile = [&](int tile, auto clamp_tail) {
         s_wait_kmcnt_for(row_ids);
-        const int d = k_step(tdm_slot);
-        tdm_k_nope.move(0_I, 0_I, 0_I, 0_I, 0_I, d);
-        tdm_k_rope.move(0_I, 0_I, 0_I, 0_I, 0_I, d);
+        tdm_slot_next();
         issue_kv_tile(row_ids, tile, clamp_tail);
         row_ids = load_row_ids(tile + 1);
     };
