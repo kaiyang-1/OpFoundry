@@ -31,69 +31,7 @@ OPUS_D opus::u32x4_t make_buffer_rsrc_raw(const void* ptr, opus::u32_t num_bytes
 }
 
 template<class T>
-__device__ inline auto make_layout_q_nope(int warp_id, int lane_id, int stride_q_nope_h) {
-    constexpr auto q_block_shape = opus::make_tuple(
-        opus::number<T::GEMM0_E_M>{},
-        opus::number<T::T_M>{},
-        opus::number<T::W_M>{},
-        opus::number<T::D_NOPE_PADDED_SIZE / T::W_K_NOPE>{},
-        opus::number<T::W_M * T::W_K_NOPE / (T::WARP_SIZE * T::VEC_NOPE)>{},
-        opus::number<T::WARP_SIZE / T::W_M>{},
-        opus::number<T::VEC_NOPE>{});
-
-    constexpr auto q_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
-
-    return opus::make_layout(
-        q_block_shape,
-        opus::unfold_x_stride(q_block_dim, q_block_shape, opus::tuple{stride_q_nope_h, 1_I}),
-        opus::unfold_p_coord(q_block_dim, opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
-}
-
-template<class T>
-__device__ inline auto make_layout_q_rope(int warp_id, int lane_id, int stride_q_rope_h) {
-    constexpr auto q_block_shape = opus::make_tuple(
-        opus::number<T::GEMM0_E_M>{},
-        opus::number<T::T_M>{},
-        opus::number<T::W_M>{},
-        opus::number<T::D_ROPE_SIZE / T::W_K_ROPE>{},
-        opus::number<T::W_M * T::W_K_ROPE / (T::WARP_SIZE * T::VEC_ROPE)>{},
-        opus::number<T::WARP_SIZE / T::W_M>{},
-        opus::number<T::VEC_ROPE>{});
-
-    constexpr auto q_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
-
-    return opus::make_layout(
-        q_block_shape,
-        opus::unfold_x_stride(q_block_dim, q_block_shape, opus::tuple{stride_q_rope_h, 1_I}),
-        opus::unfold_p_coord(q_block_dim, opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
-}
-
-template<class T>
-__device__ inline auto make_layout_q_mxscl(int warp_id, int lane_id, int stride_q_nope_h) {
-    constexpr auto q_block_shape = opus::make_tuple(
-        opus::number<T::GEMM0_E_M>{},
-        opus::number<T::T_M>{},
-        opus::number<T::W_M>{},
-        opus::number<T::W_M * T::D_NOPE_PADDED_SIZE / T::MXSCL_BLOCK_SIZE / (T::WARP_SIZE * T::VEC_MXSCL)>{},
-        opus::number<T::WARP_SIZE / T::W_M>{},
-        opus::number<T::VEC_MXSCL>{});
-
-    constexpr auto q_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
-
-    return opus::make_layout(
-        q_block_shape,
-        opus::unfold_x_stride(q_block_dim, q_block_shape, opus::tuple{stride_q_nope_h, 1_I}),
-        opus::unfold_p_coord(q_block_dim, opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
-}
-
-template<class T>
-__device__ inline auto make_layout_rk_nope(int lane_id) {
+__device__ inline auto make_layout_qk_nope(int lane_id) {
     constexpr auto k_block_shape = opus::make_tuple(
         opus::number<T::GEMM0_E_N>{},
         opus::number<T::W_N>{},
@@ -113,7 +51,7 @@ __device__ inline auto make_layout_rk_nope(int lane_id) {
 }
 
 template<class T, int RowLdsElems>
-__device__ inline auto make_layout_rkv_rope(int lane_id) {
+__device__ inline auto make_layout_kv_rope(int lane_id) {
     constexpr auto k_block_shape = opus::make_tuple(
         opus::number<T::GEMM0_E_N>{},
         opus::number<T::W_N>{},
@@ -133,7 +71,7 @@ __device__ inline auto make_layout_rkv_rope(int lane_id) {
 }
 
 template<class T>
-__device__ inline auto make_layout_rk_mxscl(int lane_id) {
+__device__ inline auto make_layout_qk_mxscl(int lane_id) {
     constexpr auto k_block_shape = opus::make_tuple(
         opus::number<T::GEMM0_E_N>{},
         opus::number<T::W_N>{},
@@ -152,7 +90,7 @@ __device__ inline auto make_layout_rk_mxscl(int lane_id) {
 }
 
 template<class T>
-__device__ inline auto make_layout_rv_nope(int lane_id) {
+__device__ inline auto make_layout_v_nope(int lane_id) {
     constexpr auto v_block_shape = opus::make_tuple(
         opus::number<T::GEMM0_E_N>{},
         opus::number<T::W_N>{},
@@ -171,7 +109,7 @@ __device__ inline auto make_layout_rv_nope(int lane_id) {
 }
 
 template<class T>
-__device__ inline auto make_layout_rv(int lane_id) {
+__device__ inline auto make_layout_v(int lane_id) {
     constexpr int lane_per_grp = 16;
     constexpr int lane_n = 2;
     constexpr int lane_k = lane_per_grp / lane_n;
@@ -199,12 +137,11 @@ __device__ inline auto make_layout_rv(int lane_id) {
 }
 
 template<class T>
-__device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h) {
+__device__ inline auto make_layout_o(int lane_id) {
     constexpr int dwordx32_rpt = 4 * 32 / sizeof(typename T::D_OUT) / T::VEC_O;
 
     constexpr auto o_block_shape = opus::make_tuple(
         opus::number<T::GEMM1_E_M>{},
-        opus::number<T::T_M>{},
         opus::number<T::W_M>{},
         opus::number<T::GEMM1_STAGE_N>{},
         opus::number<T::GEMM1_E_N / dwordx32_rpt>{},
@@ -213,13 +150,13 @@ __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h) {
         opus::number<T::VEC_O>{});
 
     constexpr auto o_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
         opus::make_tuple(opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::y_dim{}));
 
     return opus::make_layout(
         o_block_shape,
-        opus::unfold_x_stride(o_block_dim, o_block_shape, opus::tuple{stride_o_h, 1_I}),
-        opus::unfold_p_coord(o_block_dim, opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
+        opus::unfold_x_stride(o_block_dim, o_block_shape, opus::tuple{opus::number<T::O_ROW_LDS_ELEMS>{}, 1_I}),
+        opus::unfold_p_coord(o_block_dim, opus::tuple{lane_id % T::W_M, lane_id / T::W_M}));
 }
 
 template<class T, class V>
@@ -398,12 +335,12 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
     };
     auto tdm_slot_next = [&]() { tdm_slot = (tdm_slot == T::NUM_K_BUFS - 1) ? 0 : tdm_slot + 1; };
 
-    auto u_rk_nope  = make_layout_rk_nope<T>(lane_id);
-    auto u_rk_rope  = make_layout_rkv_rope<T, T::K_ROPE_ROW_LDS_ELEMS>(lane_id);
-    auto u_rk_mxscl = make_layout_rk_mxscl<T>(lane_id);
-    auto u_rv_nope  = make_layout_rv_nope<T>(lane_id) + number<OWN_V_ROW>{};
-    auto u_rv_rope  = make_layout_rkv_rope<T, T::V_ROW_LDS_ELEMS>(lane_id);
-    auto u_rv       = make_layout_rv<T>(lane_id);
+    auto u_rk_nope  = make_layout_qk_nope<T>(lane_id);
+    auto u_rk_rope  = make_layout_kv_rope<T, T::K_ROPE_ROW_LDS_ELEMS>(lane_id);
+    auto u_rk_mxscl = make_layout_qk_mxscl<T>(lane_id);
+    auto u_rv_nope  = make_layout_v_nope<T>(lane_id) + number<OWN_V_ROW>{};
+    auto u_rv_rope  = make_layout_kv_rope<T, T::V_ROW_LDS_ELEMS>(lane_id);
+    auto u_rv       = make_layout_v<T>(lane_id);
 
     auto mma0_nope = make_tiled_mma<D_NOPE, D_NOPE, D_ACC>(
         seq<T::GEMM0_E_N, T::GEMM0_E_M, T::GEMM0_NOPE_E_K>{},
@@ -698,25 +635,47 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     const int h_block_start = h_block_idx * T::NUM_WARPS * T::Q_TILE_SIZE;
-    const int64_t q_nope_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_q_nope_n + static_cast<int64_t>(h_block_start) * kargs.stride_q_nope_h;
-    const int64_t q_rope_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_q_rope_n + static_cast<int64_t>(h_block_start) * kargs.stride_q_rope_h;
+    const u32_t qo_head_origin = (u32_t)(h_block_start + warp_id * T::Q_TILE_SIZE);
 
-    auto g_q_nope = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.q_nope_ptr) + q_nope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_nope_h * sizeof(D_NOPE));
-    auto g_q_rope = make_gmem(reinterpret_cast<const D_ROPE*>(kargs.q_rope_ptr) + q_rope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_rope_h * sizeof(D_ROPE));
+    __shared__ char smem_buf[T::smem_size_bytes()];
+    char* const qo_seg = smem_buf + warp_id * T::QO_SEG_BYTES;
 
-    auto u_q_nope  = make_layout_q_nope<T>(warp_id, lane_id, kargs.stride_q_nope_h);
-    auto u_q_mxscl = make_layout_q_mxscl<T>(warp_id, lane_id, kargs.stride_q_nope_h);
-    auto u_q_rope  = make_layout_q_rope<T>(warp_id, lane_id, kargs.stride_q_rope_h);
+    using q_nope_window = tdm<D_NOPE, seq<T::D_NOPE_PADDED_SIZE, T::Q_TILE_SIZE>,
+                              tdm_traits::padding_auto<D_NOPE, T::D_NOPE_PADDED_SIZE>>;
+    using q_rope_window = tdm<D_ROPE, seq<T::D_ROPE_SIZE, T::Q_TILE_SIZE>,
+                              tdm_traits::padding_auto<D_ROPE, T::D_ROPE_SIZE>>;
 
-    auto v_q_nope  = load<T::VEC_NOPE>(g_q_nope, u_q_nope);
-    auto v_q_mxscl = load<T::VEC_MXSCL>(g_q_nope, u_q_mxscl + T::D_NOPE_SIZE);
-    auto v_q_rope  = load<T::VEC_ROPE>(g_q_rope, u_q_rope);
-    s_wait_loadcnt(0_I);
+    auto tdm_q_nope = make_tdm<q_nope_window>(
+        (u32_t)reinterpret_cast<uintptr_t>(qo_seg),
+        reinterpret_cast<const D_NOPE*>(kargs.q_nope_ptr) + (int64_t)q_token_idx * kargs.stride_q_nope_n,
+        /*shape0=*/ (u32_t)T::D_NOPE_PADDED_SIZE,
+        /*shape1=*/ (u32_t)kargs.H,
+        /*stride=*/ (u64_t)kargs.stride_q_nope_h,
+        /*origin0=*/ 0u,
+        /*origin1=*/ qo_head_origin);
+    auto tdm_q_rope = make_tdm<q_rope_window>(
+        (u32_t)reinterpret_cast<uintptr_t>(qo_seg + T::Q_ROPE_SEG_OFF),
+        reinterpret_cast<const D_ROPE*>(kargs.q_rope_ptr) + (int64_t)q_token_idx * kargs.stride_q_rope_n,
+        /*shape0=*/ (u32_t)T::D_ROPE_SIZE,
+        /*shape1=*/ (u32_t)kargs.H,
+        /*stride=*/ (u64_t)kargs.stride_q_rope_h,
+        /*origin0=*/ 0u,
+        /*origin1=*/ qo_head_origin);
+    tdm_q_nope.async_load();
+    tdm_q_rope.async_load();
+
+    auto s_q_nope = make_smem(reinterpret_cast<D_NOPE*>(qo_seg));
+    auto s_q_rope = make_smem(reinterpret_cast<D_ROPE*>(qo_seg + T::Q_ROPE_SEG_OFF));
+
+    s_wait_tensorcnt(0_I);
+    auto v_q_nope  = load<T::VEC_NOPE>(s_q_nope, make_layout_qk_nope<T>(lane_id));
+    auto v_q_mxscl = load<T::VEC_MXSCL>(s_q_nope, make_layout_qk_mxscl<T>(lane_id) + T::D_NOPE_SIZE);
+    auto v_q_rope  = load<T::VEC_ROPE>(s_q_rope, make_layout_kv_rope<T, T::K_ROPE_ROW_LDS_ELEMS>(lane_id));
+    s_wait_dscnt(0_I);
+    __builtin_amdgcn_s_barrier();
 
     zero_nope_pad<T>(v_q_nope);
     zero_mxscl_pad<T>(v_q_mxscl, lane_id >= T::W_M);
-
-    __shared__ char smem_kv_buf[T::smem_size_bytes()];
 
     constexpr D_ACC LOG2_E = 1.44269504089f;
     const D_ACC temperature_scale = kargs.softmax_scale * LOG2_E;
@@ -742,7 +701,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
             const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
             pa_prefill_accum_pipelined<Traits, SLOT_SWAP>(kargs, nope_ptr, rope_ptr, kv_rows,
                                                           kv_indices, page_idx_begin, valid_kv_len, num_kv_tiles,
-                                                          smem_kv_buf, v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row, temperature_scale);
+                                                          smem_buf, v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row, temperature_scale);
         }
     };
     if (warp_id >> 1) run_kv_segments(number<1>{});
@@ -759,8 +718,27 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
     scale_output_tile<T>(v_o, o_scale);
 
     using D_OUT = typename T::D_OUT;
-    const int64_t o_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_o_n + static_cast<int64_t>(h_block_start) * kargs.stride_o_h;
-    auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
-    auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_o_h);
-    store<T::VEC_O>(g_o, cast<D_OUT>(v_o), u_o);
+    {
+        using o_window = tdm<D_OUT, seq<T::O_ROW_LDS_ELEMS, T::Q_TILE_SIZE>>;
+
+        s_wait_tensorcnt(0_I);
+        s_wait_dscnt(0_I);
+        __builtin_amdgcn_s_barrier();
+
+        auto s_o = make_smem(reinterpret_cast<D_OUT*>(qo_seg));
+        store<T::VEC_O>(s_o, cast<D_OUT>(v_o), make_layout_o<T>(lane_id));
+
+        auto tdm_o = make_tdm<o_window>(
+            (u32_t)reinterpret_cast<uintptr_t>(qo_seg),
+            reinterpret_cast<D_OUT*>(kargs.out_ptr) + (int64_t)q_token_idx * kargs.stride_o_n,
+            /*shape0=*/ (u32_t)T::D_HEAD_SIZE,
+            /*shape1=*/ (u32_t)kargs.H,
+            /*stride=*/ (u64_t)kargs.stride_o_h,
+            /*origin0=*/ 0u,
+            /*origin1=*/ qo_head_origin);
+
+        s_wait_dscnt(0_I);
+        tdm_o.async_store();
+        s_wait_tensorcnt(0_I);
+    }
 }

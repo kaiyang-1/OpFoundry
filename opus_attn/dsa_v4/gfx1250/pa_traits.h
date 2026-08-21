@@ -70,8 +70,14 @@ struct pa_16mx4_64nx1_traits {
     static constexpr int SEG_BYTES          = 160 * 1024;
     static constexpr int KV_BUF_BYTES       = ROWS_PER_SEG * KV_ROW_LDS_BYTES;       // slot stride
     static constexpr int NUM_KV_BUFS        = 4;                                     // QK(t) gathers t+2, so t-1, t, t+1, t+2 coexist
+    static constexpr int KV_STAGE_BYTES     = SEG_BYTES + NUM_KV_BUFS * KV_BUF_BYTES;
 
-    static constexpr size_t smem_size_bytes() { return (size_t)SEG_BYTES + NUM_KV_BUFS * KV_BUF_BYTES; }
+    static constexpr int Q_ROW_LDS_ELEMS    = D_TILE_SIZE + 16 / sizeof(D_ATTN);
+    static constexpr int O_ROW_LDS_ELEMS    = D_TILE_SIZE + 16 / sizeof(D_OUT);
+    static constexpr int QO_SEG_BYTES       = 64 * 1024;
+    static constexpr int QO_STAGE_BYTES     = NUM_WARPS * QO_SEG_BYTES;
+
+    static constexpr size_t smem_size_bytes() { return (size_t)(KV_STAGE_BYTES > QO_STAGE_BYTES ? KV_STAGE_BYTES : QO_STAGE_BYTES); }
 };
 
 template<int Q_TILE_SIZE_ = 16,
@@ -164,6 +170,12 @@ struct pa_16mx4_64nx1_fp8_traits {
 
     static constexpr int SEG_USED_BYTES = V_REGION_OFF + NUM_V_BUFS * V_SLOT_BYTES;
     static_assert(SEG_USED_BYTES <= SEG_BYTES, "a segment's rows must not reach into the next segment");
+    static constexpr int KV_STAGE_BYTES = (SEGS_PER_TILE - 1) * SEG_BYTES + SEG_USED_BYTES;
 
-    static constexpr size_t smem_size_bytes() { return (size_t)(SEGS_PER_TILE - 1) * SEG_BYTES + SEG_USED_BYTES; }
+    static constexpr int O_ROW_LDS_ELEMS = D_HEAD_SIZE + 16 / sizeof(D_OUT);
+    static constexpr int Q_ROPE_SEG_OFF  = 32 * 1024;
+    static constexpr int QO_SEG_BYTES    = 64 * 1024;
+    static constexpr int QO_STAGE_BYTES  = NUM_WARPS * QO_SEG_BYTES;
+
+    static constexpr size_t smem_size_bytes() { return (size_t)(KV_STAGE_BYTES > QO_STAGE_BYTES ? KV_STAGE_BYTES : QO_STAGE_BYTES); }
 };
