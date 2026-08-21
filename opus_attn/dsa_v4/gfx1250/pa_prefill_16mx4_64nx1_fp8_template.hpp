@@ -308,32 +308,26 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
     };
     const int v_seg_off = (seg_base_rows / T::ROWS_PER_SEG) * T::SEG_BYTES;
     smem<D_ROPE> s_vw[T::GEMM1_STAGE_K] = {
-        make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + T::V_REGION_OFF + v_seg_off)),
-        make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + T::V_REGION_OFF + (T::SEG_BYTES - v_seg_off))),
+        make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + T::K_SLOT_BYTES + v_seg_off)),
+        make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + T::K_SLOT_BYTES + (T::SEG_BYTES - v_seg_off))),
     };
     smem<D_ROPE> s_vr[T::GEMM1_STAGE_K] = { s_vw[0], s_vw[1] };
     constexpr int OWN_V_ROW = (1 ^ SLOT_SWAP) * T::W_N * T::V_ROW_LDS_ELEMS;
 
     int k_slot = 0, tdm_slot = 0, vw_slot = 0, vr_slot = 0;
-    auto k_step = [](int& s) {
-        const bool wrap = (s == T::NUM_K_BUFS - 1);
-        s = wrap ? 0 : s + 1;
-        return wrap ? -(T::NUM_K_BUFS - 1) * T::K_SLOT_BYTES : T::K_SLOT_BYTES;
-    };
-    auto v_step = [](int& s) {
-        const bool wrap = (s == T::NUM_V_BUFS - 1);
-        s = wrap ? 0 : s + 1;
-        return wrap ? -(T::NUM_V_BUFS - 1) * T::V_SLOT_BYTES : T::V_SLOT_BYTES;
-    };
     auto advance_k = [&]() {
-        const int d = k_step(k_slot);
+        const bool wrap = (k_slot == T::NUM_KV_BUFS - 1);
+        const int  d    = wrap ? -(T::NUM_KV_BUFS - 1) * T::KV_BUF_BYTES : T::KV_BUF_BYTES;
+        k_slot = wrap ? 0 : k_slot + 1;
         static_for<T::GEMM0_STAGE_N>([&](auto i) { s_k_nope[i.value].ptr += d; s_k_rope[i.value].ptr += d; });
     };
     auto advance_v = [&](auto& s, int& slot) {
-        const int d = v_step(slot);
+        const bool wrap = (slot == T::NUM_KV_BUFS - 1);
+        const int  d    = wrap ? -(T::NUM_KV_BUFS - 1) * T::KV_BUF_BYTES : T::KV_BUF_BYTES;
+        slot = wrap ? 0 : slot + 1;
         static_for<T::GEMM1_STAGE_K>([&](auto i) { s[i.value].ptr += d; });
     };
-    auto tdm_slot_next = [&]() { tdm_slot = (tdm_slot == T::NUM_K_BUFS - 1) ? 0 : tdm_slot + 1; };
+    auto tdm_slot_next = [&]() { tdm_slot = (tdm_slot + 1) % T::NUM_KV_BUFS; };
 
     auto u_rk_nope  = make_layout_qk_nope<T>(lane_id);
     auto u_rk_rope  = make_layout_kv_rope<T, T::K_ROPE_ROW_LDS_ELEMS>(lane_id);
@@ -409,8 +403,8 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
 
     constexpr int nope_lds_step  = T::INDICES_PER_TDM * T::K_NOPE_ROW_LDS_ELEMS;
     constexpr int rope_lds_step  = T::INDICES_PER_TDM * T::K_ROPE_ROW_LDS_ELEMS;
-    constexpr int nope_slot_step = T::K_SLOT_BYTES / (int)sizeof(D_NOPE);
-    constexpr int rope_slot_step = T::K_SLOT_BYTES / (int)sizeof(D_ROPE);
+    constexpr int nope_slot_step = T::KV_BUF_BYTES / (int)sizeof(D_NOPE);
+    constexpr int rope_slot_step = T::KV_BUF_BYTES / (int)sizeof(D_ROPE);
 
     auto issue_kv_tile = [&](const u32x16_t& ids, int tile_idx, auto clamp_tail) {
         [[maybe_unused]] const int wave_valid = valid_kv_len - (tile_idx * T::KV_TILE_SIZE + wave_gather_row);

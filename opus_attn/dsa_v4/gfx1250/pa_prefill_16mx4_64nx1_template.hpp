@@ -234,17 +234,13 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
     constexpr int RING_BYTES = T::NUM_KV_BUFS * T::KV_BUF_BYTES;
     int qk_off = 0, pv_off = 0, tdm_slot = 0;
 
-    auto slot_step = [](int& off) {
-        const int prev = off;
-        const int next = off + SLOT_BYTES;
-        off = (next == RING_BYTES) ? 0 : next;
-        return off - prev;
-    };
     auto advance = [&](auto& s, int& off) {
-        const int delta = slot_step(off);
+        const int next  = (off + SLOT_BYTES == RING_BYTES) ? 0 : off + SLOT_BYTES;
+        const int delta = next - off;
+        off = next;
         static_for<T::SEGS_PER_BUF>([&](auto i) { s[i.value].ptr += delta; });
     };
-    auto tdm_slot_next = [&]() { tdm_slot = (tdm_slot == T::NUM_KV_BUFS - 1) ? 0 : tdm_slot + 1; };
+    auto tdm_slot_next = [&]() { tdm_slot = (tdm_slot + 1) % T::NUM_KV_BUFS; };
 
     const u32x4_t kv_indices_rsrc = make_buffer_rsrc_raw(kv_indices + page_idx_begin, (u32_t)(valid_kv_len * sizeof(int)));
 
