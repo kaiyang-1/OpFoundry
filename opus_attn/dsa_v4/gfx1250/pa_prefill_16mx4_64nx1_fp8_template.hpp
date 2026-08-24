@@ -396,6 +396,12 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
         /*shape1=*/ (u32_t)kv_rows,
         /*stride=*/ (u64_t)kargs.stride_kv_rope_page);
 
+    if constexpr (T::CLUSTER_Y > 1) {
+        const auto peers = tdm_traits::peers_along_y<1, T::CLUSTER_Y>();
+        tdm_k_nope.set_workgroup_mask(peers);
+        tdm_k_rope.set_workgroup_mask(peers);
+    }
+
     auto load_row_ids = [&](int tile_idx) {
         const int idx_byte_off = (tile_idx * T::KV_TILE_SIZE + wave_gather_row) * (int)sizeof(int);
         return s_buffer_load_b512(kv_indices_rsrc, idx_byte_off);

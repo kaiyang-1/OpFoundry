@@ -256,6 +256,10 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_kar
                                       /*shape1=*/ (u32_t)kv_rows,
                                       /*stride=*/ (u64_t)kargs.stride_kv_page);
 
+    if constexpr (T::CLUSTER_Y > 1) {
+        tdm_kv.set_workgroup_mask(tdm_traits::peers_along_y<1, T::CLUSTER_Y>());
+    }
+
     auto mma0 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
         seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_E_K>{},
         seq<T::T_M, T::T_N, T::T_K>{},

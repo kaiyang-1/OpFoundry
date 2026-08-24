@@ -7,6 +7,7 @@ template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
          int D_TILE_SIZE_ = 512,
          int NUM_WARPS_ = 4,
+         int CLUSTER_Y_ = 1,
          typename D_ATTN_ = bf16_t,
          typename D_OUT_ = bf16_t>
 struct pa_16mx4_64nx1_traits {
@@ -15,9 +16,10 @@ struct pa_16mx4_64nx1_traits {
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
     static constexpr int D_HEAD_SIZE = D_TILE_SIZE;
     static constexpr int NUM_WARPS = NUM_WARPS_;
-
+    
     static constexpr int WARP_SIZE = 32;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+    static constexpr int CLUSTER_Y = CLUSTER_Y_;
 
     using D_ATTN = D_ATTN_;
     using D_OUT  = D_OUT_;
@@ -83,6 +85,7 @@ struct pa_16mx4_64nx1_traits {
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
          int NUM_WARPS_ = 4,
+         int CLUSTER_Y_ = 1,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
          typename D_OUT_ = bf16_t>
@@ -93,6 +96,7 @@ struct pa_16mx4_64nx1_fp8_traits {
 
     static constexpr int WARP_SIZE = 32;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+    static constexpr int CLUSTER_Y = CLUSTER_Y_;
     static constexpr int MXSCL_BLOCK_SIZE = 32;
 
     // Packed DSA hdim split
