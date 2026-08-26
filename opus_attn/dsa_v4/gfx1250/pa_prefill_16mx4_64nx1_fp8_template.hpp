@@ -337,13 +337,15 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
     auto u_rv       = make_layout_v<T>(lane_id);
 
     auto mma0_nope = make_tiled_mma<D_NOPE, D_NOPE, D_ACC>(
-        seq<T::GEMM0_E_N, T::GEMM0_E_M, T::GEMM0_NOPE_E_K>{},
-        seq<T::T_N, T::T_M, T::T_K>{},
-        seq<T::W_M, T::W_N, T::W_K_NOPE>{});
+        seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_NOPE_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K_NOPE>{},
+        wmma_adaptor_swap_ab{});
     auto mma0_rope = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
-        seq<T::GEMM0_E_N, T::GEMM0_E_M, T::GEMM0_ROPE_E_K>{},
-        seq<T::T_N, T::T_M, T::T_K>{},
-        seq<T::W_M, T::W_N, T::W_K_ROPE>{});
+        seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_ROPE_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K_ROPE>{},
+        wmma_adaptor_swap_ab{});
     auto mma1 = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
         seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
         seq<T::T_M, T::T_N, T::T_K>{},
@@ -480,10 +482,10 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
             static_for<T::GEMM0_NOPE_E_K>([&](auto ek) {
                 constexpr int sel = ek.value % 2;
                 constexpr int dw  = ek.value / 2;
-                v_s_stages[slot] = mma0_nope.step_k(ek, v_k_nope[buf], v_q_nope, v_s_stages[slot],
-                                                    scale_k[dw], scale_q[dw], number<sel>{}, number<sel>{});
+                v_s_stages[slot] = mma0_nope.step_k(ek, v_q_nope, v_k_nope[buf], v_s_stages[slot],
+                                                    scale_q[dw], scale_k[dw], number<sel>{}, number<sel>{});
             });
-            v_s_stages[slot] = mma0_rope(v_k_rope[buf], v_q_rope, v_s_stages[slot]);
+            v_s_stages[slot] = mma0_rope(v_q_rope, v_k_rope[buf], v_s_stages[slot]);
 
             if constexpr (j.value + 1 < T::GEMM0_STAGE_N) {
                 load_k(number<j.value + 1>{}, number<(j.value + 1) & 1>{});
