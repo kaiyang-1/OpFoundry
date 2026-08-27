@@ -13,11 +13,11 @@
 #include <cmath>
 #include <cassert>
 #include <type_traits>
-#include <omp.h>
+#include "common/pa_parallel.h"
 
-#include "pa_defs.h"
+#if defined(PA_ARCH_GFX950)
+#include "gfx950/pa_traits.h"
 
-// Declared in per-variant/per-dtype kernel instantiation TUs.
 template<class Traits>
 __global__ void pa_prefill_16mx1_16nx4_kernel(pa_kargs kargs);
 template<class Traits>
@@ -49,6 +49,69 @@ inline void pa_launch(pa_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>,
     pa_prefill_16mx8_32nx1_fp8_kernel<pa_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 
+#elif defined(PA_ARCH_GFX1250)
+#include "gfx1250/pa_traits.h"
+
+template<class Traits>
+__global__ void pa_prefill_16mx4_64nx1_kernel(pa_kargs kargs);
+template<class Traits>
+__global__ void pa_prefill_16mx4_64nx1_fp8_kernel(pa_fp8_kargs kargs);
+
+constexpr int pa_max_cluster_y = 2;
+
+inline int pa_pick_cluster_y(int num_h_blocks) {
+    for (int c = pa_max_cluster_y; c > 1; c >>= 1)
+        if (num_h_blocks % c == 0) return c;
+    return 1;
+}
+
+template<int CY, class Kernel, class KArgs>
+inline void pa_launch_clustered(Kernel kernel, const KArgs& kargs, dim3 grid, dim3 block) {
+    if constexpr (CY == 1) {
+        kernel<<<grid, block>>>(kargs);
+    } else {
+        if (grid.y % CY != 0) {
+            fprintf(stderr, "CLUSTER_Y=%d does not divide grid.y=%u; refusing to launch a masked gather\n",
+                    CY, grid.y);
+            exit(1);
+        }
+        hipLaunchAttribute attr{};
+        attr.id = hipLaunchAttributeClusterDimension;
+        attr.val.clusterDim.x = 1;
+        attr.val.clusterDim.y = CY;
+        attr.val.clusterDim.z = 1;
+
+        hipLaunchConfig_t cfg{};
+        cfg.gridDim          = grid;
+        cfg.blockDim         = block;
+        cfg.dynamicSmemBytes = 0;
+        cfg.stream           = nullptr;
+        cfg.attrs            = &attr;
+        cfg.numAttrs         = 1;
+        hipError_t e = hipLaunchKernelEx(&cfg, kernel, kargs);
+        if (e != hipSuccess) {
+            fprintf(stderr, "cluster launch (1,%d,1) failed: %s\n", CY, hipGetErrorString(e));
+            exit(1);
+        }
+    }
+}
+
+template<int Q, int KV, int D, int NW, int CY, class DT, class DO>
+inline void pa_launch(pa_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>,
+                      const pa_kargs& kargs, dim3 grid, dim3 block) {
+    using Traits = pa_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>;
+    pa_launch_clustered<CY>(pa_prefill_16mx4_64nx1_kernel<Traits>, kargs, grid, block);
+}
+template<int Q, int KV, int NW, int CY, class NOPE, class ROPE, class DO>
+inline void pa_launch(pa_16mx4_64nx1_fp8_traits<Q, KV, NW, CY, NOPE, ROPE, DO>,
+                      const pa_fp8_kargs& kargs, dim3 grid, dim3 block) {
+    using Traits = pa_16mx4_64nx1_fp8_traits<Q, KV, NW, CY, NOPE, ROPE, DO>;
+    pa_launch_clustered<CY>(pa_prefill_16mx4_64nx1_fp8_kernel<Traits>, kargs, grid, block);
+}
+#else
+#  error "No target arch defined. The Makefile passes PA_ARCH_<ARCH> from ARCH (e.g. ARCH=gfx950)."
+#endif
+
 #define CHECK_HIP(call)                                                                                   \
     do {                                                                                                  \
         hipError_t status_ = call;                                                                        \
@@ -63,16 +126,14 @@ inline void pa_launch(pa_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>,
 // Fill a contiguous vector with random values
 template<typename T>
 void rand_vector(T* ptr, size_t size, float min_val = 0.0f, float max_val = 1.0f) {
-    #pragma omp parallel
-    {
+    pa::parallel_chunks(size, pa::default_grain(size), [&](size_t begin, size_t end, unsigned) {
         std::random_device rd;
-        std::mt19937 gen(rd() + omp_get_thread_num());
+        std::mt19937 gen(rd() + static_cast<uint32_t>(begin));
         std::uniform_real_distribution<float> dis(min_val, max_val);
-        #pragma omp for
-        for (size_t i = 0; i < size; i++) {
+        for (size_t i = begin; i < end; i++) {
             ptr[i] = static_cast<T>(dis(gen));
         }
-    }
+    });
 }
 
 // Initialize the split DSA fp8 streams. The NoPE stream packs, per row of
@@ -88,14 +149,12 @@ void init_fp8_dsa_split(typename PATraits::D_NOPE* nope_ptr,
     constexpr int ROPE        = PATraits::D_ROPE_SIZE;         // RoPE bf16 elements (64)
     static_assert(NOPE + SCALE <= NOPE_PADDED, "NoPE + scales exceed padded row");
 
-    #pragma omp parallel
-    {
+    pa::parallel_chunks(rows, pa::default_grain(rows), [&](size_t begin, size_t end, unsigned) {
         std::random_device rd;
-        std::mt19937 gen(rd() + omp_get_thread_num());
+        std::mt19937 gen(rd() + static_cast<uint32_t>(begin));
         std::uniform_real_distribution<float> dis(-2.0f, 2.0f);
         std::uniform_real_distribution<float> scale_dis(-4.0f, 4.0f);
-        #pragma omp for
-        for (size_t r = 0; r < rows; r++) {
+        for (size_t r = begin; r < end; r++) {
             unsigned char* nbase = reinterpret_cast<unsigned char*>(nope_ptr) + r * NOPE_PADDED;
             auto* nope = reinterpret_cast<__hip_fp8_e4m3*>(nbase);
             for (int i = 0; i < NOPE; i++) nope[i] = static_cast<__hip_fp8_e4m3>(dis(gen));
@@ -109,7 +168,7 @@ void init_fp8_dsa_split(typename PATraits::D_NOPE* nope_ptr,
             D_ROPE* rope = rope_ptr + r * ROPE;
             for (int i = 0; i < ROPE; i++) rope[i] = static_cast<D_ROPE>(dis(gen));
         }
-    }
+    });
 }
 
 void init_sparse_kv_indices(std::vector<int>& kv_indptr,
@@ -154,7 +213,9 @@ void init_sparse_kv_indices(std::vector<int>& kv_indptr,
         }
 
         std::shuffle(pages.begin(), pages.end(), gen);
+        const size_t seg_begin = kv_indices.size();
         kv_indices.insert(kv_indices.end(), pages.begin(), pages.begin() + nnz);
+        std::sort(kv_indices.begin() + seg_begin, kv_indices.end());
         assert(kv_indices.size() <= static_cast<size_t>(std::numeric_limits<int>::max()));
         kv_indptr[q + 1] = static_cast<int>(kv_indices.size());
     }
@@ -165,6 +226,8 @@ void init_sparse_kv_indices(std::vector<int>& kv_indptr,
         assert(kv_indptr[q] <= kv_indptr[q + 1]);
         for (int p = kv_indptr[q]; p < kv_indptr[q + 1]; ++p) {
             assert(kv_indices[p] >= 0 && kv_indices[p] < total_pages);
+            if (p > kv_indptr[q])
+                assert(kv_indices[p] >= kv_indices[p - 1]);
         }
     }
 }
@@ -384,35 +447,34 @@ void pa_attention_ref(
     const int o_stride_n = H * D_HEAD;
     const int o_stride_h = D_HEAD;
 
-    #pragma omp parallel for collapse(2)
-    for (int h = 0; h < H; h++) {
-        for (int i = 0; i < N; i++) {
-            const int prefix_begin = kv_indptr_prefix[i];
-            const int extend_begin = kv_indptr_extend[i];
-            const int num_prefix = kv_indptr_prefix[i + 1] - prefix_begin;
-            const int num_extend = kv_indptr_extend[i + 1] - extend_begin;
-            const int num_rows   = num_prefix + num_extend;
+    pa::parallel_for((size_t)H * N, [&](size_t idx) {
+        const int h = static_cast<int>(idx / N);
+        const int i = static_cast<int>(idx % N);
+        const int prefix_begin = kv_indptr_prefix[i];
+        const int extend_begin = kv_indptr_extend[i];
+        const int num_prefix = kv_indptr_prefix[i + 1] - prefix_begin;
+        const int num_extend = kv_indptr_extend[i + 1] - extend_begin;
+        const int num_rows   = num_prefix + num_extend;
 
-            O_t* o_row = O + (size_t)i * o_stride_n + h * o_stride_h;
-            if (num_rows <= 0) {
-                for (int d = 0; d < D_HEAD; d++) o_row[d] = static_cast<O_t>(0.0f);
-                continue;
-            }
-
-            std::vector<float> q_dense(D_HEAD);
-            decode_dsa_row_bf16<PATraits>(Q + (size_t)i * stride_qo_n + h * stride_qo_h, q_dense.data());
-
-            std::vector<float> kv_dense((size_t)num_rows * D_HEAD);
-            for (int p = 0; p < num_prefix; p++)
-                decode_dsa_row_bf16<PATraits>(UnifiedKV + (size_t)kv_indices_prefix[prefix_begin + p] * stride_kv_page,
-                                              kv_dense.data() + (size_t)p * D_HEAD);
-            for (int p = 0; p < num_extend; p++)
-                decode_dsa_row_bf16<PATraits>(KV + (size_t)kv_indices_extend[extend_begin + p] * stride_kv_page,
-                                              kv_dense.data() + (size_t)(num_prefix + p) * D_HEAD);
-
-            pa_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, AttnSink[h], o_row);
+        O_t* o_row = O + (size_t)i * o_stride_n + h * o_stride_h;
+        if (num_rows <= 0) {
+            for (int d = 0; d < D_HEAD; d++) o_row[d] = static_cast<O_t>(0.0f);
+            return;
         }
-    }
+
+        std::vector<float> q_dense(D_HEAD);
+        decode_dsa_row_bf16<PATraits>(Q + (size_t)i * stride_qo_n + h * stride_qo_h, q_dense.data());
+
+        std::vector<float> kv_dense((size_t)num_rows * D_HEAD);
+        for (int p = 0; p < num_prefix; p++)
+            decode_dsa_row_bf16<PATraits>(UnifiedKV + (size_t)kv_indices_prefix[prefix_begin + p] * stride_kv_page,
+                                          kv_dense.data() + (size_t)p * D_HEAD);
+        for (int p = 0; p < num_extend; p++)
+            decode_dsa_row_bf16<PATraits>(KV + (size_t)kv_indices_extend[extend_begin + p] * stride_kv_page,
+                                          kv_dense.data() + (size_t)(num_prefix + p) * D_HEAD);
+
+        pa_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, AttnSink[h], o_row);
+    });
 }
 
 // fp8 reference operating on the split NoPE (fp8) and RoPE (bf16) streams.
@@ -434,40 +496,39 @@ void pa_attention_ref_fp8(
     const int o_stride_n = H * D_HEAD;
     const int o_stride_h = D_HEAD;
 
-    #pragma omp parallel for collapse(2)
-    for (int h = 0; h < H; h++) {
-        for (int i = 0; i < N; i++) {
-            const int prefix_begin = kv_indptr_prefix[i];
-            const int extend_begin = kv_indptr_extend[i];
-            const int num_prefix = kv_indptr_prefix[i + 1] - prefix_begin;
-            const int num_extend = kv_indptr_extend[i + 1] - extend_begin;
-            const int num_rows   = num_prefix + num_extend;
+    pa::parallel_for((size_t)H * N, [&](size_t idx) {
+        const int h = static_cast<int>(idx / N);
+        const int i = static_cast<int>(idx % N);
+        const int prefix_begin = kv_indptr_prefix[i];
+        const int extend_begin = kv_indptr_extend[i];
+        const int num_prefix = kv_indptr_prefix[i + 1] - prefix_begin;
+        const int num_extend = kv_indptr_extend[i + 1] - extend_begin;
+        const int num_rows   = num_prefix + num_extend;
 
-            O_t* o_row = O + (size_t)i * o_stride_n + h * o_stride_h;
-            if (num_rows <= 0) {
-                for (int d = 0; d < D_HEAD; d++) o_row[d] = static_cast<O_t>(0.0f);
-                continue;
-            }
-
-            std::vector<float> q_dense(D_HEAD);
-            const size_t q_row = (size_t)i * H + h;
-            decode_dsa_row_fp8<PATraits>(Q_nope + q_row * NOPE_PADDED, Q_rope + q_row * ROPE, q_dense.data());
-
-            std::vector<float> kv_dense((size_t)num_rows * D_HEAD);
-            for (int p = 0; p < num_prefix; p++) {
-                const int kv_row = kv_indices_prefix[prefix_begin + p];
-                decode_dsa_row_fp8<PATraits>(UKV_nope + (size_t)kv_row * NOPE_PADDED, UKV_rope + (size_t)kv_row * ROPE,
-                                             kv_dense.data() + (size_t)p * D_HEAD);
-            }
-            for (int p = 0; p < num_extend; p++) {
-                const int kv_row = kv_indices_extend[extend_begin + p];
-                decode_dsa_row_fp8<PATraits>(KV_nope + (size_t)kv_row * NOPE_PADDED, KV_rope + (size_t)kv_row * ROPE,
-                                             kv_dense.data() + (size_t)(num_prefix + p) * D_HEAD);
-            }
-
-            pa_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, AttnSink[h], o_row);
+        O_t* o_row = O + (size_t)i * o_stride_n + h * o_stride_h;
+        if (num_rows <= 0) {
+            for (int d = 0; d < D_HEAD; d++) o_row[d] = static_cast<O_t>(0.0f);
+            return;
         }
-    }
+
+        std::vector<float> q_dense(D_HEAD);
+        const size_t q_row = (size_t)i * H + h;
+        decode_dsa_row_fp8<PATraits>(Q_nope + q_row * NOPE_PADDED, Q_rope + q_row * ROPE, q_dense.data());
+
+        std::vector<float> kv_dense((size_t)num_rows * D_HEAD);
+        for (int p = 0; p < num_prefix; p++) {
+            const int kv_row = kv_indices_prefix[prefix_begin + p];
+            decode_dsa_row_fp8<PATraits>(UKV_nope + (size_t)kv_row * NOPE_PADDED, UKV_rope + (size_t)kv_row * ROPE,
+                                         kv_dense.data() + (size_t)p * D_HEAD);
+        }
+        for (int p = 0; p < num_extend; p++) {
+            const int kv_row = kv_indices_extend[extend_begin + p];
+            decode_dsa_row_fp8<PATraits>(KV_nope + (size_t)kv_row * NOPE_PADDED, KV_rope + (size_t)kv_row * ROPE,
+                                         kv_dense.data() + (size_t)(num_prefix + p) * D_HEAD);
+        }
+
+        pa_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, AttnSink[h], o_row);
+    });
 }
 
 // ─── main ───────────────────────────────────────────────────────────────────
@@ -742,6 +803,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+#if defined(PA_ARCH_GFX950)
     if (use_fp8) {
         return H <= 32
             ? run_pa_case<pa_16mx1_16nx4_fp8_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
@@ -750,4 +812,17 @@ int main(int argc, char** argv) {
     return H <= 32
         ? run_pa_case<pa_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
         : run_pa_case<pa_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+#elif defined(PA_ARCH_GFX1250)
+    const int cluster_y = pa_pick_cluster_y(ceil_div(H, 64));
+    if (use_fp8) {
+        switch (cluster_y) {
+            case 2: return run_pa_case<pa_16mx4_64nx1_fp8_traits<16, 64, 4, 2, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+            default: return run_pa_case<pa_16mx4_64nx1_fp8_traits<16, 64, 4, 1, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        }
+    }
+    switch (cluster_y) {
+        case 2: return run_pa_case<pa_16mx4_64nx1_traits<16, 64, 512, 4, 2, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        default: return run_pa_case<pa_16mx4_64nx1_traits<16, 64, 512, 4, 1, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+    }
+#endif
 }

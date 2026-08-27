@@ -1,7 +1,7 @@
 #pragma once
 
 #include <opus/opus.hpp>
-#include "pa_defs.h"
+#include "pa_traits.h"
 #include "pa_global_load.hpp"
 #include <bit>
 #include <cstdint>
@@ -216,7 +216,7 @@ template<typename T, typename V, typename S>
 __device__ inline typename T::D_ACC attn_row_max(const V& v_s, S& s_m, int warp_id, int lane_id) {
     using D_ACC = typename T::D_ACC;
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    D_ACC row_max = -1e30f;
+    D_ACC row_max = opus::numeric_limits<D_ACC>::lowest();
     opus::static_for<s_len>([&](auto i) {
         row_max = max(row_max, v_s[i.value]);
     });

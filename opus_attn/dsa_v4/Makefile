@@ -1,19 +1,35 @@
 OPUS_INCLUDE_DIR ?= /path/to/aiter/csrc/include
 HIPCC           ?= /opt/rocm/bin/hipcc
-ARCH            ?= gfx950
+ARCH            ?= gfx1250
 
-COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -fopenmp -O3 -Wall --offload-arch=$(ARCH)
-KERNEL_FLAGS = -ffast-math -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage -save-temps=obj
+ifeq ($(wildcard $(ARCH)/pa_traits.h),)
+$(error unknown ARCH '$(ARCH)'; available: $(patsubst %/pa_traits.h,%,$(wildcard */pa_traits.h)))
+endif
 
-BUILD = build
+ARCH_MACRO := PA_ARCH_$(shell echo $(ARCH) | tr '[:lower:]' '[:upper:]')
+
+# The gfx1250 kernels depend on the expert mode and llvm scheduler
+SCHED_FLAGS_gfx1250 = -mllvm -amdgpu-expert-scheduling-mode \
+                      -mllvm -amdgpu-sched-strategy=coexec \
+                      -mllvm -amdgpu-anti-hints-for-va-vdst
+
+COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -pthread -O3 -Wall -D$(ARCH_MACRO) --offload-arch=$(ARCH)
+KERNEL_FLAGS = -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage --no-offload-new-driver \
+               -save-temps=obj $(SCHED_FLAGS_$(ARCH))
+LINK_FLAGS   = --offload-arch=$(ARCH) -pthread
+
+BUILD = build/$(ARCH)
 OUT   = $(BUILD)/pa_prefill.exe
 
-KERNEL_SRCS = pa_prefill_16mx1_16nx4_kernel.cc pa_prefill_16mx8_32nx1_kernel.cc pa_prefill_16mx1_16nx4_fp8_kernel.cc pa_prefill_16mx8_32nx1_fp8_kernel.cc
-HOST_SRC    = pa_host.cc
-KERNEL_OBJS = $(patsubst %.cc,$(BUILD)/%.o,$(KERNEL_SRCS))
+KERNEL_SRCS = $(wildcard $(ARCH)/pa_prefill_*_kernel.cc)
+HOST_SRC    = common/pa_host.cc
+COMMON_HDRS = common/pa_kargs.h common/pa_parallel.h
+SHARED_HDRS = $(filter-out %_template.hpp,$(wildcard $(ARCH)/*.h) $(wildcard $(ARCH)/*.hpp)) $(COMMON_HDRS)
+KERNEL_OBJS = $(patsubst %.cc,$(BUILD)/%.o,$(notdir $(KERNEL_SRCS)))
 HOST_OBJ    = $(BUILD)/pa_host.o
 
-.PHONY: all clean benchmark
+.PHONY: all clean verify
+.DELETE_ON_ERROR:
 
 all: $(OUT)
 
@@ -21,22 +37,25 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 # Kernel objects (heavy — device+host passes, parallelizable via make -j)
-# -D__HIPCC_RTC__ skips implicit __clang_hip_runtime_wrapper.h on host pass (~250ms saved)
-# Each kernel .cc only includes its own template hpp; depending on both keeps the rule simple.
-$(BUILD)/%.o: %.cc pa_prefill_16mx1_16nx4_template.hpp pa_prefill_16mx8_32nx1_template.hpp pa_prefill_16mx1_16nx4_fp8_template.hpp pa_prefill_16mx8_32nx1_fp8_template.hpp pa_global_load.hpp pa_defs.h | $(BUILD)
+# -D__HIPCC_RTC__ skips implicit __clang_hip_runtime_wrapper.h on host pass
+$(BUILD)/%_kernel.o: $(ARCH)/%_kernel.cc $(ARCH)/%_template.hpp $(SHARED_HDRS) | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) -c -o $@
 
-# Host object (no -D__HIPCC_RTC__ — needs full HIP runtime for <<<>>> syntax)
-$(HOST_OBJ): $(HOST_SRC) pa_defs.h | $(BUILD)
+# Host object (no -D__HIPCC_RTC__ — needs full HIP runtime for <<<>>> syntax).
+$(HOST_OBJ): $(HOST_SRC) $(ARCH)/pa_traits.h $(COMMON_HDRS) | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) -c -o $@
 
 # Link
 $(OUT): $(KERNEL_OBJS) $(HOST_OBJ)
-	$(HIPCC) $^ --offload-arch=$(ARCH) -fopenmp -o $@
+	$(HIPCC) $^ $(LINK_FLAGS) -o $@
 
-benchmark: $(OUT)
-	@echo "=== h_q=16 (16mx1_16nx4) ===" && $(OUT) -h_q 16
-	@echo "=== h_q=128 (16mx8_32nx1) ===" && $(OUT) -h_q 128
+VERIFY_HQ     ?= 16 32 64 128
+VERIFY_DTYPES ?= bf16 fp8
+
+verify: $(OUT)
+	@for dtype in $(VERIFY_DTYPES); do for hq in $(VERIFY_HQ); do \
+	    echo "=== $(ARCH) $$dtype h_q=$$hq --verify ==="; $(OUT) -dtype $$dtype -h_q $$hq -n 256 --verify || exit 1; \
+	done; done
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf build
