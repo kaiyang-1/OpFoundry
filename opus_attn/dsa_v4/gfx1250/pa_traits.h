@@ -84,6 +84,63 @@ struct pa_16mx4_64nx1_traits {
 
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
+         int D_TILE_SIZE_ = 512,
+         int NUM_WARPS_ = 4,
+         int CLUSTER_Y_ = 1,
+         typename D_ATTN_ = bf16_t,
+         typename D_OUT_ = bf16_t>
+struct pa_16mx1_16nx4_traits {
+    static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
+    static constexpr int D_HEAD_SIZE = D_TILE_SIZE;
+    static constexpr int NUM_WARPS = NUM_WARPS_;
+
+    static constexpr int WARP_SIZE = 32;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+    static constexpr int CLUSTER_Y = CLUSTER_Y_;
+
+    using D_ATTN = D_ATTN_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    // Wave grid
+    static constexpr int T_M = 1;
+    static constexpr int T_N = NUM_WARPS;
+    static constexpr int T_K = 1;
+
+    // WMMA base tile
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 32;
+
+    // GEMM0: S = Q @ K^T
+    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM0_E_N = KV_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM0_E_K = D_TILE_SIZE / W_K;
+
+    // GEMM1: O = P @ V
+    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM1_E_N = D_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
+
+    static constexpr int VEC_Q  = 8;
+    static constexpr int VEC_KV = 8;
+    static constexpr int VEC_P  = 8;
+    static constexpr int VEC_O  = 8;
+
+    static constexpr int QO_ROWS_PER_WAVE = Q_TILE_SIZE / NUM_WARPS;
+    static constexpr int Q_ROW_LDS_ELEMS  = D_TILE_SIZE + 16 / sizeof(D_ATTN);
+    static constexpr int O_ROW_LDS_ELEMS  = D_TILE_SIZE + 16 / sizeof(D_OUT);
+    static constexpr int Q_TILE_LDS_BYTES = Q_TILE_SIZE * Q_ROW_LDS_ELEMS * sizeof(D_ATTN);
+    static constexpr int O_TILE_LDS_BYTES = Q_TILE_SIZE * O_ROW_LDS_ELEMS * sizeof(D_OUT);
+    static constexpr int QO_LDS_BYTES     = Q_TILE_LDS_BYTES > O_TILE_LDS_BYTES ? Q_TILE_LDS_BYTES : O_TILE_LDS_BYTES;
+
+    static constexpr size_t smem_size_bytes() { return (size_t)QO_LDS_BYTES; }
+};
+
+template<int Q_TILE_SIZE_ = 16,
+         int KV_TILE_SIZE_ = 64,
          int NUM_WARPS_ = 4,
          int CLUSTER_Y_ = 1,
          typename D_NOPE_ = fp8_t,

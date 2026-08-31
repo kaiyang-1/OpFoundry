@@ -55,6 +55,8 @@ inline void pa_launch(pa_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>,
 template<class Traits>
 __global__ void pa_prefill_16mx4_64nx1_kernel(pa_kargs kargs);
 template<class Traits>
+__global__ void pa_prefill_16mx1_16nx4_kernel(pa_kargs kargs);
+template<class Traits>
 __global__ void pa_prefill_16mx4_64nx1_fp8_kernel(pa_fp8_kargs kargs);
 
 constexpr int pa_max_cluster_y = 2;
@@ -101,6 +103,12 @@ inline void pa_launch(pa_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>,
                       const pa_kargs& kargs, dim3 grid, dim3 block) {
     using Traits = pa_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>;
     pa_launch_clustered<CY>(pa_prefill_16mx4_64nx1_kernel<Traits>, kargs, grid, block);
+}
+template<int Q, int KV, int D, int NW, int CY, class DT, class DO>
+inline void pa_launch(pa_16mx1_16nx4_traits<Q, KV, D, NW, CY, DT, DO>,
+                      const pa_kargs& kargs, dim3 grid, dim3 block) {
+    using Traits = pa_16mx1_16nx4_traits<Q, KV, D, NW, CY, DT, DO>;
+    pa_launch_clustered<CY>(pa_prefill_16mx1_16nx4_kernel<Traits>, kargs, grid, block);
 }
 template<int Q, int KV, int NW, int CY, class NOPE, class ROPE, class DO>
 inline void pa_launch(pa_16mx4_64nx1_fp8_traits<Q, KV, NW, CY, NOPE, ROPE, DO>,
