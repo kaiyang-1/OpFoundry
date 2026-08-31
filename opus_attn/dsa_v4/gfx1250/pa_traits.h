@@ -136,7 +136,22 @@ struct pa_16mx1_16nx4_traits {
     static constexpr int O_TILE_LDS_BYTES = Q_TILE_SIZE * O_ROW_LDS_ELEMS * sizeof(D_OUT);
     static constexpr int QO_LDS_BYTES     = Q_TILE_LDS_BYTES > O_TILE_LDS_BYTES ? Q_TILE_LDS_BYTES : O_TILE_LDS_BYTES;
 
-    static constexpr size_t smem_size_bytes() { return (size_t)QO_LDS_BYTES; }
+    static constexpr int ROWS_PER_WAVE      = KV_TILE_SIZE / NUM_WARPS;
+    static constexpr int INDICES_PER_TDM    = 8;
+    static constexpr int TDM_LOADS_PER_WAVE = ROWS_PER_WAVE / INDICES_PER_TDM;
+    static constexpr int KV_ROW_PAD_SIZE    = 16 / sizeof(D_ATTN);
+    static constexpr int KV_ROW_LDS_BYTES   = D_TILE_SIZE * sizeof(D_ATTN) + 16;
+    static constexpr int KV_ROW_LDS_ELEMS   = D_TILE_SIZE + KV_ROW_PAD_SIZE;
+
+    static constexpr int NUM_KV_SEGS     = 2;
+    static constexpr int KV_SEG_BYTES    = 64 * 1024;
+    static constexpr int ROWS_PER_SEG    = KV_TILE_SIZE / NUM_KV_SEGS;
+    static constexpr int WAVE_LDS_BYTES  = ROWS_PER_WAVE * KV_ROW_LDS_BYTES;
+    static constexpr int KV_LDS_BYTES    = NUM_KV_SEGS * KV_SEG_BYTES;
+
+    static constexpr size_t smem_size_bytes() {
+        return (size_t)(KV_LDS_BYTES > QO_LDS_BYTES ? KV_LDS_BYTES : QO_LDS_BYTES);
+    }
 };
 
 template<int Q_TILE_SIZE_ = 16,

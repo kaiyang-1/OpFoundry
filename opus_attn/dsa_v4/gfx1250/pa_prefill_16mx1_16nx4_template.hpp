@@ -9,6 +9,27 @@ using opus::operator""_I;
 
 namespace pa_16mx1_16nx4 {
 
+OPUS_D opus::u32x16_t s_buffer_load_b512(opus::u32x4_t rsrc, int soffset) {
+    opus::u32x16_t ids;
+    asm volatile("s_buffer_load_b512 %0, %1, %2 offset:0x0 nv"
+                 : "=&s"(ids)
+                 : "s"(rsrc), "s"(soffset));
+    return ids;
+}
+
+OPUS_D void s_wait_kmcnt_for(opus::u32x16_t& ids) {
+    asm volatile("s_wait_kmcnt 0x0" : "+s"(ids));
+}
+
+OPUS_D opus::u32x4_t make_buffer_rsrc_raw(const void* ptr, opus::u32_t num_bytes,
+                                          opus::u32_t config = opus::buffer_default_config()) {
+    __amdgpu_buffer_rsrc_t rsrc = __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(ptr), /*stride=*/0, num_bytes, config);
+    opus::u32x4_t raw;
+    __builtin_memcpy(&raw, &rsrc, sizeof(raw));
+    opus::static_for<4>([&](auto k) { raw[k.value] = __builtin_amdgcn_readfirstlane(raw[k.value]); });
+    return raw;
+}
+
 template<class T>
 __device__ inline auto make_layout_q(int lane_id) {
     constexpr auto q_block_shape = opus::make_tuple(
@@ -52,10 +73,49 @@ __device__ inline auto make_layout_o(int warp_id, int lane_id) {
         opus::unfold_p_coord(o_block_dim, opus::tuple{lane_id % T::W_M, warp_id, lane_id / T::W_M}));
 }
 
+template<class T>
+__device__ inline auto make_layout_k(int lane_id) {
+    constexpr auto k_block_shape = opus::make_tuple(
+        opus::number<T::GEMM0_E_N>{},
+        opus::number<T::W_N>{},
+        opus::number<T::D_TILE_SIZE / T::W_K>{},
+        opus::number<T::W_N * T::W_K / (T::WARP_SIZE * T::VEC_KV)>{},
+        opus::number<T::WARP_SIZE / T::W_N>{},
+        opus::number<T::VEC_KV>{});
+
+    constexpr auto k_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout(
+        k_block_shape,
+        opus::unfold_x_stride(k_block_dim, k_block_shape, opus::tuple{opus::number<T::KV_ROW_LDS_ELEMS>{}, 1_I}),
+        opus::unfold_p_coord(k_block_dim, opus::tuple{lane_id % T::W_N, lane_id / T::W_N}));
+}
+
 template<typename T, typename V>
 __device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
     constexpr opus::index_t o_len = opus::vector_traits<V>::size();
     opus::static_for<o_len>([&](auto i) { v_o[i.value] *= scale; });
+}
+
+template<typename T, typename V>
+__device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile_idx, int wave_kv_base) {
+    using D_ACC = typename T::D_ACC;
+
+    if ((kv_tile_idx + 1) * T::KV_TILE_SIZE <= valid_kv_len) return;
+
+    constexpr opus::index_t s_len = opus::vector_traits<V>::size();
+    constexpr int lane_hi_kv_step = T::W_N / (T::WARP_SIZE / T::W_M);
+    static_assert(s_len == (T::W_M * T::W_N) / T::WARP_SIZE);
+
+    const D_ACC neg_inf = -opus::numeric_limits<D_ACC>::infinity();
+    const int lane_hi = (opus::thread_id_x() % T::WARP_SIZE) / T::W_M;
+    const int rel = (valid_kv_len - 1) - kv_tile_idx * T::KV_TILE_SIZE - wave_kv_base - lane_hi * lane_hi_kv_step;
+
+    opus::static_for<s_len>([&](auto i_reg) {
+        v_s[i_reg.value] = (i_reg.value > rel) ? neg_inf : v_s[i_reg.value];
+    });
 }
 
 template<class Traits>
@@ -63,19 +123,103 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(
         pa_kargs kargs,
         const void* kv_ptr, int kv_rows,
         const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
-        char* smem_kv_buf,
+        char* smem_buf,
         opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
         opus::vector_t<typename Traits::D_ACC, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / (Traits::T_N * Traits::WARP_SIZE)>& v_o,
         typename Traits::D_ACC& m_row,
         typename Traits::D_ACC& l_row,
         typename Traits::D_ACC temperature_scale) {
-    
+    using namespace opus;
+    using T = opus::remove_cvref_t<Traits>;
+    using D_ATTN = typename T::D_ATTN;
+    using D_ACC = typename T::D_ACC;
+
+    if (num_kv_tiles <= 0) return;
+
+    const int lane_id = thread_id_x() % T::WARP_SIZE;
+    const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+
+    // wave 0/2 -> segment 0, wave 1/3 -> segment 1; the slot picks which half of a segment.
+    // KV rows: wave 0 -> 0..15, wave 2 -> 16..31, wave 1 -> 32..47, wave 3 -> 48..63.
+    const int kv_seg  = warp_id & 1;
+    const int kv_slot = warp_id >> 1;
+    const int wave_lds_off = kv_seg * T::KV_SEG_BYTES + kv_slot * T::WAVE_LDS_BYTES;
+    const int wave_kv_base = kv_seg * T::ROWS_PER_SEG + kv_slot * T::ROWS_PER_WAVE;
+
+    auto s_k = make_smem(reinterpret_cast<D_ATTN*>(smem_buf + wave_lds_off));
+
+    const u32x4_t kv_indices_rsrc = make_buffer_rsrc_raw(kv_indices + page_idx_begin, (u32_t)(valid_kv_len * sizeof(int)));
+
+    using kv_window = tdm<D_ATTN, seq<T::D_TILE_SIZE, T::INDICES_PER_TDM>,
+                          tdm_traits::gather<32>,
+                          tdm_traits::padding_auto<D_ATTN, T::D_TILE_SIZE>>;
+
+    auto tdm_kv = make_tdm<kv_window>((u32_t)reinterpret_cast<uintptr_t>(smem_buf + wave_lds_off),
+                                      reinterpret_cast<const D_ATTN*>(kv_ptr),
+                                      /*shape0=*/ (u32_t)T::D_TILE_SIZE,
+                                      /*shape1=*/ (u32_t)kv_rows,
+                                      /*stride=*/ (u64_t)kargs.stride_kv_page);
+
+    if constexpr (T::CLUSTER_Y > 1) {
+        tdm_kv.set_workgroup_mask(tdm_traits::peers_along_y<1, T::CLUSTER_Y>());
+    }
+
+    auto mma0 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
+        seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K>{},
+        wmma_adaptor_swap_ab{});
+
+    auto u_rk = make_layout_k<T>(lane_id);
+
+    vector_t<D_ATTN, T::GEMM0_E_N * T::GEMM0_E_K * T::W_N * T::W_K / T::WARP_SIZE> v_k;
+    vector_t<D_ACC,  T::Q_TILE_SIZE * T::KV_TILE_SIZE / (T::T_N * T::WARP_SIZE)> v_s;
+
+    auto load_row_ids = [&](int tile_idx) {
+        const int idx_byte_off = (tile_idx * T::KV_TILE_SIZE + wave_kv_base) * (int)sizeof(int);
+        return s_buffer_load_b512(kv_indices_rsrc, idx_byte_off);
+    };
+
+    auto issue_kv_tile = [&](const u32x16_t& ids, int tile_idx, auto clamp_tail) {
+        constexpr int LOAD_ELEMS = T::INDICES_PER_TDM * T::KV_ROW_LDS_ELEMS;
+        [[maybe_unused]] const int wave_valid = valid_kv_len - (tile_idx * T::KV_TILE_SIZE + wave_kv_base);
+
+        static_for<T::TDM_LOADS_PER_WAVE>([&](auto d) {
+            constexpr int ld = d.value;
+            u32_t idx[T::INDICES_PER_TDM];
+            static_for<T::INDICES_PER_TDM>([&](auto r) {
+                constexpr int slot = ld * T::INDICES_PER_TDM + r.value;
+                u32_t id = ids[slot];
+                if constexpr (decltype(clamp_tail)::value) id = slot < wave_valid ? id : (u32_t)kv_rows;
+                idx[r.value] = __builtin_amdgcn_readfirstlane(id);
+            });
+            tdm_kv.set_indices(idx, T::INDICES_PER_TDM);
+            tdm_kv.async_load(u32_t(ld * LOAD_ELEMS));
+        });
+    };
+
+    u32x16_t row_ids = load_row_ids(0);
+
+    for (int tile = 0; tile < num_kv_tiles; ++tile) {
+        s_wait_kmcnt_for(row_ids);
+        if (tile + 1 < num_kv_tiles) issue_kv_tile(row_ids, tile, false_type{});
+        else                         issue_kv_tile(row_ids, tile, true_type{});
+        row_ids = load_row_ids(tile + 1);
+
+        s_wait_tensorcnt(0_I);
+        v_k = load<T::VEC_KV>(s_k, u_rk);
+
+        clear(v_s);
+        v_s = mma0(v_q, v_k, v_s);
+        attn_mask_oob_score<T>(v_s, valid_kv_len, tile, wave_kv_base);
+
+    }
 }
 
 } // namespace pa_16mx1_16nx4
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx1_16nx4_kernel(pa_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_kernel(pa_kargs kargs) {
     using namespace opus;
     using namespace pa_16mx1_16nx4;
     using T = opus::remove_cvref_t<Traits>;
