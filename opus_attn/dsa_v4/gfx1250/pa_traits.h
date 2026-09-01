@@ -86,7 +86,6 @@ template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
          int D_TILE_SIZE_ = 512,
          int NUM_WARPS_ = 4,
-         int CLUSTER_Y_ = 1,
          typename D_ATTN_ = bf16_t,
          typename D_OUT_ = bf16_t>
 struct pa_16mx1_16nx4_traits {
@@ -98,7 +97,6 @@ struct pa_16mx1_16nx4_traits {
 
     static constexpr int WARP_SIZE = 32;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
-    static constexpr int CLUSTER_Y = CLUSTER_Y_;
 
     using D_ATTN = D_ATTN_;
     using D_OUT  = D_OUT_;
@@ -120,10 +118,9 @@ struct pa_16mx1_16nx4_traits {
     static constexpr int GEMM0_E_K = D_TILE_SIZE / W_K;
 
     // GEMM1: O = P @ V
-    static constexpr int GEMM1_STAGE_K = 2;
     static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
     static constexpr int GEMM1_E_N = D_TILE_SIZE / (W_N * T_N);
-    static constexpr int GEMM1_E_K = (KV_TILE_SIZE / GEMM1_STAGE_K) / W_K;
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
 
     static constexpr int VEC_Q  = 8;
     static constexpr int VEC_KV = 8;
@@ -144,21 +141,22 @@ struct pa_16mx1_16nx4_traits {
     static constexpr int KV_ROW_LDS_BYTES   = D_TILE_SIZE * sizeof(D_ATTN) + 16;
     static constexpr int KV_ROW_LDS_ELEMS   = D_TILE_SIZE + KV_ROW_PAD_SIZE;
 
-    static constexpr int NUM_KV_SEGS     = 2;
-    static constexpr int KV_SEG_BYTES    = 64 * 1024;
-    static constexpr int ROWS_PER_SEG    = KV_TILE_SIZE / NUM_KV_SEGS;
-    static constexpr int WAVE_LDS_BYTES  = ROWS_PER_WAVE * KV_ROW_LDS_BYTES;
-    static constexpr int KV_LDS_BYTES    = NUM_KV_SEGS * KV_SEG_BYTES;
+    static constexpr int NUM_KV_BUFS    = 2;
+    static constexpr int WAVE_LDS_BYTES = ROWS_PER_WAVE * KV_ROW_LDS_BYTES;
+    static constexpr int KV_BUF_BYTES   = KV_TILE_SIZE * KV_ROW_LDS_BYTES;
+    static constexpr int KV_LDS_BYTES   = NUM_KV_BUFS * KV_BUF_BYTES;
 
-    static constexpr int ML_LDS_OFF   = ROWS_PER_SEG * KV_ROW_LDS_BYTES;
+    static constexpr int ML_LDS_OFF   = KV_LDS_BYTES;
     static constexpr int ML_LDS_BYTES = 2 * T_N * W_M * sizeof(D_ACC);
 
     static constexpr int P_LDS_OFF   = ML_LDS_OFF + ML_LDS_BYTES;
     static constexpr int P_BLOCK_ELEMS = W_M * W_N;
     static constexpr int P_LDS_BYTES = NUM_WARPS * P_BLOCK_ELEMS * sizeof(D_ATTN);
 
+    static constexpr int ACCUM_LDS_BYTES = P_LDS_OFF + P_LDS_BYTES;
+
     static constexpr size_t smem_size_bytes() {
-        return (size_t)(KV_LDS_BYTES > QO_LDS_BYTES ? KV_LDS_BYTES : QO_LDS_BYTES);
+        return (size_t)(ACCUM_LDS_BYTES > QO_LDS_BYTES ? ACCUM_LDS_BYTES : QO_LDS_BYTES);
     }
 };
 

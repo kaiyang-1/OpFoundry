@@ -105,7 +105,7 @@ __device__ inline auto make_layout_v(int lane_id) {
         opus::number<T::GEMM1_E_N / dwordx32_rpt>{},
         opus::number<lane_n>{},
         opus::number<dwordx32_rpt>{},
-        opus::number<T::W_K / (T::WARP_SIZE / lane_per_grp) / T::VEC_KV>{},
+        opus::number<T::GEMM1_E_K * T::W_K / (T::WARP_SIZE / lane_per_grp) / T::VEC_KV>{},
         opus::number<T::WARP_SIZE / lane_per_grp>{},
         opus::number<lane_k>{},
         opus::number<T::VEC_KV>{});
@@ -227,24 +227,22 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(
     const int lane_id = thread_id_x() % T::WARP_SIZE;
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    // Wave placement. wave 0/2 -> segment 0, wave 1/3 -> segment 1; the slot picks which half of a
-    // segment. KV rows: wave 0 -> 0..15, wave 2 -> 16..31, wave 1 -> 32..47, wave 3 -> 48..63.
-    const int kv_seg  = warp_id & 1;
-    const int kv_slot = warp_id >> 1;
-    const int wave_lds_off = kv_seg * T::KV_SEG_BYTES + kv_slot * T::WAVE_LDS_BYTES;
-    const int wave_kv_base = kv_seg * T::ROWS_PER_SEG + kv_slot * T::ROWS_PER_WAVE;
-    const int p_block      = wave_kv_base / T::ROWS_PER_WAVE;
+    const int wave_kv_base = warp_id * T::ROWS_PER_WAVE;
+    const int wave_lds_off = warp_id * T::WAVE_LDS_BYTES;
+    const int v_col_off    = warp_id * (T::D_TILE_SIZE / T::T_N);
 
     auto s_k = make_smem(reinterpret_cast<D_ATTN*>(smem_buf + wave_lds_off));
+    auto s_v = make_smem(reinterpret_cast<D_ATTN*>(smem_buf) + v_col_off);
     auto s_m = make_smem(reinterpret_cast<D_ACC*>(smem_buf + T::ML_LDS_OFF));
     auto s_l = make_smem(reinterpret_cast<D_ACC*>(smem_buf + T::ML_LDS_OFF) + T::T_N * T::W_M);
     auto s_p = make_smem(reinterpret_cast<D_ATTN*>(smem_buf + T::P_LDS_OFF));
 
-    const int seg_rot_bytes = kv_seg * T::KV_SEG_BYTES;
-    const int v_col_off     = warp_id * (T::D_TILE_SIZE / T::T_N);
-    smem<D_ATTN> s_v[T::NUM_KV_SEGS] = {
-        make_smem(reinterpret_cast<D_ATTN*>(smem_buf + seg_rot_bytes) + v_col_off),
-        make_smem(reinterpret_cast<D_ATTN*>(smem_buf + (T::KV_SEG_BYTES - seg_rot_bytes)) + v_col_off),
+    constexpr int BUF_ELEMS = T::KV_BUF_BYTES / (int)sizeof(D_ATTN);
+    int buf_delta = T::KV_BUF_BYTES;
+    auto advance_bufs = [&]() {
+        s_k.ptr += buf_delta;
+        s_v.ptr += buf_delta;
+        buf_delta = -buf_delta;
     };
 
     const u32x4_t kv_indices_rsrc = make_buffer_rsrc_raw(kv_indices + page_idx_begin, (u32_t)(valid_kv_len * sizeof(int)));
@@ -259,16 +257,12 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(
                                       /*shape1=*/ (u32_t)kv_rows,
                                       /*stride=*/ (u64_t)kargs.stride_kv_page);
 
-    if constexpr (T::CLUSTER_Y > 1) {
-        tdm_kv.set_workgroup_mask(tdm_traits::peers_along_y<1, T::CLUSTER_Y>());
-    }
-
     auto load_row_ids = [&](int tile_idx) {
         const int idx_byte_off = (tile_idx * T::KV_TILE_SIZE + wave_kv_base) * (int)sizeof(int);
         return s_buffer_load_b512(kv_indices_rsrc, idx_byte_off);
     };
 
-    auto issue_kv_tile = [&](const u32x16_t& ids, int tile_idx, auto clamp_tail) {
+    auto issue_kv_tile = [&](const u32x16_t& ids, int tile_idx, u32_t lds_buf_off, auto clamp_tail) {
         constexpr int LOAD_ELEMS = T::INDICES_PER_TDM * T::KV_ROW_LDS_ELEMS;
         [[maybe_unused]] const int wave_valid = valid_kv_len - (tile_idx * T::KV_TILE_SIZE + wave_kv_base);
 
@@ -282,7 +276,7 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(
                 idx[r.value] = __builtin_amdgcn_readfirstlane(id);
             });
             tdm_kv.set_indices(idx, T::INDICES_PER_TDM);
-            tdm_kv.async_load(u32_t(ld * LOAD_ELEMS));
+            tdm_kv.async_load(lds_buf_off + u32_t(ld * LOAD_ELEMS));
         });
     };
 
@@ -301,24 +295,34 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(
     auto u_rk = make_layout_k<T>(lane_id);
     auto u_rv = make_layout_v<T>(lane_id);
 
+    constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
     constexpr index_t s_len = T::Q_TILE_SIZE * T::KV_TILE_SIZE / (T::T_N * T::WARP_SIZE);
     vector_t<D_ATTN, T::GEMM0_E_N * T::GEMM0_E_K * T::W_N * T::W_K / T::WARP_SIZE> v_k;
     vector_t<D_ACC,  s_len> v_s;
-    typename decltype(mma1)::vtype_b v_v[2];
-
-    vector_t<D_ATTN, T::NUM_WARPS * s_len> v_p;
+    typename decltype(mma1)::vtype_b v_v;
+    typename decltype(mma1)::vtype_a v_p;
     auto v_p_blocks = reinterpret_cast<vector_t<D_ATTN, s_len>*>(&v_p);
-    auto v_p_stages = reinterpret_cast<typename decltype(mma1)::vtype_a*>(&v_p);
 
     u32x16_t row_ids = load_row_ids(0);
+    u32_t gather_off = 0;
+
+    auto issue_tile = [&](int tile) {
+        s_wait_kmcnt_for(row_ids);
+        if (tile + 1 < num_kv_tiles) issue_kv_tile(row_ids, tile, gather_off, false_type{});
+        else                         issue_kv_tile(row_ids, tile, gather_off, true_type{});
+        row_ids = load_row_ids(tile + 1);
+        gather_off ^= (u32_t)BUF_ELEMS;
+    };
+
+    issue_tile(0);
 
     for (int tile = 0; tile < num_kv_tiles; ++tile) {
-        s_wait_kmcnt_for(row_ids);
-        if (tile + 1 < num_kv_tiles) issue_kv_tile(row_ids, tile, false_type{});
-        else                         issue_kv_tile(row_ids, tile, true_type{});
-        row_ids = load_row_ids(tile + 1);
-
-        s_wait_tensorcnt(0_I);
+        if (tile + 1 < num_kv_tiles) {
+            issue_tile(tile + 1);
+            s_wait_tensorcnt(number<T::TDM_LOADS_PER_WAVE>{});
+        } else {
+            s_wait_tensorcnt(0_I);
+        }
         v_k = load<T::VEC_KV>(s_k, u_rk);
 
         clear(v_s);
@@ -326,38 +330,34 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(
         attn_mask_oob_score<T>(v_s, valid_kv_len, tile, wave_kv_base);
 
         ml_arrive<T>(s_m, attn_row_max<T>(v_s), warp_id, lane_id);
-        D_ACC row_max = ml_reduce<T>(s_m, lane_id, [](D_ACC x, D_ACC y) { return max(x, y); });
+        const D_ACC tile_max = ml_reduce<T>(s_m, lane_id, [](D_ACC x, D_ACC y) { return max(x, y); })
+                             * temperature_scale;
 
-        row_max = max(m_row, row_max * temperature_scale);
-        const D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-        m_row = row_max;
+        const bool all_below = __builtin_amdgcn_ballot_w32((tile_max - m_row) <= RESCALE_THRESHOLD)
+                            == __builtin_amdgcn_read_exec_lo();
+        const D_ACC row_max = all_below ? m_row : max(m_row, tile_max);
 
         attn_row_scale_sub<T>(v_s, temperature_scale, row_max);
         attn_exp2_slice<T, 0, s_len>(v_s);
-
-        auto v_p_own = cast<D_ATTN>(v_s);
-        store<s_len>(s_p, v_p_own, p_block * T::P_BLOCK_ELEMS + lane_id * s_len);
+        store<s_len>(s_p, cast<D_ATTN>(v_s), warp_id * T::P_BLOCK_ELEMS + lane_id * s_len);
 
         ml_arrive<T>(s_l, attn_row_sum<T>(v_s), warp_id, lane_id);
-        l_row *= rescale_m;
-        scale_output_tile<T>(v_o, rescale_m);
+        if (!all_below) {
+            const D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+            m_row = row_max;
+            l_row *= rescale_m;
+            scale_output_tile<T>(v_o, rescale_m);
+        }
         l_row += ml_reduce<T>(s_l, lane_id, [](D_ACC x, D_ACC y) { return x + y; });
 
-        const int p_rot = kv_seg * (T::NUM_WARPS / T::NUM_KV_SEGS);
         static_for<T::NUM_WARPS>([&](auto i) {
-            const int src = (i.value + p_rot) & (T::NUM_WARPS - 1);
-            v_p_blocks[i.value] = load<s_len>(s_p, src * T::P_BLOCK_ELEMS + lane_id * s_len);
+            v_p_blocks[i.value] = load<s_len>(s_p, i.value * T::P_BLOCK_ELEMS + lane_id * s_len);
         });
 
-        v_v[0] = tr_load<T::VEC_KV>(s_v[0], u_rv);
-        static_for<T::GEMM1_STAGE_K>([&](auto k) {
-            constexpr int buf = k.value & 1;
-            if constexpr (k.value + 1 < T::GEMM1_STAGE_K) {
-                v_v[buf ^ 1] = tr_load<T::VEC_KV>(s_v[k.value + 1], u_rv);
-            }
-            v_o = mma1(v_p_stages[k.value], v_v[buf], v_o);
-        });
+        v_v = tr_load<T::VEC_KV>(s_v, u_rv);
+        v_o = mma1(v_p, v_v, v_o);
 
+        advance_bufs();
         __builtin_amdgcn_s_barrier();
     }
 }

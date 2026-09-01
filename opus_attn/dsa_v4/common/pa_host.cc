@@ -104,11 +104,10 @@ inline void pa_launch(pa_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>,
     using Traits = pa_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>;
     pa_launch_clustered<CY>(pa_prefill_16mx4_64nx1_kernel<Traits>, kargs, grid, block);
 }
-template<int Q, int KV, int D, int NW, int CY, class DT, class DO>
-inline void pa_launch(pa_16mx1_16nx4_traits<Q, KV, D, NW, CY, DT, DO>,
+template<int Q, int KV, int D, int NW, class DT, class DO>
+inline void pa_launch(pa_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>,
                       const pa_kargs& kargs, dim3 grid, dim3 block) {
-    using Traits = pa_16mx1_16nx4_traits<Q, KV, D, NW, CY, DT, DO>;
-    pa_launch_clustered<CY>(pa_prefill_16mx1_16nx4_kernel<Traits>, kargs, grid, block);
+    pa_prefill_16mx1_16nx4_kernel<pa_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int NW, int CY, class NOPE, class ROPE, class DO>
 inline void pa_launch(pa_16mx4_64nx1_fp8_traits<Q, KV, NW, CY, NOPE, ROPE, DO>,
@@ -827,6 +826,9 @@ int main(int argc, char** argv) {
             case 2: return run_pa_case<pa_16mx4_64nx1_fp8_traits<16, 64, 4, 2, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
             default: return run_pa_case<pa_16mx4_64nx1_fp8_traits<16, 64, 4, 1, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
         }
+    }
+    if (H <= 32) {
+        return run_pa_case<pa_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
     }
     switch (cluster_y) {
         case 2: return run_pa_case<pa_16mx4_64nx1_traits<16, 64, 512, 4, 2, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
