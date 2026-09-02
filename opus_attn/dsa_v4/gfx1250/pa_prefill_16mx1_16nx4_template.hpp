@@ -314,20 +314,14 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(
         gather_off ^= (u32_t)BUF_ELEMS;
     };
 
-    issue_tile(0);
-
-    for (int tile = 0; tile < num_kv_tiles; ++tile) {
-        if (tile + 1 < num_kv_tiles) {
-            issue_tile(tile + 1);
-            s_wait_tensorcnt(number<T::TDM_LOADS_PER_WAVE>{});
-        } else {
-            s_wait_tensorcnt(0_I);
-        }
+    auto accum_tile = [&](int tile, auto mask_tail) __attribute__((always_inline)) {
         v_k = load<T::VEC_KV>(s_k, u_rk);
 
         clear(v_s);
         v_s = mma0(v_q, v_k, v_s);
-        attn_mask_oob_score<T>(v_s, valid_kv_len, tile, wave_kv_base);
+        if constexpr (decltype(mask_tail)::value) {
+            attn_mask_oob_score<T>(v_s, valid_kv_len, tile, wave_kv_base);
+        }
 
         ml_arrive<T>(s_m, attn_row_max<T>(v_s), warp_id, lane_id);
         const D_ACC tile_max = ml_reduce<T>(s_m, lane_id, [](D_ACC x, D_ACC y) { return max(x, y); })
@@ -359,7 +353,18 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(
 
         advance_bufs();
         __builtin_amdgcn_s_barrier();
+    };
+
+    issue_tile(0);
+
+    for (int tile = 0; tile + 1 < num_kv_tiles; ++tile) {
+        issue_tile(tile + 1);
+        s_wait_tensorcnt(number<T::TDM_LOADS_PER_WAVE>{});
+        accum_tile(tile, false_type{});
     }
+
+    s_wait_tensorcnt(0_I);
+    accum_tile(num_kv_tiles - 1, true_type{});
 }
 
 } // namespace pa_16mx1_16nx4
