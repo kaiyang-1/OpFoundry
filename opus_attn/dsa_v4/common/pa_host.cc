@@ -60,6 +60,10 @@ template<class Traits>
 __global__ void pa_prefill_32mx1_16nx4_kernel(pa_kargs kargs);
 template<class Traits>
 __global__ void pa_prefill_16mx4_64nx1_fp8_kernel(pa_fp8_kargs kargs);
+template<class Traits>
+__global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs kargs);
+template<class Traits>
+__global__ void pa_prefill_32mx1_16nx4_fp8_kernel(pa_fp8_kargs kargs);
 
 constexpr int pa_max_cluster_y = 2;
 
@@ -121,6 +125,16 @@ inline void pa_launch(pa_16mx4_64nx1_fp8_traits<Q, KV, NW, CY, NOPE, ROPE, DO>,
                       const pa_fp8_kargs& kargs, dim3 grid, dim3 block) {
     using Traits = pa_16mx4_64nx1_fp8_traits<Q, KV, NW, CY, NOPE, ROPE, DO>;
     pa_launch_clustered<CY>(pa_prefill_16mx4_64nx1_fp8_kernel<Traits>, kargs, grid, block);
+}
+template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
+inline void pa_launch(pa_16mx1_16nx4_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>,
+                      const pa_fp8_kargs& kargs, dim3 grid, dim3 block) {
+    pa_prefill_16mx1_16nx4_fp8_kernel<pa_16mx1_16nx4_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
+}
+template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
+inline void pa_launch(pa_32mx1_16nx4_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>,
+                      const pa_fp8_kargs& kargs, dim3 grid, dim3 block) {
+    pa_prefill_32mx1_16nx4_fp8_kernel<pa_32mx1_16nx4_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 #else
 #  error "No target arch defined. The Makefile passes PA_ARCH_<ARCH> from ARCH (e.g. ARCH=gfx950)."
@@ -829,6 +843,12 @@ int main(int argc, char** argv) {
 #elif defined(PA_ARCH_GFX1250)
     const int cluster_y = pa_pick_cluster_y(ceil_div(H, 64));
     if (use_fp8) {
+        if (H <= 16) {
+            return run_pa_case<pa_16mx1_16nx4_fp8_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        }
+        if (H <= 32) {
+            return run_pa_case<pa_32mx1_16nx4_fp8_traits<32, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        }
         switch (cluster_y) {
             case 2: return run_pa_case<pa_16mx4_64nx1_fp8_traits<16, 64, 4, 2, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
             default: return run_pa_case<pa_16mx4_64nx1_fp8_traits<16, 64, 4, 1, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
