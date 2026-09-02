@@ -13,9 +13,10 @@ SCHED_FLAGS_gfx1250 = -mllvm -amdgpu-expert-scheduling-mode \
                       -mllvm -amdgpu-sched-strategy=coexec \
                       -mllvm -amdgpu-anti-hints-for-va-vdst
 
+SAVE_TEMPS   ?=
 COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -pthread -O3 -Wall -D$(ARCH_MACRO) --offload-arch=$(ARCH)
 KERNEL_FLAGS = -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage --no-offload-new-driver \
-               -save-temps=obj $(SCHED_FLAGS_$(ARCH))
+               $(if $(SAVE_TEMPS),-save-temps=obj,) $(SCHED_FLAGS_$(ARCH))
 LINK_FLAGS   = --offload-arch=$(ARCH) -pthread
 
 BUILD = build/$(ARCH)

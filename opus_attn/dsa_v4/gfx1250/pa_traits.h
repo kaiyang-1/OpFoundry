@@ -160,6 +160,111 @@ struct pa_16mx1_16nx4_traits {
     }
 };
 
+template<int Q_TILE_SIZE_ = 32,
+         int KV_TILE_SIZE_ = 64,
+         int D_TILE_SIZE_ = 512,
+         int NUM_WARPS_ = 4,
+         typename D_ATTN_ = bf16_t,
+         typename D_OUT_ = bf16_t>
+struct pa_32mx1_16nx4_traits {
+    static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
+    static constexpr int D_HEAD_SIZE = D_TILE_SIZE;
+    static constexpr int NUM_WARPS = NUM_WARPS_;
+
+    static constexpr int WARP_SIZE = 32;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+
+    using D_ATTN = D_ATTN_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    // Wave grid
+    static constexpr int T_M = 1;
+    static constexpr int T_N = NUM_WARPS;
+    static constexpr int T_K = 1;
+
+    // WMMA base tile
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 32;
+
+    // GEMM0: S = Q @ K^T
+    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM0_E_N = KV_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM0_E_K = D_TILE_SIZE / W_K;
+
+    // GEMM1: O = P @ V
+    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM1_E_N = D_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
+
+    static constexpr int VEC_Q  = 8;
+    static constexpr int VEC_KV = 8;
+    static constexpr int VEC_P  = 8;
+    static constexpr int VEC_O  = 8;
+
+    // ds_load instruction count per GEMM0 / GEMM1 tile
+    static constexpr int k_ds_load_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
+    static constexpr int v_ds_load_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
+
+    // Q/O staging tile, shared by the whole workgroup
+    static constexpr int QO_ROWS_PER_WAVE = Q_TILE_SIZE / NUM_WARPS;
+    static constexpr int Q_ROW_LDS_ELEMS  = D_TILE_SIZE + 16 / sizeof(D_ATTN);
+    static constexpr int O_ROW_LDS_ELEMS  = D_TILE_SIZE + 16 / sizeof(D_OUT);
+    static constexpr int Q_TILE_LDS_BYTES = Q_TILE_SIZE * Q_ROW_LDS_ELEMS * sizeof(D_ATTN);
+    static constexpr int O_TILE_LDS_BYTES = Q_TILE_SIZE * O_ROW_LDS_ELEMS * sizeof(D_OUT);
+    static constexpr int QO_LDS_BYTES     = Q_TILE_LDS_BYTES > O_TILE_LDS_BYTES ? Q_TILE_LDS_BYTES : O_TILE_LDS_BYTES;
+
+    // TDM gather KV load
+    static constexpr int ROWS_PER_WAVE      = KV_TILE_SIZE / NUM_WARPS;
+    static constexpr int INDICES_PER_TDM    = 8;                                     // 32-bit gather cap
+    static constexpr int TDM_LOADS_PER_WAVE = ROWS_PER_WAVE / INDICES_PER_TDM;
+    static constexpr int KV_ROW_PAD_SIZE    = 16 / sizeof(D_ATTN);
+    static constexpr int KV_ROW_LDS_BYTES   = D_TILE_SIZE * sizeof(D_ATTN) + 16;
+    static constexpr int KV_ROW_LDS_ELEMS   = D_TILE_SIZE + KV_ROW_PAD_SIZE;
+
+    // KV ring
+    static constexpr int WAVE_LDS_BYTES = ROWS_PER_WAVE * KV_ROW_LDS_BYTES;
+    static constexpr int KV_BUF_BYTES   = KV_TILE_SIZE * KV_ROW_LDS_BYTES;      // slot stride
+    static constexpr int KV_BUF_ELEMS   = KV_BUF_BYTES / (int)sizeof(D_ATTN);
+    static constexpr int NUM_KV_BUFS    = 4;                                    // a slot is K one round and V the next, and reuse trails it by two barriers
+    static constexpr int GATHER_AHEAD   = 2;
+    static constexpr int KV_LDS_BYTES   = NUM_KV_BUFS * KV_BUF_BYTES;
+
+    // Cross-wave row-max exchange, [m-block][head row][wave]: one b128 read per row
+    static constexpr int ML_SLOT_ELEMS = GEMM0_E_M * W_M * T_N;
+    static constexpr int ML_SLOT_BYTES = ML_SLOT_ELEMS * (int)sizeof(D_ACC);
+    static constexpr int M_LDS_OFF     = KV_LDS_BYTES;
+    static constexpr int L_LDS_OFF     = M_LDS_OFF + ML_SLOT_BYTES;
+
+    // Cross-wave P exchange, [m-block][wave][chunk][lane][VEC_P]: 16B lane stride, and
+    // the block order is the mma1 A-operand order so neither side shuffles lanes
+    static constexpr int P_CHUNKS      = GEMM0_E_N * W_M * W_N / (WARP_SIZE * VEC_P);
+    static constexpr int P_BLOCK_ELEMS = WARP_SIZE * VEC_P;
+    static constexpr int P_NUM_BLOCKS  = GEMM0_E_M * T_N * P_CHUNKS;
+    static constexpr int P_LDS_OFF     = L_LDS_OFF + ML_SLOT_BYTES;
+    static constexpr int P_LDS_BYTES   = P_NUM_BLOCKS * P_BLOCK_ELEMS * (int)sizeof(D_ATTN);
+
+    static constexpr int ACCUM_LDS_BYTES = P_LDS_OFF + P_LDS_BYTES;
+
+    static_assert(Q_TILE_SIZE % W_M == 0, "Q tile must be a whole number of WMMA M blocks");
+    static_assert(Q_TILE_SIZE % NUM_WARPS == 0, "Q tile rows must split evenly across waves for the TDM load");
+    static_assert(KV_TILE_SIZE % (W_N * T_N) == 0, "KV tile must split evenly into per-wave WMMA N blocks");
+    static_assert(D_TILE_SIZE % (W_N * T_N) == 0, "GEMM1 N must split evenly across waves");
+    static_assert(ROWS_PER_WAVE % INDICES_PER_TDM == 0, "KV rows per wave must be a multiple of the gather width");
+    static_assert(ROWS_PER_WAVE <= 16, "one s_buffer_load_b512 must cover a wave's row indices");
+    static_assert(GEMM0_E_N * W_M * W_N % (WARP_SIZE * VEC_P) == 0, "P chunks must be whole VEC_P vectors");
+    static_assert(GEMM0_E_M == WARP_SIZE / W_M, "the single-dword row-max publish assumes one M block per lane group");
+    static_assert(NUM_KV_BUFS >= GATHER_AHEAD + 2, "a gather target must trail the last V read by two barrier rounds");
+    static_assert(ACCUM_LDS_BYTES <= 320 * 1024, "gfx1250 addressable LDS is 320KB per workgroup");
+
+    static constexpr size_t smem_size_bytes() {
+        return (size_t)(ACCUM_LDS_BYTES > QO_LDS_BYTES ? ACCUM_LDS_BYTES : QO_LDS_BYTES);
+    }
+};
+
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
          int NUM_WARPS_ = 4,
