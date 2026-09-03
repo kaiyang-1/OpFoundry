@@ -374,9 +374,13 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
 
     using k_nope_window = tdm<D_NOPE, seq<T::D_NOPE_PADDED_SIZE, T::INDICES_PER_TDM>,
                               tdm_traits::gather<32>,
+                              tdm_traits::cache<tdm_traits::make_cache_policy(
+                                  tdm_traits::load_temporal_hint::regular, tdm_traits::scope::cu)>,
                               tdm_traits::padding_auto<D_NOPE, T::D_NOPE_PADDED_SIZE>>;
     using k_rope_window = tdm<D_ROPE, seq<T::D_ROPE_SIZE, T::INDICES_PER_TDM>,
                               tdm_traits::gather<32>,
+                              tdm_traits::cache<tdm_traits::make_cache_policy(
+                                  tdm_traits::load_temporal_hint::regular, tdm_traits::scope::cu)>,
                               tdm_traits::padding_auto<D_ROPE, T::D_ROPE_SIZE>>;
 
     // Wave w gathers tile rows [w * ROWS_PER_WAVE, +ROWS_PER_WAVE), which land in one segment.

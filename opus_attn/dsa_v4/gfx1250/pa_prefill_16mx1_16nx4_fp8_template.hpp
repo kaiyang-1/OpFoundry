@@ -283,9 +283,13 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(
 
     using k_nope_window = tdm<D_NOPE, seq<T::D_NOPE_PADDED_SIZE, T::INDICES_PER_TDM>,
                               tdm_traits::gather<32>,
+                              tdm_traits::cache<tdm_traits::make_cache_policy(
+                                  tdm_traits::load_temporal_hint::regular, tdm_traits::scope::cu)>,
                               tdm_traits::padding_auto<D_NOPE, T::D_NOPE_PADDED_SIZE>>;
     using k_rope_window = tdm<D_ROPE, seq<T::D_ROPE_SIZE, T::INDICES_PER_TDM>,
                               tdm_traits::gather<32>,
+                              tdm_traits::cache<tdm_traits::make_cache_policy(
+                                  tdm_traits::load_temporal_hint::regular, tdm_traits::scope::cu)>,
                               tdm_traits::padding_auto<D_ROPE, T::D_ROPE_SIZE>>;
 
     auto tdm_k_nope = make_tdm<k_nope_window>(

@@ -249,6 +249,8 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(
 
     using kv_window = tdm<D_ATTN, seq<T::D_TILE_SIZE, T::INDICES_PER_TDM>,
                           tdm_traits::gather<32>,
+                          tdm_traits::cache<tdm_traits::make_cache_policy(
+                              tdm_traits::load_temporal_hint::regular, tdm_traits::scope::cu)>,
                           tdm_traits::padding_auto<D_ATTN, T::D_TILE_SIZE>>;
 
     auto tdm_kv = make_tdm<kv_window>((u32_t)reinterpret_cast<uintptr_t>(smem_buf + wave_lds_off),
