@@ -1,14 +1,14 @@
 #pragma once
 
 #include <opus/opus.hpp>
-#include "pa_traits.h"
-#include "pa_global_load.hpp"
+#include "mla_v4_traits.h"
+#include "mla_v4_global_load.hpp"
 #include <bit>
 #include <cstdint>
 
 using opus::operator""_I;
 
-namespace pa_16mx8_32nx1_fp8 {
+namespace opus_mla_v4_prefill_a8w8_16mx8_32nx1 {
 
 constexpr int MFMA_MASK    = 0x08;
 constexpr int VALU_MASK    = 0x02;
@@ -536,8 +536,8 @@ __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile
 }
 
 template<class Traits, class VQN, class VQR, class VO>
-__device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
-        pa_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
+__device__ void mla_v4_prefill_accum_le2_tiles(
+        opus_mla_v4_prefill_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
         const int* kv_indices,
         int page_idx_begin, int valid_kv_len, int num_kv_tiles,
         char* smem_kv,
@@ -735,8 +735,8 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
 }
 
 template<class Traits, bool OddTail, class VQN, class VQR, class VO>
-__device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
-        pa_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
+__device__ void mla_v4_prefill_accum_pipelined(
+        opus_mla_v4_prefill_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
         const int* kv_indices,
         int page_idx_begin, int valid_kv_len, int num_kv_tiles,
         char* smem_kv,
@@ -1428,13 +1428,13 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
     }
 }
 
-} // namespace pa_16mx8_32nx1_fp8
+} // namespace opus_mla_v4_prefill_a8w8_16mx8_32nx1
 
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_fp8_kernel(pa_fp8_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_fp8_kargs kargs) {
     using namespace opus;
-    using namespace pa_16mx8_32nx1_fp8;
+    using namespace opus_mla_v4_prefill_a8w8_16mx8_32nx1;
     using T = opus::remove_cvref_t<Traits>;
     using D_NOPE = typename T::D_NOPE;
     using D_ROPE = typename T::D_ROPE;
@@ -1490,7 +1490,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_16mx8_32nx1_fp8_le2_tiles<Traits>(
+            mla_v4_prefill_accum_le2_tiles<Traits>(
                 kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -1498,7 +1498,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
                 temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true>(
+            mla_v4_prefill_accum_pipelined<Traits, true>(
                 kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -1506,7 +1506,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
                 temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false>(
+            mla_v4_prefill_accum_pipelined<Traits, false>(
                 kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -1525,7 +1525,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_16mx8_32nx1_fp8_le2_tiles<Traits>(
+            mla_v4_prefill_accum_le2_tiles<Traits>(
                 kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -1533,7 +1533,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
                 temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true>(
+            mla_v4_prefill_accum_pipelined<Traits, true>(
                 kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -1541,7 +1541,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
                 temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false>(
+            mla_v4_prefill_accum_pipelined<Traits, false>(
                 kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,

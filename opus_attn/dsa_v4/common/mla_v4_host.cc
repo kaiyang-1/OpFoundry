@@ -13,60 +13,68 @@
 #include <cmath>
 #include <cassert>
 #include <type_traits>
-#include "common/pa_parallel.h"
+#include "common/mla_v4_parallel.h"
 
-#if defined(PA_ARCH_GFX950)
-#include "gfx950/pa_traits.h"
+#if defined(MLA_V4_ARCH_GFX950)
+#include "gfx950/mla_v4_traits.h"
 
 template<class Traits>
-__global__ void pa_prefill_16mx1_16nx4_kernel(pa_kargs kargs);
+__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs kargs);
 template<class Traits>
-__global__ void pa_prefill_16mx8_32nx1_kernel(pa_kargs kargs);
+__global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs kargs);
 template<class Traits>
-__global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs kargs);
+__global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
 template<class Traits>
-__global__ void pa_prefill_16mx8_32nx1_fp8_kernel(pa_fp8_kargs kargs);
+__global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
 
 // Launch wrappers — overloaded on the trait type so each selects its own kernel.
 template<int Q, int KV, int D, int NW, class DT, class DO>
-inline void pa_launch(pa_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>,
-                      const pa_kargs& kargs, dim3 grid, dim3 block) {
-    pa_prefill_16mx1_16nx4_kernel<pa_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>,
+                                  const opus_mla_v4_prefill_kargs& kargs, dim3 grid, dim3 block) {
+    opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel<opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int D, int NW, class DT, class DO>
-inline void pa_launch(pa_16mx8_32nx1_traits<Q, KV, D, NW, DT, DO>,
-                      const pa_kargs& kargs, dim3 grid, dim3 block) {
-    pa_prefill_16mx8_32nx1_kernel<pa_16mx8_32nx1_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<Q, KV, D, NW, DT, DO>,
+                                  const opus_mla_v4_prefill_kargs& kargs, dim3 grid, dim3 block) {
+    opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel<opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
-inline void pa_launch(pa_16mx1_16nx4_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>,
-                      const pa_fp8_kargs& kargs, dim3 grid, dim3 block) {
-    pa_prefill_16mx1_16nx4_fp8_kernel<pa_16mx1_16nx4_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>,
+                                  const opus_mla_v4_prefill_fp8_kargs& kargs, dim3 grid, dim3 block) {
+    opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel<opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
-inline void pa_launch(pa_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>,
-                      const pa_fp8_kargs& kargs, dim3 grid, dim3 block) {
-    pa_prefill_16mx8_32nx1_fp8_kernel<pa_16mx8_32nx1_fp8_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>,
+                                  const opus_mla_v4_prefill_fp8_kargs& kargs, dim3 grid, dim3 block) {
+    opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel<opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 
-#elif defined(PA_ARCH_GFX1250)
-#include "gfx1250/pa_traits.h"
+#elif defined(MLA_V4_ARCH_GFX1250)
+#include "gfx1250/mla_v4_traits.h"
 
 template<class Traits>
-__global__ void pa_prefill_16mx4_64nx1_kernel(pa_kargs kargs);
+__global__ void opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel(opus_mla_v4_prefill_kargs kargs);
 template<class Traits>
-__global__ void pa_prefill_16mx4_64nx1_fp8_kernel(pa_fp8_kargs kargs);
+__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs kargs);
+template<class Traits>
+__global__ void opus_mla_v4_prefill_a16w16_32mx1_16nx4_kernel(opus_mla_v4_prefill_kargs kargs);
+template<class Traits>
+__global__ void opus_mla_v4_prefill_a8w8_16mx4_64nx1_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
+template<class Traits>
+__global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
+template<class Traits>
+__global__ void opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
 
-constexpr int pa_max_cluster_y = 2;
+constexpr int mla_v4_max_cluster_y = 2;
 
-inline int pa_pick_cluster_y(int num_h_blocks) {
-    for (int c = pa_max_cluster_y; c > 1; c >>= 1)
+inline int mla_v4_pick_cluster_y(int num_h_blocks) {
+    for (int c = mla_v4_max_cluster_y; c > 1; c >>= 1)
         if (num_h_blocks % c == 0) return c;
     return 1;
 }
 
 template<int CY, class Kernel, class KArgs>
-inline void pa_launch_clustered(Kernel kernel, const KArgs& kargs, dim3 grid, dim3 block) {
+inline void mla_v4_prefill_launch_clustered(Kernel kernel, const KArgs& kargs, dim3 grid, dim3 block) {
     if constexpr (CY == 1) {
         kernel<<<grid, block>>>(kargs);
     } else {
@@ -97,19 +105,39 @@ inline void pa_launch_clustered(Kernel kernel, const KArgs& kargs, dim3 grid, di
 }
 
 template<int Q, int KV, int D, int NW, int CY, class DT, class DO>
-inline void pa_launch(pa_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>,
-                      const pa_kargs& kargs, dim3 grid, dim3 block) {
-    using Traits = pa_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>;
-    pa_launch_clustered<CY>(pa_prefill_16mx4_64nx1_kernel<Traits>, kargs, grid, block);
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>,
+                                  const opus_mla_v4_prefill_kargs& kargs, dim3 grid, dim3 block) {
+    using Traits = opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>;
+    mla_v4_prefill_launch_clustered<CY>(opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel<Traits>, kargs, grid, block);
+}
+template<int Q, int KV, int D, int NW, class DT, class DO>
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>,
+                                  const opus_mla_v4_prefill_kargs& kargs, dim3 grid, dim3 block) {
+    opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel<opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
+}
+template<int Q, int KV, int D, int NW, class DT, class DO>
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits<Q, KV, D, NW, DT, DO>,
+                                  const opus_mla_v4_prefill_kargs& kargs, dim3 grid, dim3 block) {
+    opus_mla_v4_prefill_a16w16_32mx1_16nx4_kernel<opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int NW, int CY, class NOPE, class ROPE, class DO>
-inline void pa_launch(pa_16mx4_64nx1_fp8_traits<Q, KV, NW, CY, NOPE, ROPE, DO>,
-                      const pa_fp8_kargs& kargs, dim3 grid, dim3 block) {
-    using Traits = pa_16mx4_64nx1_fp8_traits<Q, KV, NW, CY, NOPE, ROPE, DO>;
-    pa_launch_clustered<CY>(pa_prefill_16mx4_64nx1_fp8_kernel<Traits>, kargs, grid, block);
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<Q, KV, NW, CY, NOPE, ROPE, DO>,
+                                  const opus_mla_v4_prefill_fp8_kargs& kargs, dim3 grid, dim3 block) {
+    using Traits = opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<Q, KV, NW, CY, NOPE, ROPE, DO>;
+    mla_v4_prefill_launch_clustered<CY>(opus_mla_v4_prefill_a8w8_16mx4_64nx1_kernel<Traits>, kargs, grid, block);
+}
+template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>,
+                                  const opus_mla_v4_prefill_fp8_kargs& kargs, dim3 grid, dim3 block) {
+    opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel<opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
+}
+template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>,
+                                  const opus_mla_v4_prefill_fp8_kargs& kargs, dim3 grid, dim3 block) {
+    opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel<opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 #else
-#  error "No target arch defined. The Makefile passes PA_ARCH_<ARCH> from ARCH (e.g. ARCH=gfx950)."
+#  error "No target arch defined. The Makefile passes MLA_V4_ARCH_<ARCH> from ARCH (e.g. ARCH=gfx950)."
 #endif
 
 #define CHECK_HIP(call)                                                                                   \
@@ -126,7 +154,7 @@ inline void pa_launch(pa_16mx4_64nx1_fp8_traits<Q, KV, NW, CY, NOPE, ROPE, DO>,
 // Fill a contiguous vector with random values
 template<typename T>
 void rand_vector(T* ptr, size_t size, float min_val = 0.0f, float max_val = 1.0f) {
-    pa::parallel_chunks(size, pa::default_grain(size), [&](size_t begin, size_t end, unsigned) {
+    mla_v4::parallel_chunks(size, mla_v4::default_grain(size), [&](size_t begin, size_t end, unsigned) {
         std::random_device rd;
         std::mt19937 gen(rd() + static_cast<uint32_t>(begin));
         std::uniform_real_distribution<float> dis(min_val, max_val);
@@ -139,17 +167,17 @@ void rand_vector(T* ptr, size_t size, float min_val = 0.0f, float max_val = 1.0f
 // Initialize the split DSA fp8 streams. The NoPE stream packs, per row of
 // D_NOPE_PADDED_SIZE fp8 slots: [ NoPE fp8 (D_NOPE_SIZE) | E8M0 block scales
 // (D_NOPE_SIZE/32) | fp8 zero-pad ]. The RoPE stream holds D_ROPE_SIZE bf16.
-template<class PATraits>
-void init_fp8_dsa_split(typename PATraits::D_NOPE* nope_ptr,
-                        typename PATraits::D_ROPE* rope_ptr, size_t rows) {
-    using D_ROPE = typename PATraits::D_ROPE;
-    constexpr int NOPE_PADDED = PATraits::D_NOPE_PADDED_SIZE;  // fp8 slots/row (512)
-    constexpr int NOPE        = PATraits::D_NOPE_SIZE;         // NoPE fp8 elements (448)
+template<class Traits>
+void init_fp8_dsa_split(typename Traits::D_NOPE* nope_ptr,
+                        typename Traits::D_ROPE* rope_ptr, size_t rows) {
+    using D_ROPE = typename Traits::D_ROPE;
+    constexpr int NOPE_PADDED = Traits::D_NOPE_PADDED_SIZE;  // fp8 slots/row (512)
+    constexpr int NOPE        = Traits::D_NOPE_SIZE;         // NoPE fp8 elements (448)
     constexpr int SCALE       = NOPE / 32;                     // E8M0 scales (14)
-    constexpr int ROPE        = PATraits::D_ROPE_SIZE;         // RoPE bf16 elements (64)
+    constexpr int ROPE        = Traits::D_ROPE_SIZE;         // RoPE bf16 elements (64)
     static_assert(NOPE + SCALE <= NOPE_PADDED, "NoPE + scales exceed padded row");
 
-    pa::parallel_chunks(rows, pa::default_grain(rows), [&](size_t begin, size_t end, unsigned) {
+    mla_v4::parallel_chunks(rows, mla_v4::default_grain(rows), [&](size_t begin, size_t end, unsigned) {
         std::random_device rd;
         std::mt19937 gen(rd() + static_cast<uint32_t>(begin));
         std::uniform_real_distribution<float> dis(-2.0f, 2.0f);
@@ -255,12 +283,12 @@ void init_dense_kv_indices(std::vector<int>& kv_indptr,
     }
 }
 
-// Benchmark PA kernel performance with warm-up and timing
+// Benchmark MLA-v4 kernel performance with warm-up and timing
 template<class Traits, class KArgs>
-void benchmark_pa_kernel(const KArgs& kargs, dim3 grid, dim3 block,
-                          int indices_prefix_sum, int warmup = 100, int iterations = 50) {
+void benchmark_mla_v4_kernel(const KArgs& kargs, dim3 grid, dim3 block,
+                             int indices_prefix_sum, int warmup = 100, int iterations = 50) {
     for (int i = 0; i < warmup; ++i) {
-        pa_launch(Traits{}, kargs, grid, block);
+        mla_v4_prefill_launch(Traits{}, kargs, grid, block);
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipDeviceSynchronize());
@@ -271,7 +299,7 @@ void benchmark_pa_kernel(const KArgs& kargs, dim3 grid, dim3 block,
 
     CHECK_HIP(hipEventRecord(start));
     for (int i = 0; i < iterations; ++i) {
-        pa_launch(Traits{}, kargs, grid, block);
+        mla_v4_prefill_launch(Traits{}, kargs, grid, block);
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipEventRecord(stop));
@@ -295,7 +323,7 @@ void benchmark_pa_kernel(const KArgs& kargs, dim3 grid, dim3 block,
 
     // Bandwidth: Q read (packed row) + O write (bf16) + KV read (packed row), each its own dtype.
     size_t row_bytes;
-    if constexpr (std::is_same_v<KArgs, pa_fp8_kargs>) {
+    if constexpr (std::is_same_v<KArgs, opus_mla_v4_prefill_fp8_kargs>) {
         row_bytes = (size_t)Traits::D_NOPE_PADDED_SIZE * sizeof(typename Traits::D_NOPE)
                   + (size_t)Traits::D_ROPE_SIZE * sizeof(typename Traits::D_ROPE);
     } else {
@@ -306,11 +334,11 @@ void benchmark_pa_kernel(const KArgs& kargs, dim3 grid, dim3 block,
     const size_t kv_bytes = (size_t)indices_prefix_sum * row_bytes;
     const double tbps = double(q_bytes + o_bytes + kv_bytes) / (avg_time * 1e-3) / 1e12;
 
-    printf("PA Prefill Kernel Performance: avg_time=%.3f ms, %.2f TFlops, %.2f TB/s\n",
+    printf("MLA-v4 Prefill Kernel Performance: avg_time=%.3f ms, %.2f TFlops, %.2f TB/s\n",
            avg_time, tflops, tbps);
 }
 
-// Validate PA GPU results against CPU reference.
+// Validate GPU results against CPU reference.
 template<typename DType>
 bool validate_pa_results(const DType* ref, const DType* gpu,
                           int N, int H, int D,
@@ -369,18 +397,18 @@ bool validate_pa_results(const DType* ref, const DType* gpu,
 }
 
 // Reconstruct one bf16 stored row into a dense float[D_HEAD_SIZE].
-template<class PATraits>
-inline void decode_dsa_row_bf16(const typename PATraits::D_ATTN* row, float* out) {
-    constexpr int D_HEAD = PATraits::D_HEAD_SIZE;
+template<class Traits>
+inline void decode_dsa_row_bf16(const typename Traits::D_ATTN* row, float* out) {
+    constexpr int D_HEAD = Traits::D_HEAD_SIZE;
     for (int d = 0; d < D_HEAD; d++) out[d] = static_cast<float>(row[d]);
 }
 
 // Reconstruct one split fp8 row (NoPE+scales fp8 stream, RoPE bf16 stream) into dense float.
-template<class PATraits>
-inline void decode_dsa_row_fp8(const typename PATraits::D_NOPE* nrow,
-                               const typename PATraits::D_ROPE* rrow, float* out) {
-    constexpr int NOPE = PATraits::D_NOPE_SIZE;
-    constexpr int ROPE = PATraits::D_ROPE_SIZE;
+template<class Traits>
+inline void decode_dsa_row_fp8(const typename Traits::D_NOPE* nrow,
+                               const typename Traits::D_ROPE* rrow, float* out) {
+    constexpr int NOPE = Traits::D_NOPE_SIZE;
+    constexpr int ROPE = Traits::D_ROPE_SIZE;
     const auto* base = reinterpret_cast<const unsigned char*>(nrow);
     const auto* nope = reinterpret_cast<const __hip_fp8_e4m3*>(base);
     const unsigned char* scale = base + NOPE;  // raw E8M0 bytes
@@ -390,7 +418,7 @@ inline void decode_dsa_row_fp8(const typename PATraits::D_NOPE* nrow,
         out[NOPE + j] = static_cast<float>(rrow[j]);
 }
 
-// ─── CPU reference: Paged Attention (PA) ──────────────────────────
+// ─── CPU reference ──────────────────────────
 //
 // Sparse scaled-dot-product attention over two CSR ranges:
 //   prefix rows index UnifiedKV[total_pages, D]
@@ -398,11 +426,11 @@ inline void decode_dsa_row_fp8(const typename PATraits::D_NOPE* nrow,
 //   O[i,h,:] = softmax(Q[i,h,:] @ concat(prefix, extend)^T * softmax_scale) @ concat(prefix, extend)
 //
 // Softmax + PV for one (query, head) over already-dequantized dense rows.
-template<class PATraits>
-inline void pa_attention_compute(const float* q_dense, const float* kv_dense, int num_rows,
-                                 float sink, typename PATraits::D_OUT* o_row) {
-    using O_t = typename PATraits::D_OUT;
-    constexpr int D_HEAD = PATraits::D_HEAD_SIZE;
+template<class Traits>
+inline void mla_v4_attention_compute(const float* q_dense, const float* kv_dense, int num_rows,
+                                     float sink, typename Traits::D_OUT* o_row) {
+    using O_t = typename Traits::D_OUT;
+    constexpr int D_HEAD = Traits::D_HEAD_SIZE;
     const float softmax_scale = 1.0f / std::sqrt(static_cast<float>(D_HEAD));
 
     std::vector<float> scores(num_rows);
@@ -425,29 +453,29 @@ inline void pa_attention_compute(const float* q_dense, const float* kv_dense, in
     }
 }
 
-template<class PATraits>
-void pa_attention_ref(
-    const typename PATraits::D_ATTN* Q,         // [N, H, ROW]  (ROW = D_TILE_SIZE storage stride)
-    const typename PATraits::D_ATTN* UnifiedKV, // [total_pages, ROW]
-    const typename PATraits::D_ATTN* KV,        // [total_tokens, ROW]
+template<class Traits>
+void mla_v4_attention_ref(
+    const typename Traits::D_ATTN* Q,         // [N, H, ROW]  (ROW = D_TILE_SIZE storage stride)
+    const typename Traits::D_ATTN* UnifiedKV, // [total_pages, ROW]
+    const typename Traits::D_ATTN* KV,        // [total_tokens, ROW]
     const float*  AttnSink,                     // [H]
-    typename PATraits::D_OUT* O,                // [N, H, D_HEAD]
+    typename Traits::D_OUT* O,                // [N, H, D_HEAD]
     const int* kv_indptr_prefix,
     const int* kv_indices_prefix,
     const int* kv_indptr_extend,
     const int* kv_indices_extend,
     int N, int H)
 {
-    using O_t = typename PATraits::D_OUT;
-    constexpr int D_HEAD = PATraits::D_HEAD_SIZE;
-    constexpr int ROW    = PATraits::D_TILE_SIZE;
+    using O_t = typename Traits::D_OUT;
+    constexpr int D_HEAD = Traits::D_HEAD_SIZE;
+    constexpr int ROW    = Traits::D_TILE_SIZE;
     const int stride_qo_n = H * ROW;
     const int stride_qo_h = ROW;
     const int stride_kv_page = ROW;
     const int o_stride_n = H * D_HEAD;
     const int o_stride_h = D_HEAD;
 
-    pa::parallel_for((size_t)H * N, [&](size_t idx) {
+    mla_v4::parallel_for((size_t)H * N, [&](size_t idx) {
         const int h = static_cast<int>(idx / N);
         const int i = static_cast<int>(idx % N);
         const int prefix_begin = kv_indptr_prefix[i];
@@ -463,40 +491,40 @@ void pa_attention_ref(
         }
 
         std::vector<float> q_dense(D_HEAD);
-        decode_dsa_row_bf16<PATraits>(Q + (size_t)i * stride_qo_n + h * stride_qo_h, q_dense.data());
+        decode_dsa_row_bf16<Traits>(Q + (size_t)i * stride_qo_n + h * stride_qo_h, q_dense.data());
 
         std::vector<float> kv_dense((size_t)num_rows * D_HEAD);
         for (int p = 0; p < num_prefix; p++)
-            decode_dsa_row_bf16<PATraits>(UnifiedKV + (size_t)kv_indices_prefix[prefix_begin + p] * stride_kv_page,
+            decode_dsa_row_bf16<Traits>(UnifiedKV + (size_t)kv_indices_prefix[prefix_begin + p] * stride_kv_page,
                                           kv_dense.data() + (size_t)p * D_HEAD);
         for (int p = 0; p < num_extend; p++)
-            decode_dsa_row_bf16<PATraits>(KV + (size_t)kv_indices_extend[extend_begin + p] * stride_kv_page,
+            decode_dsa_row_bf16<Traits>(KV + (size_t)kv_indices_extend[extend_begin + p] * stride_kv_page,
                                           kv_dense.data() + (size_t)(num_prefix + p) * D_HEAD);
 
-        pa_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, AttnSink[h], o_row);
+        mla_v4_attention_compute<Traits>(q_dense.data(), kv_dense.data(), num_rows, AttnSink[h], o_row);
     });
 }
 
 // fp8 reference operating on the split NoPE (fp8) and RoPE (bf16) streams.
-template<class PATraits>
-void pa_attention_ref_fp8(
-    const typename PATraits::D_NOPE* Q_nope, const typename PATraits::D_ROPE* Q_rope,
-    const typename PATraits::D_NOPE* UKV_nope, const typename PATraits::D_ROPE* UKV_rope,
-    const typename PATraits::D_NOPE* KV_nope, const typename PATraits::D_ROPE* KV_rope,
+template<class Traits>
+void mla_v4_attention_ref_fp8(
+    const typename Traits::D_NOPE* Q_nope, const typename Traits::D_ROPE* Q_rope,
+    const typename Traits::D_NOPE* UKV_nope, const typename Traits::D_ROPE* UKV_rope,
+    const typename Traits::D_NOPE* KV_nope, const typename Traits::D_ROPE* KV_rope,
     const float* AttnSink,
-    typename PATraits::D_OUT* O,
+    typename Traits::D_OUT* O,
     const int* kv_indptr_prefix, const int* kv_indices_prefix,
     const int* kv_indptr_extend, const int* kv_indices_extend,
     int N, int H)
 {
-    using O_t = typename PATraits::D_OUT;
-    constexpr int D_HEAD = PATraits::D_HEAD_SIZE;
-    constexpr int NOPE_PADDED = PATraits::D_NOPE_PADDED_SIZE;
-    constexpr int ROPE = PATraits::D_ROPE_SIZE;
+    using O_t = typename Traits::D_OUT;
+    constexpr int D_HEAD = Traits::D_HEAD_SIZE;
+    constexpr int NOPE_PADDED = Traits::D_NOPE_PADDED_SIZE;
+    constexpr int ROPE = Traits::D_ROPE_SIZE;
     const int o_stride_n = H * D_HEAD;
     const int o_stride_h = D_HEAD;
 
-    pa::parallel_for((size_t)H * N, [&](size_t idx) {
+    mla_v4::parallel_for((size_t)H * N, [&](size_t idx) {
         const int h = static_cast<int>(idx / N);
         const int i = static_cast<int>(idx % N);
         const int prefix_begin = kv_indptr_prefix[i];
@@ -513,37 +541,37 @@ void pa_attention_ref_fp8(
 
         std::vector<float> q_dense(D_HEAD);
         const size_t q_row = (size_t)i * H + h;
-        decode_dsa_row_fp8<PATraits>(Q_nope + q_row * NOPE_PADDED, Q_rope + q_row * ROPE, q_dense.data());
+        decode_dsa_row_fp8<Traits>(Q_nope + q_row * NOPE_PADDED, Q_rope + q_row * ROPE, q_dense.data());
 
         std::vector<float> kv_dense((size_t)num_rows * D_HEAD);
         for (int p = 0; p < num_prefix; p++) {
             const int kv_row = kv_indices_prefix[prefix_begin + p];
-            decode_dsa_row_fp8<PATraits>(UKV_nope + (size_t)kv_row * NOPE_PADDED, UKV_rope + (size_t)kv_row * ROPE,
+            decode_dsa_row_fp8<Traits>(UKV_nope + (size_t)kv_row * NOPE_PADDED, UKV_rope + (size_t)kv_row * ROPE,
                                          kv_dense.data() + (size_t)p * D_HEAD);
         }
         for (int p = 0; p < num_extend; p++) {
             const int kv_row = kv_indices_extend[extend_begin + p];
-            decode_dsa_row_fp8<PATraits>(KV_nope + (size_t)kv_row * NOPE_PADDED, KV_rope + (size_t)kv_row * ROPE,
+            decode_dsa_row_fp8<Traits>(KV_nope + (size_t)kv_row * NOPE_PADDED, KV_rope + (size_t)kv_row * ROPE,
                                          kv_dense.data() + (size_t)(num_prefix + p) * D_HEAD);
         }
 
-        pa_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, AttnSink[h], o_row);
+        mla_v4_attention_compute<Traits>(q_dense.data(), kv_dense.data(), num_rows, AttnSink[h], o_row);
     });
 }
 
 // ─── main ───────────────────────────────────────────────────────────────────
 
-template<class PATraits>
-int run_pa_case(int H, int N, int total_pages, int total_tokens,
-                bool verify, bool dense_kv) {
-    using DType = typename PATraits::D_ATTN;   // input storage dtype (fp8 packed, or bf16)
-    using OType = typename PATraits::D_OUT;     // output dtype (default bf16)
+template<class Traits>
+int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
+                            bool verify, bool dense_kv) {
+    using DType = typename Traits::D_ATTN;   // input storage dtype (fp8 packed, or bf16)
+    using OType = typename Traits::D_OUT;     // output dtype (default bf16)
     constexpr bool is_fp8 = std::is_same_v<DType, fp8_t> || std::is_same_v<DType, bf8_t>;
     const char* precision = is_fp8 ? "NoPE=fp8, RoPE=bf16" : "NoPE=bf16, RoPE=bf16";
-    printf("PA Prefill Attention: H_Q=%d, N=%d, D=%d, %s, total_pages=%d, total_tokens=%d\n",
-           H, N, PATraits::D_HEAD_SIZE, precision, total_pages, total_tokens);
+    printf("MLA-v4 Prefill Attention: H_Q=%d, N=%d, D=%d, %s, total_pages=%d, total_tokens=%d\n",
+           H, N, Traits::D_HEAD_SIZE, precision, total_pages, total_tokens);
 
-    constexpr int D_HEAD = PATraits::D_HEAD_SIZE;
+    constexpr int D_HEAD = Traits::D_HEAD_SIZE;
     const size_t o_size = (size_t)N * H * D_HEAD;
 
     auto host_attn_sink = std::make_unique<float[]>(H);
@@ -557,8 +585,8 @@ int run_pa_case(int H, int N, int total_pages, int total_tokens,
         init_dense_kv_indices(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages);
         init_dense_kv_indices(host_kv_indptr_extend, host_kv_indices_extend, N, total_tokens);
     } else {
-        init_sparse_kv_indices(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages, PATraits::KV_TILE_SIZE, 1234);
-        init_sparse_kv_indices(host_kv_indptr_extend, host_kv_indices_extend, N, total_tokens, PATraits::KV_TILE_SIZE, 5678);
+        init_sparse_kv_indices(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages, Traits::KV_TILE_SIZE, 1234);
+        init_sparse_kv_indices(host_kv_indptr_extend, host_kv_indices_extend, N, total_tokens, Traits::KV_TILE_SIZE, 5678);
     }
     const size_t total_kv_indices = host_kv_indices_prefix.size() + host_kv_indices_extend.size();
     assert(total_kv_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
@@ -584,15 +612,15 @@ int run_pa_case(int H, int N, int total_pages, int total_tokens,
     if (!host_kv_indices_extend.empty())
         CHECK_HIP(hipMemcpy(dev_kv_indices_extend, host_kv_indices_extend.data(), host_kv_indices_extend.size() * sizeof(int), hipMemcpyHostToDevice));
 
-    const int num_h_blocks = ceil_div(H, PATraits::Q_TILE_SIZE * PATraits::T_M);
+    const int num_h_blocks = ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M);
     dim3 grid(N, num_h_blocks, 1);
-    dim3 block(PATraits::BLOCK_SIZE);
-    printf("PA kernel launch config: grid=(%d,%d,%d), block=%d (NUM_WARPS=%d), smem=%zu bytes (K/V tiles)\n",
-           grid.x, grid.y, grid.z, (int)block.x, PATraits::NUM_WARPS, PATraits::smem_size_bytes());
+    dim3 block(Traits::BLOCK_SIZE);
+    printf("MLA-v4 kernel launch config: grid=(%d,%d,%d), block=%d (NUM_WARPS=%d), smem=%zu bytes (K/V tiles)\n",
+           grid.x, grid.y, grid.z, (int)block.x, Traits::NUM_WARPS, Traits::smem_size_bytes());
 
     int rc = 0;
     auto verify_and_bench = [&](const auto& kargs) {
-        pa_launch(PATraits{}, kargs, grid, block);
+        mla_v4_prefill_launch(Traits{}, kargs, grid, block);
         CHECK_HIP_KERNEL_LAUNCH();
         if (verify) {
             printf("\nValidating GPU results against CPU reference...\n");
@@ -603,16 +631,16 @@ int run_pa_case(int H, int N, int total_pages, int total_tokens,
         }
         if (!rc) {
             printf("\n");
-            benchmark_pa_kernel<PATraits>(kargs, grid, block, indices_prefix_sum);
+            benchmark_mla_v4_kernel<Traits>(kargs, grid, block, indices_prefix_sum);
             printf("\n");
         }
     };
 
     if constexpr (is_fp8) {
-        using D_NOPE = typename PATraits::D_NOPE;
-        using D_ROPE = typename PATraits::D_ROPE;
-        constexpr int NOPE_PADDED = PATraits::D_NOPE_PADDED_SIZE;
-        constexpr int ROPE = PATraits::D_ROPE_SIZE;
+        using D_NOPE = typename Traits::D_NOPE;
+        using D_ROPE = typename Traits::D_ROPE;
+        constexpr int NOPE_PADDED = Traits::D_NOPE_PADDED_SIZE;
+        constexpr int ROPE = Traits::D_ROPE_SIZE;
         const size_t q_nope_size = (size_t)N * H * NOPE_PADDED, q_rope_size = (size_t)N * H * ROPE;
         const size_t ukv_nope_size = (size_t)total_pages * NOPE_PADDED, ukv_rope_size = (size_t)total_pages * ROPE;
         const size_t kv_nope_size = (size_t)total_tokens * NOPE_PADDED, kv_rope_size = (size_t)total_tokens * ROPE;
@@ -623,9 +651,9 @@ int run_pa_case(int H, int N, int total_pages, int total_tokens,
         auto host_ukv_rope = std::make_unique<D_ROPE[]>(ukv_rope_size);
         auto host_kv_nope = std::make_unique<D_NOPE[]>(kv_nope_size);
         auto host_kv_rope = std::make_unique<D_ROPE[]>(kv_rope_size);
-        init_fp8_dsa_split<PATraits>(host_q_nope.get(), host_q_rope.get(), (size_t)N * H);
-        init_fp8_dsa_split<PATraits>(host_ukv_nope.get(), host_ukv_rope.get(), (size_t)total_pages);
-        init_fp8_dsa_split<PATraits>(host_kv_nope.get(), host_kv_rope.get(), (size_t)total_tokens);
+        init_fp8_dsa_split<Traits>(host_q_nope.get(), host_q_rope.get(), (size_t)N * H);
+        init_fp8_dsa_split<Traits>(host_ukv_nope.get(), host_ukv_rope.get(), (size_t)total_pages);
+        init_fp8_dsa_split<Traits>(host_kv_nope.get(), host_kv_rope.get(), (size_t)total_tokens);
 
         D_NOPE *dev_q_nope, *dev_ukv_nope, *dev_kv_nope;
         D_ROPE *dev_q_rope, *dev_ukv_rope, *dev_kv_rope;
@@ -643,12 +671,12 @@ int run_pa_case(int H, int N, int total_pages, int total_tokens,
         CHECK_HIP(hipMemcpy(dev_kv_rope, host_kv_rope.get(), kv_rope_size * sizeof(D_ROPE), hipMemcpyHostToDevice));
 
         if (verify)
-            pa_attention_ref_fp8<PATraits>(host_q_nope.get(), host_q_rope.get(), host_ukv_nope.get(), host_ukv_rope.get(),
+            mla_v4_attention_ref_fp8<Traits>(host_q_nope.get(), host_q_rope.get(), host_ukv_nope.get(), host_ukv_rope.get(),
                                            host_kv_nope.get(), host_kv_rope.get(), host_attn_sink.get(), host_o_ref.get(),
                                            host_kv_indptr_prefix.data(), host_kv_indices_prefix.data(),
                                            host_kv_indptr_extend.data(), host_kv_indices_extend.data(), N, H);
 
-        pa_fp8_kargs kargs{};
+        opus_mla_v4_prefill_fp8_kargs kargs{};
         kargs.q_nope_ptr = dev_q_nope;
         kargs.q_rope_ptr = dev_q_rope;
         kargs.unified_kv_nope_ptr = dev_ukv_nope;
@@ -681,7 +709,7 @@ int run_pa_case(int H, int N, int total_pages, int total_tokens,
         CHECK_HIP(hipFree(dev_ukv_nope)); CHECK_HIP(hipFree(dev_ukv_rope));
         CHECK_HIP(hipFree(dev_kv_nope));  CHECK_HIP(hipFree(dev_kv_rope));
     } else {
-        constexpr int D = PATraits::D_TILE_SIZE;
+        constexpr int D = Traits::D_TILE_SIZE;
         const size_t q_size = (size_t)N * H * D;
         const size_t unified_kv_size = (size_t)total_pages * D;
         const size_t kv_size = (size_t)total_tokens * D;
@@ -702,11 +730,11 @@ int run_pa_case(int H, int N, int total_pages, int total_tokens,
         CHECK_HIP(hipMemcpy(dev_kv, host_kv.get(), kv_size * sizeof(DType), hipMemcpyHostToDevice));
 
         if (verify)
-            pa_attention_ref<PATraits>(host_q.get(), host_unified_kv.get(), host_kv.get(), host_attn_sink.get(), host_o_ref.get(),
+            mla_v4_attention_ref<Traits>(host_q.get(), host_unified_kv.get(), host_kv.get(), host_attn_sink.get(), host_o_ref.get(),
                                        host_kv_indptr_prefix.data(), host_kv_indices_prefix.data(),
                                        host_kv_indptr_extend.data(), host_kv_indices_extend.data(), N, H);
 
-        pa_kargs kargs{};
+        opus_mla_v4_prefill_kargs kargs{};
         kargs.q_ptr = dev_q;
         kargs.unified_kv_ptr = dev_unified_kv;
         kargs.kv_ptr = dev_kv;
@@ -803,26 +831,38 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-#if defined(PA_ARCH_GFX950)
+#if defined(MLA_V4_ARCH_GFX950)
     if (use_fp8) {
         return H <= 32
-            ? run_pa_case<pa_16mx1_16nx4_fp8_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
-            : run_pa_case<pa_16mx8_32nx1_fp8_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+            ? run_mla_v4_prefill_case<opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
+            : run_mla_v4_prefill_case<opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
     }
     return H <= 32
-        ? run_pa_case<pa_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
-        : run_pa_case<pa_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
-#elif defined(PA_ARCH_GFX1250)
-    const int cluster_y = pa_pick_cluster_y(ceil_div(H, 64));
+        ? run_mla_v4_prefill_case<opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
+        : run_mla_v4_prefill_case<opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+#elif defined(MLA_V4_ARCH_GFX1250)
+    const int cluster_y = mla_v4_pick_cluster_y(ceil_div(H, 64));
     if (use_fp8) {
+        if (H <= 16) {
+            return run_mla_v4_prefill_case<opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        }
+        if (H <= 32) {
+            return run_mla_v4_prefill_case<opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<32, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        }
         switch (cluster_y) {
-            case 2: return run_pa_case<pa_16mx4_64nx1_fp8_traits<16, 64, 4, 2, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
-            default: return run_pa_case<pa_16mx4_64nx1_fp8_traits<16, 64, 4, 1, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+            case 2: return run_mla_v4_prefill_case<opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, 2, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+            default: return run_mla_v4_prefill_case<opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, 1, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
         }
     }
+    if (H <= 16) {
+        return run_mla_v4_prefill_case<opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+    }
+    if (H <= 32) {
+        return run_mla_v4_prefill_case<opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits<32, 64, 512, 4, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+    }
     switch (cluster_y) {
-        case 2: return run_pa_case<pa_16mx4_64nx1_traits<16, 64, 512, 4, 2, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
-        default: return run_pa_case<pa_16mx4_64nx1_traits<16, 64, 512, 4, 1, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        case 2: return run_mla_v4_prefill_case<opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, 2, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        default: return run_mla_v4_prefill_case<opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, 1, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
     }
 #endif
 }

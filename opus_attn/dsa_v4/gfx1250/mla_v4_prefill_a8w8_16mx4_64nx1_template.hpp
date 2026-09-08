@@ -1,13 +1,13 @@
 #pragma once
 
 #include <opus/opus.hpp>
-#include "pa_traits.h"
+#include "mla_v4_traits.h"
 #include <cstdint>
 #include <bit>
 
 using opus::operator""_I;
 
-namespace pa_16mx4_64nx1_fp8 {
+namespace opus_mla_v4_prefill_a8w8_16mx4_64nx1 {
 
 OPUS_D opus::u32x16_t s_buffer_load_b512(opus::u32x4_t rsrc, int soffset) {
     opus::u32x16_t ids;
@@ -266,7 +266,7 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
 }
 
 template<class Traits, int SLOT_SWAP, class VQN, class VQR, class VQS, class VO>
-__device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8_kargs kargs,
+__device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_fp8_kargs kargs,
                                            const void* kv_nope_ptr, const void* kv_rope_ptr, int kv_rows,
                                            const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
                                            char* smem_kv_buf,
@@ -374,9 +374,13 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
 
     using k_nope_window = tdm<D_NOPE, seq<T::D_NOPE_PADDED_SIZE, T::INDICES_PER_TDM>,
                               tdm_traits::gather<32>,
+                              tdm_traits::cache<tdm_traits::make_cache_policy(
+                                  tdm_traits::load_temporal_hint::regular, tdm_traits::scope::cu)>,
                               tdm_traits::padding_auto<D_NOPE, T::D_NOPE_PADDED_SIZE>>;
     using k_rope_window = tdm<D_ROPE, seq<T::D_ROPE_SIZE, T::INDICES_PER_TDM>,
                               tdm_traits::gather<32>,
+                              tdm_traits::cache<tdm_traits::make_cache_policy(
+                                  tdm_traits::load_temporal_hint::regular, tdm_traits::scope::cu)>,
                               tdm_traits::padding_auto<D_ROPE, T::D_ROPE_SIZE>>;
 
     // Wave w gathers tile rows [w * ROWS_PER_WAVE, +ROWS_PER_WAVE), which land in one segment.
@@ -620,12 +624,12 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(pa_fp8
     compute_pv(0_I, false_type{});
 }
 
-} // namespace pa_16mx4_64nx1_fp8
+} // namespace opus_mla_v4_prefill_a8w8_16mx4_64nx1
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_fp8_kernel(pa_fp8_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void opus_mla_v4_prefill_a8w8_16mx4_64nx1_kernel(opus_mla_v4_prefill_fp8_kargs kargs) {
     using namespace opus;
-    using namespace pa_16mx4_64nx1_fp8;
+    using namespace opus_mla_v4_prefill_a8w8_16mx4_64nx1;
     using T = opus::remove_cvref_t<Traits>;
     using D_NOPE = typename T::D_NOPE;
     using D_ROPE = typename T::D_ROPE;
@@ -701,7 +705,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx4_64nx1_
             const int page_idx_begin = kv_indptr[q_token_idx];
             const int valid_kv_len   = kv_indptr[q_token_idx + 1] - page_idx_begin;
             const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
-            pa_prefill_accum_pipelined<Traits, SLOT_SWAP>(kargs, nope_ptr, rope_ptr, kv_rows,
+            mla_v4_prefill_accum_pipelined<Traits, SLOT_SWAP>(kargs, nope_ptr, rope_ptr, kv_rows,
                                                           kv_indices, page_idx_begin, valid_kv_len, num_kv_tiles,
                                                           smem_buf, v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row, temperature_scale);
         }

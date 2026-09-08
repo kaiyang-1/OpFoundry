@@ -2,11 +2,11 @@ OPUS_INCLUDE_DIR ?= /path/to/aiter/csrc/include
 HIPCC           ?= /opt/rocm/bin/hipcc
 ARCH            ?= gfx1250
 
-ifeq ($(wildcard $(ARCH)/pa_traits.h),)
-$(error unknown ARCH '$(ARCH)'; available: $(patsubst %/pa_traits.h,%,$(wildcard */pa_traits.h)))
+ifeq ($(wildcard $(ARCH)/mla_v4_traits.h),)
+$(error unknown ARCH '$(ARCH)'; available: $(patsubst %/mla_v4_traits.h,%,$(wildcard */mla_v4_traits.h)))
 endif
 
-ARCH_MACRO := PA_ARCH_$(shell echo $(ARCH) | tr '[:lower:]' '[:upper:]')
+ARCH_MACRO := MLA_V4_ARCH_$(shell echo $(ARCH) | tr '[:lower:]' '[:upper:]')
 
 # The gfx1250 kernels depend on the expert mode and llvm scheduler
 SCHED_FLAGS_gfx1250 = -mllvm -amdgpu-expert-scheduling-mode \
@@ -14,21 +14,21 @@ SCHED_FLAGS_gfx1250 = -mllvm -amdgpu-expert-scheduling-mode \
                       -mllvm -amdgpu-anti-hints-for-va-vdst
 
 COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -pthread -O3 -Wall -D$(ARCH_MACRO) --offload-arch=$(ARCH)
-KERNEL_FLAGS = -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage --no-offload-new-driver \
-               -save-temps=obj $(SCHED_FLAGS_$(ARCH))
+KERNEL_FLAGS = -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage --no-offload-new-driver $(SCHED_FLAGS_$(ARCH))
 LINK_FLAGS   = --offload-arch=$(ARCH) -pthread
 
 BUILD = build/$(ARCH)
-OUT   = $(BUILD)/pa_prefill.exe
+OUT   = $(BUILD)/mla_v4_prefill.exe
 
-KERNEL_SRCS = $(wildcard $(ARCH)/pa_prefill_*_kernel.cc)
-HOST_SRC    = common/pa_host.cc
-COMMON_HDRS = common/pa_kargs.h common/pa_parallel.h
+KERNEL_SRCS = $(wildcard $(ARCH)/mla_v4_prefill_*_kernel.cc)
+HOST_SRC    = common/mla_v4_host.cc
+COMMON_HDRS = common/mla_v4_kargs.h common/mla_v4_parallel.h
 SHARED_HDRS = $(filter-out %_template.hpp,$(wildcard $(ARCH)/*.h) $(wildcard $(ARCH)/*.hpp)) $(COMMON_HDRS)
 KERNEL_OBJS = $(patsubst %.cc,$(BUILD)/%.o,$(notdir $(KERNEL_SRCS)))
-HOST_OBJ    = $(BUILD)/pa_host.o
+KERNEL_ASMS = $(patsubst %.cc,$(BUILD)/%.s,$(notdir $(KERNEL_SRCS)))
+HOST_OBJ    = $(BUILD)/mla_v4_host.o
 
-.PHONY: all clean verify
+.PHONY: all asm clean verify
 .DELETE_ON_ERROR:
 
 all: $(OUT)
@@ -41,8 +41,14 @@ $(BUILD):
 $(BUILD)/%_kernel.o: $(ARCH)/%_kernel.cc $(ARCH)/%_template.hpp $(SHARED_HDRS) | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) -c -o $@
 
+# Device assembly.
+$(BUILD)/%_kernel.s: $(ARCH)/%_kernel.cc $(ARCH)/%_template.hpp $(SHARED_HDRS) | $(BUILD)
+	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) --offload-device-only -S -o $@
+
+asm: $(KERNEL_ASMS)
+
 # Host object (no -D__HIPCC_RTC__ — needs full HIP runtime for <<<>>> syntax).
-$(HOST_OBJ): $(HOST_SRC) $(ARCH)/pa_traits.h $(COMMON_HDRS) | $(BUILD)
+$(HOST_OBJ): $(HOST_SRC) $(ARCH)/mla_v4_traits.h $(COMMON_HDRS) | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) -c -o $@
 
 # Link

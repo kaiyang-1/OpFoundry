@@ -8,11 +8,11 @@
 #include <thread>
 #include <vector>
 
-namespace pa {
+namespace mla_v4 {
 
-// Worker count, overridable via PA_NUM_THREADS (the OMP_NUM_THREADS equivalent).
+// Worker count, overridable via MLA_V4_NUM_THREADS (the OMP_NUM_THREADS equivalent).
 inline unsigned num_threads() {
-    if (const char* env = std::getenv("PA_NUM_THREADS")) {
+    if (const char* env = std::getenv("MLA_V4_NUM_THREADS")) {
         const int v = std::atoi(env);
         if (v > 0) return static_cast<unsigned>(v);
     }
@@ -62,4 +62,4 @@ void parallel_for(size_t n, Body body) {
     });
 }
 
-}  // namespace pa
+}  // namespace mla_v4

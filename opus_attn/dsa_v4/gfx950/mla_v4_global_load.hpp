@@ -28,15 +28,15 @@ __device__ inline void global_load(const D* g_base, void* smem_base,
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
         const unsigned int m0_val = m0_base + m0_fix;
         const char* addr = src;   // asm operands do not odr-use, so name it inside the lambda
-        #define PA_GLOBAL_LOAD_LDS(mnemonic)                                                \
+        #define OPUS_MLA_V4_GLOBAL_LOAD_LDS(mnemonic)                                       \
             asm volatile("s_mov_b32 m0, %0\n\ts_nop 0\n\t" mnemonic " %1, off offset:%2"    \
                          :: "s"(m0_val), "v"(addr), "n"(g_delta) : "memory")
-        if      constexpr (BYTES == 16) PA_GLOBAL_LOAD_LDS("global_load_lds_dwordx4");
-        else if constexpr (BYTES == 12) PA_GLOBAL_LOAD_LDS("global_load_lds_dwordx3");
-        else if constexpr (BYTES ==  4) PA_GLOBAL_LOAD_LDS("global_load_lds_dword");
-        else if constexpr (BYTES ==  2) PA_GLOBAL_LOAD_LDS("global_load_lds_ushort");
-        else                            PA_GLOBAL_LOAD_LDS("global_load_lds_ubyte");
-        #undef PA_GLOBAL_LOAD_LDS
+        if      constexpr (BYTES == 16) OPUS_MLA_V4_GLOBAL_LOAD_LDS("global_load_lds_dwordx4");
+        else if constexpr (BYTES == 12) OPUS_MLA_V4_GLOBAL_LOAD_LDS("global_load_lds_dwordx3");
+        else if constexpr (BYTES ==  4) OPUS_MLA_V4_GLOBAL_LOAD_LDS("global_load_lds_dword");
+        else if constexpr (BYTES ==  2) OPUS_MLA_V4_GLOBAL_LOAD_LDS("global_load_lds_ushort");
+        else                            OPUS_MLA_V4_GLOBAL_LOAD_LDS("global_load_lds_ubyte");
+        #undef OPUS_MLA_V4_GLOBAL_LOAD_LDS
 #else
         *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<D, VEC>*>(
             s_ptr + s_os[i.value] * static_cast<int>(sizeof(D))) =
