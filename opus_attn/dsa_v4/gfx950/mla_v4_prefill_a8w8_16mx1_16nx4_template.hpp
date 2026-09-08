@@ -1,14 +1,14 @@
 #pragma once
 
 #include <opus/opus.hpp>
-#include "pa_traits.h"
-#include "pa_global_load.hpp"
+#include "mla_v4_traits.h"
+#include "mla_v4_global_load.hpp"
 #include <bit>
 #include <cstdint>
 
 using opus::operator""_I;
 
-namespace pa_16mx1_16nx4_fp8 {
+namespace opus_mla_v4_prefill_a8w8_16mx1_16nx4 {
 
 template<class T>
 __device__ inline auto make_layout_q_nope(int lane_id) {
@@ -360,8 +360,8 @@ __device__ inline void reorder_mxscl_for_opsel(V& v) {
 }
 
 template<class Traits, class VQN, class VQR, class VO>
-__device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
-        pa_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
+__device__ void mla_v4_prefill_accum_pipelined(
+        opus_mla_v4_prefill_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
         const int* kv_indices,
         int page_idx_begin, int valid_kv_len, int num_kv_tiles,
         char* smem_kv, char* smem_ml, char* smem_p,
@@ -510,12 +510,12 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
     }
 }
 
-} // namespace pa_16mx1_16nx4_fp8
+} // namespace opus_mla_v4_prefill_a8w8_16mx1_16nx4
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs) {
     using namespace opus;
-    using namespace pa_16mx1_16nx4_fp8;
+    using namespace opus_mla_v4_prefill_a8w8_16mx1_16nx4;
     using T = opus::remove_cvref_t<Traits>;
     using D_NOPE = typename T::D_NOPE;
     using D_ROPE = typename T::D_ROPE;
@@ -571,7 +571,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        pa_prefill_16mx1_16nx4_fp8_pipeline<Traits>(
+        mla_v4_prefill_accum_pipelined<Traits>(
             kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
             page_idx_begin, valid_kv_len, num_kv_tiles,
             smem_kv, smem_ml, smem_p,
@@ -588,7 +588,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        pa_prefill_16mx1_16nx4_fp8_pipeline<Traits>(
+        mla_v4_prefill_accum_pipelined<Traits>(
             kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
             page_idx_begin, valid_kv_len, num_kv_tiles,
             smem_kv, smem_ml, smem_p,

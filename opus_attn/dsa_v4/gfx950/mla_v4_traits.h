@@ -1,10 +1,10 @@
-// Configuration traits for gfx950 (wave64 / MFMA) PA prefill kernels.
+// Configuration traits for gfx950 (wave64 / MFMA) MLA-v4 prefill kernels.
 #pragma once
 
-#include "common/pa_kargs.h"
+#include "common/mla_v4_kargs.h"
 #include <algorithm>
 
-// Configuration traits for the 16mx1_16nx4 PA kernel variant (T_M=1, T_N=NUM_WARPS).
+// Configuration traits for the 16mx1_16nx4 MLA-v4 kernel variant (T_M=1, T_N=NUM_WARPS).
 // Used when h_q <= 32. KV_TILE=64, NUM_WARPS=4, BLOCK_SIZE=256.
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
@@ -12,7 +12,7 @@ template<int Q_TILE_SIZE_ = 16,
          int NUM_WARPS_ = 4,
          typename D_ATTN_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct pa_16mx1_16nx4_traits {
+struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
@@ -72,7 +72,7 @@ struct pa_16mx1_16nx4_traits {
     }
 };
 
-// Configuration traits for the 16mx8_32nx1 PA kernel variant (T_M=NUM_WARPS, T_N=1).
+// Configuration traits for the 16mx8_32nx1 MLA-v4 kernel variant (T_M=NUM_WARPS, T_N=1).
 // Used when h_q > 32. KV_TILE=32, NUM_WARPS=8, BLOCK_SIZE=512.
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 32,
@@ -80,7 +80,7 @@ template<int Q_TILE_SIZE_ = 16,
          int NUM_WARPS_ = 8,
          typename D_ATTN_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct pa_16mx8_32nx1_traits {
+struct opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
@@ -145,14 +145,14 @@ struct pa_16mx8_32nx1_traits {
     }
 };
 
-// Configuration traits for the FP8 16mx1_16nx4 PA kernel variant.
+// Configuration traits for the FP8 16mx1_16nx4 MLA-v4 kernel variant.
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
          int NUM_WARPS_ = 4,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct pa_16mx1_16nx4_fp8_traits {
+struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
@@ -217,14 +217,14 @@ struct pa_16mx1_16nx4_fp8_traits {
     }
 };
 
-// Configuration traits for the FP8 16mx8_32nx1 PA kernel variant (T_M=NUM_WARPS, T_N=1).
+// Configuration traits for the FP8 16mx8_32nx1 MLA-v4 kernel variant (T_M=NUM_WARPS, T_N=1).
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 32,
          int NUM_WARPS_ = 8,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct pa_16mx8_32nx1_fp8_traits {
+struct opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;

@@ -1,7 +1,7 @@
-// Configuration traits for gfx1250 (wave32 / WMMA) PA prefill kernels.
+// Configuration traits for gfx1250 (wave32 / WMMA) MLA-v4 prefill kernels.
 #pragma once
 
-#include "common/pa_kargs.h"
+#include "common/mla_v4_kargs.h"
 
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
@@ -10,7 +10,7 @@ template<int Q_TILE_SIZE_ = 16,
          int CLUSTER_Y_ = 1,
          typename D_ATTN_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct pa_16mx4_64nx1_traits {
+struct opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
@@ -88,7 +88,7 @@ template<int Q_TILE_SIZE_ = 32,
          int NUM_WARPS_ = 4,
          typename D_ATTN_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct pa_32mx1_16nx4_traits {
+struct opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
@@ -182,7 +182,7 @@ template<int Q_TILE_SIZE_ = 16,
          int NUM_WARPS_ = 4,
          typename D_ATTN_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct pa_16mx1_16nx4_traits {
+struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
@@ -261,7 +261,7 @@ template<int Q_TILE_SIZE_ = 16,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct pa_16mx4_64nx1_fp8_traits {
+struct opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
@@ -361,7 +361,7 @@ template<int Q_TILE_SIZE_ = 32,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct pa_32mx1_16nx4_fp8_traits {
+struct opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
@@ -464,7 +464,7 @@ template<int Q_TILE_SIZE_ = 16,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct pa_16mx1_16nx4_fp8_traits {
+struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;

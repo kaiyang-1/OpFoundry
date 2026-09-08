@@ -6,8 +6,8 @@ using fp16_t = __fp16;
 using fp8_t  = _BitInt(8);
 using bf8_t  = unsigned _BitInt(8);
 
-// Kernel arguments for PA prefill attention
-struct pa_kargs {
+// Kernel arguments for MLA-v4 prefill attention
+struct opus_mla_v4_prefill_kargs {
     const void* __restrict__ q_ptr;          // [N, H, D]
     const void* __restrict__ unified_kv_ptr; // [total_pages, D], prefix source
     const void* __restrict__ kv_ptr;         // [total_tokens, D], extend source
@@ -28,8 +28,8 @@ struct pa_kargs {
     float softmax_scale;
 };
 
-// Kernel arguments for the FP8 PA prefill attention.
-struct pa_fp8_kargs {
+// Kernel arguments for the FP8 MLA-v4 prefill attention.
+struct opus_mla_v4_prefill_fp8_kargs {
     const void* __restrict__ q_nope_ptr;          // [N, H, D_NOPE_PADDED] fp8
     const void* __restrict__ q_rope_ptr;          // [N, H, D_ROPE]        bf16
     const void* __restrict__ unified_kv_nope_ptr; // [total_pages, D_NOPE_PADDED] fp8

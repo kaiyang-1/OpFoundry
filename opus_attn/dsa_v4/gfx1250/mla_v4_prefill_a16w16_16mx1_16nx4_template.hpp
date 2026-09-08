@@ -1,13 +1,13 @@
 #pragma once
 
 #include <opus/opus.hpp>
-#include "pa_traits.h"
+#include "mla_v4_traits.h"
 #include <cstdint>
 #include <bit>
 
 using opus::operator""_I;
 
-namespace pa_16mx1_16nx4 {
+namespace opus_mla_v4_prefill_a16w16_16mx1_16nx4 {
 
 OPUS_D opus::u32x16_t s_buffer_load_b512(opus::u32x4_t rsrc, int soffset) {
     opus::u32x16_t ids;
@@ -207,8 +207,8 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
 }
 
 template<class Traits>
-__device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(
-        pa_kargs kargs,
+__device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(
+        opus_mla_v4_prefill_kargs kargs,
         const void* kv_ptr, int kv_rows,
         const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
         char* smem_buf,
@@ -369,12 +369,12 @@ __device__ __attribute__((always_inline)) void pa_prefill_accum_pipelined(
     accum_tile(num_kv_tiles - 1, true_type{});
 }
 
-} // namespace pa_16mx1_16nx4
+} // namespace opus_mla_v4_prefill_a16w16_16mx1_16nx4
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_kernel(pa_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs kargs) {
     using namespace opus;
-    using namespace pa_16mx1_16nx4;
+    using namespace opus_mla_v4_prefill_a16w16_16mx1_16nx4;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
@@ -429,7 +429,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
         const int valid_kv_len   = kargs.kv_indptr_prefix[q_token_idx + 1] - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
-        pa_prefill_accum_pipelined<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages,
+        mla_v4_prefill_accum_pipelined<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages,
                                            kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles,
                                            smem_buf, v_q, v_o, m_row, l_row, temperature_scale);
     }
@@ -439,7 +439,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
         const int valid_kv_len   = kargs.kv_indptr_extend[q_token_idx + 1] - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
-        pa_prefill_accum_pipelined<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens,
+        mla_v4_prefill_accum_pipelined<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens,
                                            kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles,
                                            smem_buf, v_q, v_o, m_row, l_row, temperature_scale);
     }

@@ -3,14 +3,14 @@
 #pragma once
 
 #include <opus/opus.hpp>
-#include "pa_traits.h"
-#include "pa_global_load.hpp"
+#include "mla_v4_traits.h"
+#include "mla_v4_global_load.hpp"
 #include <bit>
 #include <cstdint>
 
 using opus::operator""_I;
 
-namespace pa_16mx8_32nx1 {
+namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1 {
 
 constexpr int MFMA_MASK    = 0x08;
 constexpr int VALU_MASK    = 0x02;
@@ -346,15 +346,15 @@ __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile
 }
 
 template<class Traits>
-__device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
-                                           const void* kv_ptr,
-                                           const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
-                                           char* smem_kv_buf,
-                                           opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
-                                           opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
-                                           typename Traits::D_ACC& m_row,
-                                           typename Traits::D_ACC& l_row,
-                                           typename Traits::D_ACC temperature_scale) {
+__device__ void mla_v4_prefill_accum_le2_tiles(opus_mla_v4_prefill_kargs kargs,
+                                               const void* kv_ptr,
+                                               const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+                                               char* smem_kv_buf,
+                                               opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
+                                               opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
+                                               typename Traits::D_ACC& m_row,
+                                               typename Traits::D_ACC& l_row,
+                                               typename Traits::D_ACC temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
@@ -469,15 +469,15 @@ __device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
 }
 
 template<class Traits, bool OddTail>
-__device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
-                                           const void* kv_ptr,
-                                           const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
-                                           char* smem_kv_buf,
-                                           opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
-                                           opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
-                                           typename Traits::D_ACC& m_row,
-                                           typename Traits::D_ACC& l_row,
-                                           typename Traits::D_ACC temperature_scale) {
+__device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
+                                               const void* kv_ptr,
+                                               const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+                                               char* smem_kv_buf,
+                                               opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
+                                               opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
+                                               typename Traits::D_ACC& m_row,
+                                               typename Traits::D_ACC& l_row,
+                                               typename Traits::D_ACC temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
@@ -1030,13 +1030,13 @@ __device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
     }
 }
 
-} // namespace pa_16mx8_32nx1
+} // namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1
 
-// ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
+// ─── MLA-v4 kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_kernel(pa_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs kargs) {
     using namespace opus;
-    using namespace pa_16mx8_32nx1;
+    using namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
@@ -1077,13 +1077,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            mla_v4_prefill_accum_le2_tiles<Traits>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            mla_v4_prefill_accum_pipelined<Traits, true>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            mla_v4_prefill_accum_pipelined<Traits, false>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
     }
 
@@ -1097,13 +1097,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            mla_v4_prefill_accum_le2_tiles<Traits>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            mla_v4_prefill_accum_pipelined<Traits, true>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            mla_v4_prefill_accum_pipelined<Traits, false>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
     }
 
