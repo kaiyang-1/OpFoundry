@@ -9,6 +9,7 @@ using bf8_t  = unsigned _BitInt(8);
 
 static constexpr int DSA_V32_NUM_CU = 256;
 static constexpr int DSA_V32_FIXED_OVERHEAD = 5;
+static constexpr float DSA_V32_LN_2 = 0.69314718055994531f;
 
 struct alignas(16) DsaSchedMeta {
     int begin_req_idx;
@@ -27,6 +28,7 @@ struct dsa_kargs {
     const void* __restrict__ kv_scale_ptr;
     const void* __restrict__ kv_rope_ptr;
     void* __restrict__ out_ptr;
+    void* __restrict__ lse_ptr;
     const int* __restrict__ kv_indptr;
     const int* __restrict__ kv_indices;
 
@@ -47,6 +49,7 @@ struct dsa_kargs {
     int stride_q_rope_h;
     int stride_o_b;
     int stride_o_h;
+    int stride_lse_b;
     int stride_kv_nope_page;
     int stride_kv_scale_page;
     int stride_kv_rope_page;

@@ -1424,6 +1424,15 @@ __device__ void dsa_v32_decode_one_req(dsa_kargs kargs, int batch_idx, int h_blo
         auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
         auto v_o_out = cast<D_OUT>(v_o);
         store<T::VEC_O>(g_o, v_o_out, u_o);
+
+        if (lane_id_o < T::W_M) {
+            const int lse_offset = batch_idx * kargs.stride_lse_b + h_block_start;
+            auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_ptr) + lse_offset,
+                                   (kargs.H - h_block_start) * sizeof(D_ACC));
+            const D_ACC lse = (l_row > D_ACC(0.0f)) ? (m_row + log2f(l_row)) * D_ACC(DSA_V32_LN_2)
+                                                    : opus::numeric_limits<D_ACC>::infinity();
+            g_lse.store(lse, warp_id_o * T::Q_TILE_SIZE + lane_id_o);
+        }
     }
     if (slot >= 0) {
         const int oa_offset = slot * kargs.H * T::D_NOPE_SIZE + h_block_start * T::D_NOPE_SIZE;

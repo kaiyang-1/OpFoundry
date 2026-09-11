@@ -285,6 +285,43 @@ bool validate_dsa_v32_results(const DType* ref, const DType* gpu,
     return all_valid;
 }
 
+bool validate_dsa_v32_lse(const float* ref, const float* gpu, int B, int H,
+                          float rtol = 1e-3f, float atol = 1e-3f) {
+    const size_t total = (size_t)B * H;
+    constexpr size_t printNum = 10;
+
+    size_t errors = 0, printed = 0;
+    float max_abs_delta = 0.0f;
+
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            const float r = ref[(size_t)b * H + h];
+            const float g = gpu[(size_t)b * H + h];
+            if (std::isinf(r) || std::isinf(g)) {
+                if (std::isinf(r) && std::isinf(g) && std::signbit(r) == std::signbit(g)) continue;
+                errors++;
+                if (printed++ < printNum)
+                    printf("  lse mismatch [b=%d,h=%d] ref=%f gpu=%f\n", b, h, r, g);
+                continue;
+            }
+            const float delta = std::abs(g - r);
+            max_abs_delta = std::max(max_abs_delta, delta);
+            if (std::isnan(g) || delta > atol + rtol * std::abs(r)) {
+                errors++;
+                if (printed++ < printNum)
+                    printf("  lse mismatch [b=%d,h=%d] ref=%.6f gpu=%.6f delta=%.6f\n", b, h, r, g, delta);
+            }
+        }
+    }
+
+    printf("  LSE: rtol=%.0e atol=%.0e | max_abs_delta=%.6f | mismatch %zu/%zu\n",
+           rtol, atol, max_abs_delta, errors, total);
+    if (errors == 0) printf("✓ LSE validation passed (checked %zu elements)\n", total);
+    else             printf("✗ LSE validation failed\n");
+
+    return errors == 0;
+}
+
 template<class PATraits>
 inline void dequant_dsa_row_fp8(const typename PATraits::D_NOPE* nrow,
                                 const uint8_t* srow,
@@ -300,7 +337,7 @@ inline void dequant_dsa_row_fp8(const typename PATraits::D_NOPE* nrow,
 
 template<class PATraits>
 inline void dsa_v32_attention_compute(const float* q_dense, const float* kv_dense, int num_rows,
-                                      typename PATraits::D_OUT* o_row) {
+                                      typename PATraits::D_OUT* o_row, float* lse_row) {
     using O_t = typename PATraits::D_OUT;
     constexpr int D_QK = PATraits::D_HEAD_SIZE;
     constexpr int D_V  = PATraits::D_NOPE_SIZE;
@@ -316,6 +353,7 @@ inline void dsa_v32_attention_compute(const float* q_dense, const float* kv_dens
     float max_score = *std::max_element(scores.begin(), scores.end());
     float sum_exp = 0.0f;
     for (int p = 0; p < num_rows; p++) { scores[p] = std::exp(scores[p] - max_score); sum_exp += scores[p]; }
+    *lse_row = std::log(sum_exp) + max_score;
     for (int p = 0; p < num_rows; p++)
         scores[p] = static_cast<float>(static_cast<bf16_t>(scores[p] / sum_exp));
     for (int d = 0; d < D_V; d++) {
@@ -329,7 +367,7 @@ template<class PATraits>
 void dsa_v32_attention_ref_fp8(
     const typename PATraits::D_NOPE* Q_nope, const uint8_t* Q_scale, const typename PATraits::D_ROPE* Q_rope,
     const typename PATraits::D_NOPE* KV_nope, const uint8_t* KV_scale, const typename PATraits::D_ROPE* KV_rope,
-    typename PATraits::D_OUT* O,
+    typename PATraits::D_OUT* O, float* LSE,
     const int* kv_indptr, const int* kv_indices,
     int B, int H)
 {
@@ -349,8 +387,10 @@ void dsa_v32_attention_ref_fp8(
             const int num_rows = kv_indptr[i + 1] - kv_begin;
 
             O_t* o_row = O + (size_t)i * o_stride_n + h * o_stride_h;
+            float* lse_row = LSE + (size_t)i * H + h;
             if (num_rows <= 0) {
                 for (int d = 0; d < D_HEAD; d++) o_row[d] = static_cast<O_t>(0.0f);
+                *lse_row = std::numeric_limits<float>::infinity();
                 continue;
             }
 
@@ -366,7 +406,7 @@ void dsa_v32_attention_ref_fp8(
                                               kv_dense.data() + (size_t)p * D_QK);
             }
 
-            dsa_v32_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, o_row);
+            dsa_v32_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, o_row, lse_row);
         }
     }
 }
@@ -383,6 +423,9 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
 
     auto host_o_ref = std::make_unique<OType[]>(o_size);
     auto host_o_gpu = std::make_unique<OType[]>(o_size);
+    const size_t lse_size = (size_t)B * H;
+    auto host_lse_ref = std::make_unique<float[]>(lse_size);
+    auto host_lse_gpu = std::make_unique<float[]>(lse_size);
 
     std::vector<int> host_kv_indptr, host_kv_indices;
     if (dense_kv) {
@@ -395,9 +438,11 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
     const int total_kv_count = static_cast<int>(total_kv_indices);
 
     OType *dev_o;
+    float *dev_lse;
     int *dev_kv_indptr, *dev_kv_indices;
     const size_t kv_indices_alloc_size = std::max<size_t>(host_kv_indices.size(), 1);
     CHECK_HIP(hipMalloc(&dev_o, o_size * sizeof(OType)));
+    CHECK_HIP(hipMalloc(&dev_lse, lse_size * sizeof(float)));
     CHECK_HIP(hipMalloc(&dev_kv_indptr, host_kv_indptr.size() * sizeof(int)));
     CHECK_HIP(hipMalloc(&dev_kv_indices, kv_indices_alloc_size * sizeof(int)));
     CHECK_HIP(hipMemcpy(dev_kv_indptr, host_kv_indptr.data(), host_kv_indptr.size() * sizeof(int), hipMemcpyHostToDevice));
@@ -426,7 +471,9 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
         if (verify) {
             printf("\nValidating GPU results against CPU reference...\n");
             CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, o_size * sizeof(OType), hipMemcpyDeviceToHost));
+            CHECK_HIP(hipMemcpy(host_lse_gpu.get(), dev_lse, lse_size * sizeof(float), hipMemcpyDeviceToHost));
             bool all_valid = validate_dsa_v32_results<OType>(host_o_ref.get(), host_o_gpu.get(), B, H, D_HEAD);
+            all_valid &= validate_dsa_v32_lse(host_lse_ref.get(), host_lse_gpu.get(), B, H);
             printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
             if (!all_valid) rc = 1;
         }
@@ -474,7 +521,7 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
     if (verify)
         dsa_v32_attention_ref_fp8<PATraits>(host_q_nope.get(), host_q_scale.get(), host_q_rope.get(),
                                             host_kv_nope.get(), host_kv_scale.get(), host_kv_rope.get(),
-                                            host_o_ref.get(),
+                                            host_o_ref.get(), host_lse_ref.get(),
                                             host_kv_indptr.data(), host_kv_indices.data(), B, H);
 
     dsa_kargs kargs{};
@@ -485,6 +532,7 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
     kargs.kv_scale_ptr = dev_kv_scale;
     kargs.kv_rope_ptr = dev_kv_rope;
     kargs.out_ptr = dev_o;
+    kargs.lse_ptr = dev_lse;
     kargs.kv_indptr = dev_kv_indptr;
     kargs.kv_indices = dev_kv_indices;
     kargs.sched_meta = dev_sched_meta;
@@ -503,6 +551,7 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
     kargs.stride_q_rope_h = ROPE;
     kargs.stride_o_b = H * D_HEAD;
     kargs.stride_o_h = D_HEAD;
+    kargs.stride_lse_b = H;
     kargs.stride_kv_nope_page = NOPE;
     kargs.stride_kv_scale_page = SCALE;
     kargs.stride_kv_rope_page = ROPE;
@@ -519,6 +568,7 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
     CHECK_HIP(hipFree(dev_lse_accum));
 
     CHECK_HIP(hipFree(dev_o));
+    CHECK_HIP(hipFree(dev_lse));
     CHECK_HIP(hipFree(dev_kv_indptr));
     CHECK_HIP(hipFree(dev_kv_indices));
 

@@ -3,6 +3,17 @@
 #include <opus/opus.hpp>
 #include "defs.h"
 
+template<class T>
+__device__ inline void mla_write_lse(const dsa_kargs& kargs, int b, int head, int lane,
+                                     typename T::D_ACC m, typename T::D_ACC denom) {
+    using D_ACC = typename T::D_ACC;
+    if (lane != 0) return;
+    D_ACC* lse = reinterpret_cast<D_ACC*>(kargs.lse_ptr);
+    lse[b * kargs.stride_lse_b + head] = (denom > D_ACC(0.0f))
+        ? (m + log2f(denom)) * D_ACC(DSA_V32_LN_2)
+        : opus::numeric_limits<D_ACC>::infinity();
+}
+
 template<class T, int HEADS_PER_BLOCK>
 __device__ void mla_combine_online(const dsa_kargs& kargs, int b, int head,
                                    int lane, int start, int ns) {
@@ -44,7 +55,8 @@ __device__ void mla_combine_online(const dsa_kargs& kargs, int b, int head,
         }
         const D_ACC new_m   = opus::max(m, lse_cur);
         const D_ACC old_scl = __builtin_amdgcn_exp2f(m - new_m);
-        const D_ACC cur_scl = __builtin_amdgcn_exp2f(lse_cur - new_m);
+        const D_ACC cur_scl = (lse_cur > opus::numeric_limits<D_ACC>::lowest())
+                                ? __builtin_amdgcn_exp2f(lse_cur - new_m) : D_ACC(0.0f);
         #pragma unroll
         for (int v = 0; v < NVEC; ++v) acc[v] = old_scl * acc[v] + cur_scl * cur[v];
         denom = denom * old_scl + cur_scl;
@@ -53,6 +65,8 @@ __device__ void mla_combine_online(const dsa_kargs& kargs, int b, int head,
         for (int v = 0; v < NVEC; ++v) cur[v] = nxt[v];
         lse_cur = lse_nxt;
     }
+
+    mla_write_lse<T>(kargs, b, head, lane, m, denom);
 
     const D_ACC inv_denom = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
     #pragma unroll
@@ -99,13 +113,19 @@ __device__ void mla_combine_two_pass(const dsa_kargs& kargs, int b, int head,
     #pragma unroll
     for (int c = 0; c < NCHUNK; ++c) {
         const int s = lane + c * WARP;
-        const D_ACC e = (s < ns) ? __builtin_amdgcn_exp2f(lse_accum[(start + s) * H + head] - m) : 0.0f;
+        const D_ACC lse_s = (s < ns) ? lse_accum[(start + s) * H + head]
+                                     : opus::numeric_limits<D_ACC>::lowest();
+        const D_ACC e = (lse_s > opus::numeric_limits<D_ACC>::lowest())
+                          ? __builtin_amdgcn_exp2f(lse_s - m) : D_ACC(0.0f);
         scale[c] = e;
         local_sum += e;
     }
     #pragma unroll
     for (int off = WARP / 2; off >= 1; off >>= 1)
         local_sum += opus::shfl(local_sum, lane ^ off);
+
+    mla_write_lse<T>(kargs, b, head, lane, m, local_sum);
+
     const D_ACC inv_denom = (local_sum > 0.0f) ? (1.0f / local_sum) : 0.0f;
 
     D_ACCx4 acc[NVEC];
