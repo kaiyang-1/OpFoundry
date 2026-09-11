@@ -3,8 +3,8 @@
 #include <opus/opus.hpp>
 #include "defs.h"
 
-template<class Traits>
-__global__ void get_mla_metadata_kernel(dsa_kargs kargs) {
+template<class Traits, class KArgs>
+__global__ void get_mla_metadata_kernel(KArgs kargs) {
     using T = opus::remove_cvref_t<Traits>;
     constexpr int WARP = T::WARP_SIZE;
 

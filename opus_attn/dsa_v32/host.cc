@@ -16,21 +16,47 @@
 
 #include "defs.h"
 
+template<class Traits, class KArgs>
+__global__ void get_mla_metadata_kernel(KArgs kargs);
+template<class Traits, class KArgs, int HEADS_PER_BLOCK = 8>
+__global__ void mla_combine_kernel(KArgs kargs);
+
 template<class Traits>
-__global__ void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_kargs kargs);
+__global__ void dsa_v32_decode_a8w8_16mx8_32nx1_kernel(dsa_v32_a8w8_kargs kargs);
 template<class Traits>
-__global__ void get_mla_metadata_kernel(dsa_kargs kargs);
-template<class Traits, int HEADS_PER_BLOCK = 8>
-__global__ void mla_combine_kernel(dsa_kargs kargs);
+__global__ void dsa_v32_decode_a16w16_16mx4_64nx1_kernel(dsa_v32_a16w16_kargs kargs);
+template<class Traits>
+__global__ void dsa_v32_decode_a16w16_32mx1_16nx4_kernel(dsa_v32_a16w16_kargs kargs);
 
 static constexpr int DSA_V32_COMBINE_HEADS_PER_BLOCK = 8;
 
-template<class Traits>
-inline void dsa_v32_launch_pipeline(Traits, const dsa_kargs& kargs,
+template<int Q, int KV, int NW, class DN, class DR, class DO>
+inline void dsa_v32_decode_launch(dsa_v32_decode_a8w8_16mx8_32nx1_traits<Q, KV, NW, DN, DR, DO>,
+                                  const dsa_v32_a8w8_kargs& kargs, dim3 grid, dim3 block) {
+    using Traits = dsa_v32_decode_a8w8_16mx8_32nx1_traits<Q, KV, NW, DN, DR, DO>;
+    dsa_v32_decode_a8w8_16mx8_32nx1_kernel<Traits><<<grid, block>>>(kargs);
+}
+
+template<int Q, int KV, int NW, class DA, class DO>
+inline void dsa_v32_decode_launch(dsa_v32_decode_a16w16_16mx4_64nx1_traits<Q, KV, NW, DA, DO>,
+                                  const dsa_v32_a16w16_kargs& kargs, dim3 grid, dim3 block) {
+    using Traits = dsa_v32_decode_a16w16_16mx4_64nx1_traits<Q, KV, NW, DA, DO>;
+    dsa_v32_decode_a16w16_16mx4_64nx1_kernel<Traits><<<grid, block>>>(kargs);
+}
+
+template<int Q, int KV, int NW, class DA, class DO>
+inline void dsa_v32_decode_launch(dsa_v32_decode_a16w16_32mx1_16nx4_traits<Q, KV, NW, DA, DO>,
+                                  const dsa_v32_a16w16_kargs& kargs, dim3 grid, dim3 block) {
+    using Traits = dsa_v32_decode_a16w16_32mx1_16nx4_traits<Q, KV, NW, DA, DO>;
+    dsa_v32_decode_a16w16_32mx1_16nx4_kernel<Traits><<<grid, block>>>(kargs);
+}
+
+template<class Traits, class KArgs>
+inline void dsa_v32_launch_pipeline(Traits, const KArgs& kargs,
                                     dim3 grid_main, dim3 block_main, bool run_metadata = true) {
     if (run_metadata)
         get_mla_metadata_kernel<Traits><<<dim3(1), dim3(Traits::WARP_SIZE), (2 * kargs.B + 1) * (int)sizeof(int)>>>(kargs);
-    dsa_v32_decode_16mx8_32nx1_fp8_kernel<Traits><<<grid_main, block_main>>>(kargs);
+    dsa_v32_decode_launch(Traits{}, kargs, grid_main, block_main);
     const int n_head_blocks = ceil_div(kargs.H, DSA_V32_COMBINE_HEADS_PER_BLOCK);
     dim3 grid_combine(kargs.B, n_head_blocks, 1);
     dim3 block_combine(DSA_V32_COMBINE_HEADS_PER_BLOCK * Traits::WARP_SIZE);
@@ -210,8 +236,8 @@ void benchmark_dsa_v32_kernel(const KArgs& kargs, dim3 grid, dim3 block,
     using D_NOPE = typename Traits::D_NOPE;
     using D_ROPE = typename Traits::D_ROPE;
     using D_OUT  = typename Traits::D_OUT;
-    constexpr int D_QK = Traits::D_HEAD_SIZE;
-    constexpr int D_V  = Traits::D_NOPE_SIZE;
+    constexpr int D_QK = Traits::D_QK_SIZE;
+    constexpr int D_V  = Traits::D_V_SIZE;
 
     const double flops = 2.0 * kargs.H * indices_prefix_sum * (D_QK + D_V);
     const double tflops = flops / (avg_time * 1e-3) / 1e12;
@@ -339,8 +365,8 @@ template<class PATraits>
 inline void dsa_v32_attention_compute(const float* q_dense, const float* kv_dense, int num_rows,
                                       typename PATraits::D_OUT* o_row, float* lse_row) {
     using O_t = typename PATraits::D_OUT;
-    constexpr int D_QK = PATraits::D_HEAD_SIZE;
-    constexpr int D_V  = PATraits::D_NOPE_SIZE;
+    constexpr int D_QK = PATraits::D_QK_SIZE;
+    constexpr int D_V  = PATraits::D_V_SIZE;
     const float softmax_scale = 1.0f / std::sqrt(static_cast<float>(D_QK));
 
     std::vector<float> scores(num_rows);
@@ -372,8 +398,8 @@ void dsa_v32_attention_ref_fp8(
     int B, int H)
 {
     using O_t = typename PATraits::D_OUT;
-    constexpr int D_HEAD = PATraits::D_NOPE_SIZE;
-    constexpr int D_QK   = PATraits::D_HEAD_SIZE;
+    constexpr int D_HEAD = PATraits::D_V_SIZE;
+    constexpr int D_QK   = PATraits::D_QK_SIZE;
     constexpr int NOPE   = PATraits::D_NOPE_SIZE;
     constexpr int SCALE  = PATraits::D_SCALE_SIZE;
     constexpr int ROPE   = PATraits::D_ROPE_SIZE;
@@ -416,9 +442,9 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
                 bool verify, bool dense_kv) {
     using OType = typename PATraits::D_OUT;
     printf("DSA v3.2 Decode Attention: H_Q=%d, B=%d, D_QK=%d, D_V=%d, NoPE=fp8, RoPE=bf16, total_tokens=%d\n",
-           H, B, PATraits::D_HEAD_SIZE, PATraits::D_NOPE_SIZE, total_tokens);
+           H, B, PATraits::D_QK_SIZE, PATraits::D_V_SIZE, total_tokens);
 
-    constexpr int D_HEAD = PATraits::D_NOPE_SIZE;
+    constexpr int D_HEAD = PATraits::D_V_SIZE;
     const size_t o_size = (size_t)B * H * D_HEAD;
 
     auto host_o_ref = std::make_unique<OType[]>(o_size);
@@ -461,7 +487,7 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
     float *dev_o_accum, *dev_lse_accum;
     CHECK_HIP(hipMalloc(&dev_sched_meta, num_parts * sizeof(DsaSchedMeta)));
     CHECK_HIP(hipMalloc(&dev_num_splits, (B + 1) * sizeof(int)));
-    CHECK_HIP(hipMalloc(&dev_o_accum, (size_t)total_splits * H * PATraits::D_NOPE_SIZE * sizeof(float)));
+    CHECK_HIP(hipMalloc(&dev_o_accum, (size_t)total_splits * H * PATraits::D_V_SIZE * sizeof(float)));
     CHECK_HIP(hipMalloc(&dev_lse_accum, (size_t)total_splits * H * sizeof(float)));
 
     int rc = 0;
@@ -524,7 +550,7 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
                                             host_o_ref.get(), host_lse_ref.get(),
                                             host_kv_indptr.data(), host_kv_indices.data(), B, H);
 
-    dsa_kargs kargs{};
+    dsa_v32_a8w8_kargs kargs{};
     kargs.q_nope_ptr = dev_q_nope;
     kargs.q_scale_ptr = dev_q_scale;
     kargs.q_rope_ptr = dev_q_rope;
@@ -555,7 +581,7 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
     kargs.stride_kv_nope_page = NOPE;
     kargs.stride_kv_scale_page = SCALE;
     kargs.stride_kv_rope_page = ROPE;
-    kargs.softmax_scale = 1.0f / std::sqrt(static_cast<float>(PATraits::D_HEAD_SIZE));
+    kargs.softmax_scale = 1.0f / std::sqrt(static_cast<float>(PATraits::D_QK_SIZE));
 
     verify_and_bench(kargs);
 
@@ -582,6 +608,7 @@ int main(int argc, char** argv) {
 
     bool verify = false;
     bool dense_kv = false;
+    const char* dtype = "fp8";
     auto parse_val = [](const char* arg, const char* flag) -> const char* {
         size_t len = std::strlen(flag);
         if (std::strncmp(arg, flag, len) == 0) {
@@ -603,6 +630,15 @@ int main(int argc, char** argv) {
             }
             return false;
         };
+        auto try_parse_str = [&](const char*& target, const char* flag) {
+            if ((val = parse_val(arg, flag))) {
+                if (val == reinterpret_cast<const char*>(1)) { if (i + 1 < argc) target = argv[++i]; }
+                else target = val;
+                return true;
+            }
+            return false;
+        };
+        if (try_parse_str(dtype, "-dtype")) continue;
         if (try_parse(H, "-h_q")) continue;
         if (try_parse(B, "-b")) continue;
         if (try_parse(total_tokens, "-total_tokens")) continue;
@@ -613,5 +649,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    return run_dsa_v32_case<dsa_v32_16mx8_32nx1_fp8_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(H, B, total_tokens, verify, dense_kv);
+    if (std::strcmp(dtype, "fp8") == 0)
+        return run_dsa_v32_case<dsa_v32_decode_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(H, B, total_tokens, verify, dense_kv);
+
+    if (std::strcmp(dtype, "bf16") == 0) {
+        std::cerr << "bf16 decode is not implemented yet\n";
+        return 2;
+    }
+
+    std::cerr << "unknown -dtype '" << dtype << "'; available: fp8, bf16\n";
+    return 1;
 }

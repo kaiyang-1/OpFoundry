@@ -3,8 +3,8 @@
 #include <opus/opus.hpp>
 #include "defs.h"
 
-template<class T>
-__device__ inline void mla_write_lse(const dsa_kargs& kargs, int b, int head, int lane,
+template<class T, class KArgs>
+__device__ inline void mla_write_lse(const KArgs& kargs, int b, int head, int lane,
                                      typename T::D_ACC m, typename T::D_ACC denom) {
     using D_ACC = typename T::D_ACC;
     if (lane != 0) return;
@@ -14,14 +14,14 @@ __device__ inline void mla_write_lse(const dsa_kargs& kargs, int b, int head, in
         : opus::numeric_limits<D_ACC>::infinity();
 }
 
-template<class T, int HEADS_PER_BLOCK>
-__device__ void mla_combine_online(const dsa_kargs& kargs, int b, int head,
+template<class T, int HEADS_PER_BLOCK, class KArgs>
+__device__ void mla_combine_online(const KArgs& kargs, int b, int head,
                                    int lane, int start, int ns) {
     using D_OUT = typename T::D_OUT;
     using D_ACC = typename T::D_ACC;
     using D_ACCx4 = opus::vector_t<D_ACC, 4>;
     constexpr int WARP = T::WARP_SIZE;
-    constexpr int D    = T::D_NOPE_SIZE;
+    constexpr int D    = T::D_V_SIZE;
     constexpr int VEC  = 4;
     constexpr int NVEC = D / (WARP * VEC);
 
@@ -66,7 +66,7 @@ __device__ void mla_combine_online(const dsa_kargs& kargs, int b, int head,
         lse_cur = lse_nxt;
     }
 
-    mla_write_lse<T>(kargs, b, head, lane, m, denom);
+    mla_write_lse<T, KArgs>(kargs, b, head, lane, m, denom);
 
     const D_ACC inv_denom = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
     #pragma unroll
@@ -83,14 +83,14 @@ __device__ void mla_combine_online(const dsa_kargs& kargs, int b, int head,
     }
 }
 
-template<class T, int HEADS_PER_BLOCK>
-__device__ void mla_combine_two_pass(const dsa_kargs& kargs, int b, int head,
+template<class T, int HEADS_PER_BLOCK, class KArgs>
+__device__ void mla_combine_two_pass(const KArgs& kargs, int b, int head,
                                      int lane, int start, int ns) {
     using D_OUT = typename T::D_OUT;
     using D_ACC = typename T::D_ACC;
     using D_ACCx4 = opus::vector_t<D_ACC, 4>;
     constexpr int WARP = T::WARP_SIZE;
-    constexpr int D    = T::D_NOPE_SIZE;
+    constexpr int D    = T::D_V_SIZE;
     constexpr int VEC  = 4;
     constexpr int NVEC = D / (WARP * VEC);
     constexpr int MAX_SPLITS = DSA_V32_NUM_CU;
@@ -124,7 +124,7 @@ __device__ void mla_combine_two_pass(const dsa_kargs& kargs, int b, int head,
     for (int off = WARP / 2; off >= 1; off >>= 1)
         local_sum += opus::shfl(local_sum, lane ^ off);
 
-    mla_write_lse<T>(kargs, b, head, lane, m, local_sum);
+    mla_write_lse<T, KArgs>(kargs, b, head, lane, m, local_sum);
 
     const D_ACC inv_denom = (local_sum > 0.0f) ? (1.0f / local_sum) : 0.0f;
 
@@ -165,8 +165,8 @@ __device__ void mla_combine_two_pass(const dsa_kargs& kargs, int b, int head,
     }
 }
 
-template<class Traits, int HEADS_PER_BLOCK = 8>
-__global__ void mla_combine_kernel(dsa_kargs kargs) {
+template<class Traits, class KArgs, int HEADS_PER_BLOCK = 8>
+__global__ void mla_combine_kernel(KArgs kargs) {
     using T = opus::remove_cvref_t<Traits>;
     constexpr int WARP = T::WARP_SIZE;
     constexpr int ONLINE_MAX_NS = 4;

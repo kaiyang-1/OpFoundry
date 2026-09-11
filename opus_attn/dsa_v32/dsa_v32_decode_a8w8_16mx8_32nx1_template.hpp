@@ -7,7 +7,7 @@
 
 using opus::operator""_I;
 
-namespace dsa_v32_16mx8_32nx1_fp8 {
+namespace dsa_v32_decode_a8w8_16mx8_32nx1 {
 
 template<class T>
 __device__ inline auto make_layout_q_nope(int warp_id, int lane_id) {
@@ -503,7 +503,7 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
 }
 
 template<class Traits, class VQN, class VQR, class VO>
-__device__ void dsa_v32_decode_le2_tiles(dsa_kargs kargs,
+__device__ void dsa_v32_decode_le2_tiles(dsa_v32_a8w8_kargs kargs,
                                          int page_idx_begin, int valid_kv_len, int tile_begin, int tile_end,
                                          char* smem_kv, char* smem_kv_scale,
                                          VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
@@ -694,7 +694,7 @@ __device__ void dsa_v32_decode_le2_tiles(dsa_kargs kargs,
 }
 
 template<class Traits, bool OddTail, class VQN, class VQR, class VO>
-__device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
+__device__ void dsa_v32_decode_pipelined(dsa_v32_a8w8_kargs kargs,
                                          int page_idx_begin, int valid_kv_len, int tile_begin, int tile_end,
                                          char* smem_kv, char* smem_kv_scale,
                                          VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
@@ -1356,7 +1356,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
 }
 
 template<class Traits>
-__device__ void dsa_v32_decode_one_req(dsa_kargs kargs, int batch_idx, int h_block_idx,
+__device__ void dsa_v32_decode_one_req(dsa_v32_a8w8_kargs kargs, int batch_idx, int h_block_idx,
                                        int page_idx_begin, int valid_kv_len,
                                        int tile_begin, int tile_end, int slot,
                                        char* smem_kv, char* smem_kv_scale, float temperature_scale) {
@@ -1454,9 +1454,9 @@ __device__ void dsa_v32_decode_one_req(dsa_kargs kargs, int batch_idx, int h_blo
 }
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::MIN_WAVES_PER_EU) void dsa_v32_decode_a8w8_16mx8_32nx1_kernel(dsa_v32_a8w8_kargs kargs) {
     using namespace opus;
-    using namespace dsa_v32_16mx8_32nx1_fp8;
+    using namespace dsa_v32_decode_a8w8_16mx8_32nx1;
     using T = opus::remove_cvref_t<Traits>;
 
     const int part = block_id_x();

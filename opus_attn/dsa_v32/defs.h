@@ -20,7 +20,7 @@ struct alignas(16) DsaSchedMeta {
     int _pad[3];
 };
 
-struct dsa_kargs {
+struct dsa_v32_a8w8_kargs {
     const void* __restrict__ q_nope_ptr;
     const void* __restrict__ q_scale_ptr;
     const void* __restrict__ q_rope_ptr;
@@ -56,25 +56,55 @@ struct dsa_kargs {
     float softmax_scale;
 };
 
+struct dsa_v32_a16w16_kargs {
+    const void* __restrict__ q_ptr;
+    const void* __restrict__ kv_ptr;
+    void* __restrict__ out_ptr;
+    void* __restrict__ lse_ptr;
+    const int* __restrict__ kv_indptr;
+    const int* __restrict__ kv_indices;
+
+    const DsaSchedMeta* __restrict__ sched_meta;
+    const int* __restrict__ num_splits;
+    void* __restrict__ o_accum;
+    void* __restrict__ lse_accum;
+    int num_parts;
+
+    int B;
+    int H;
+    int total_tokens;
+    int stride_q_b;
+    int stride_q_h;
+    int stride_o_b;
+    int stride_o_h;
+    int stride_lse_b;
+    int stride_kv_page;
+    float softmax_scale;
+};
+
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 32,
          int NUM_WARPS_ = 8,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct dsa_v32_16mx8_32nx1_fp8_traits {
+struct dsa_v32_decode_a8w8_16mx8_32nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
 
     static constexpr int WARP_SIZE = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+    static constexpr int MIN_WAVES_PER_EU = 2;
 
     static constexpr int D_NOPE_SIZE = 512;
     static constexpr int D_ROPE_SIZE = 64;
     static constexpr int D_HEAD_SIZE = D_NOPE_SIZE + D_ROPE_SIZE;
     static constexpr int D_SCALE_SIZE = D_NOPE_SIZE / 32;
     static constexpr int D_SCALE_PADDED_SIZE = 32;
+
+    static constexpr int D_QK_SIZE = D_HEAD_SIZE;
+    static constexpr int D_V_SIZE  = D_NOPE_SIZE;
 
     using D_NOPE = D_NOPE_;
     using D_ROPE = D_ROPE_;
@@ -139,6 +169,106 @@ struct dsa_v32_16mx8_32nx1_fp8_traits {
     static constexpr int k_nope_ds_read_insts = (GEMM0_E_N * W_N * W_K_NOPE) / (WARP_SIZE * VEC_KV_NOPE);
     static constexpr int k_rope_ds_read_insts = (GEMM0_E_N * W_N * W_K_ROPE) / (WARP_SIZE * VEC_KV_ROPE);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K_ROPE) / (WARP_SIZE * VEC_TR_V);
+};
+
+template<int Q_TILE_SIZE_ = 16,
+         int KV_TILE_SIZE_ = 64,
+         int NUM_WARPS_ = 4,
+         typename D_ATTN_ = bf16_t,
+         typename D_OUT_ = bf16_t>
+struct dsa_v32_decode_a16w16_16mx4_64nx1_traits {
+    static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int NUM_WARPS = NUM_WARPS_;
+
+    static constexpr int WARP_SIZE = 64;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+    static constexpr int MIN_WAVES_PER_EU = 1;
+
+    static constexpr int D_QK_SIZE = 576;
+    static constexpr int D_V_SIZE  = 512;
+
+    using D_ATTN = D_ATTN_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    static constexpr int T_M = NUM_WARPS;
+    static constexpr int T_N = 1;
+    static constexpr int T_K = 1;
+
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 32;
+
+    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM0_E_N = KV_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM0_E_K = D_QK_SIZE / W_K;
+
+    static constexpr int SLICE_D = 32;
+    static constexpr int NUM_D_SLICES = D_V_SIZE / SLICE_D;
+
+    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM1_E_N = SLICE_D / W_N;
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
+
+    static constexpr int VEC_O = 4;
+
+    static constexpr size_t smem_kv_bytes = (size_t)KV_TILE_SIZE * D_QK_SIZE * sizeof(D_ATTN);
+    static constexpr size_t smem_bytes() { return smem_kv_bytes; }
+
+    static_assert(D_QK_SIZE % W_K == 0);
+    static_assert(KV_TILE_SIZE % (W_N * T_N) == 0);
+    static_assert(T_M * T_N * T_K == NUM_WARPS);
+};
+
+template<int Q_TILE_SIZE_ = 32,
+         int KV_TILE_SIZE_ = 64,
+         int NUM_WARPS_ = 4,
+         typename D_ATTN_ = bf16_t,
+         typename D_OUT_ = bf16_t>
+struct dsa_v32_decode_a16w16_32mx1_16nx4_traits {
+    static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int NUM_WARPS = NUM_WARPS_;
+
+    static constexpr int WARP_SIZE = 64;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+    static constexpr int MIN_WAVES_PER_EU = 1;
+
+    static constexpr int D_QK_SIZE = 576;
+    static constexpr int D_V_SIZE  = 512;
+
+    using D_ATTN = D_ATTN_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    static constexpr int T_M = 1;
+    static constexpr int T_N = NUM_WARPS;
+    static constexpr int T_K = 1;
+
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 32;
+
+    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM0_E_N = KV_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM0_E_K = D_QK_SIZE / W_K;
+
+    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM1_E_N = D_V_SIZE / (W_N * T_N);
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
+
+    static constexpr int VEC_O = 4;
+
+    static constexpr int ML_SLOT_ELEMS = GEMM0_E_M * W_M * T_N;
+    static constexpr size_t smem_ml_bytes = 2 * ML_SLOT_ELEMS * sizeof(D_ACC);
+    static constexpr size_t smem_kv_bytes = (size_t)KV_TILE_SIZE * D_QK_SIZE * sizeof(D_ATTN);
+    static constexpr size_t smem_bytes() { return smem_kv_bytes + smem_ml_bytes; }
+
+    static_assert(D_QK_SIZE % W_K == 0);
+    static_assert(KV_TILE_SIZE % (W_N * T_N) == 0);
+    static_assert(D_V_SIZE % (W_N * T_N) == 0);
+    static_assert(T_M * T_N * T_K == NUM_WARPS);
 };
 
 __host__ __device__ inline int ceil_div(int a, int b) {
