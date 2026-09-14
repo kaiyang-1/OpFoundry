@@ -7,24 +7,28 @@
 using opus::operator""_I;
 
 namespace dsa_v32_decode_a16w16_16mx4_64nx1 {
+// ----------------------------------------------------------------- register budget and tiles
 
 constexpr int Q_AGPR_BASE = 0;
-constexpr int S_VGPR_BASE = 128;
-
 template<class T> constexpr int Q_ELEMS          = T::Q_TILE_SIZE * T::D_QK_SIZE / T::WARP_SIZE;
 template<class T> constexpr int Q_LOAD_INSTS     = Q_ELEMS<T> / T::VEC_Q;
 template<class T> constexpr int Q_AGPR_PER_LOAD  = T::VEC_Q * sizeof(typename T::D_ATTN) / 4;
 
+template<class T> constexpr int K_AGPR_BASE      = Q_AGPR_BASE + Q_LOAD_INSTS<T> * Q_AGPR_PER_LOAD<T>;
 template<class T> constexpr int K_CHUNKS         = (T::GEMM0_E_N / T::smem_n_sub_tile_rpt) * (T::D_128B_SIZE / T::W_K);
 template<class T> constexpr int K_AGPR_PER_CHUNK = T::VEC_KV * sizeof(typename T::D_ATTN) / 4;
-template<class T> constexpr int K_AGPR_BASE      = Q_AGPR_BASE + Q_LOAD_INSTS<T> * Q_AGPR_PER_LOAD<T>;
 
+template<class T> constexpr int V_N_TILES        = T::D_128B_SIZE / T::W_N;
+template<class T> constexpr int V_TR_PER_TILE    = T::W_N * T::W_K / T::WARP_SIZE / T::VEC_TR_V;
+template<class T> constexpr int V_TR_GRP_K       = (T::WARP_SIZE / 16) / (T::W_N / (4 * T::VEC_TR_V));
+template<class T, int I> constexpr int v_tr_issue_off = (I / V_TR_PER_TILE<T>) * T::W_N + (I % V_TR_PER_TILE<T>) * V_TR_GRP_K<T> * T::D_128B_SIZE;
+
+constexpr int O_VGPR_BASE = 0;
+constexpr int S_VGPR_BASE = 128;
+template<class T> constexpr int P_VGPR_BASE      = S_VGPR_BASE;
 template<class T> constexpr int S_ELEMS          = T::GEMM0_E_N * T::W_M * T::W_N / T::WARP_SIZE;
 template<class T> constexpr int S_VGPR_PER_TILE  = T::W_M * T::W_N / T::WARP_SIZE;
-template<class T> constexpr int P_VGPR_BASE      = S_VGPR_BASE;
-
 template<class T> constexpr int O_ELEMS          = T::Q_TILE_SIZE * T::D_VO_SIZE / T::WARP_SIZE;
-constexpr int O_VGPR_BASE = 0;
 
 template<class T> using v_q_t = opus::array<opus::vector_t<typename T::D_ATTN, T::VEC_Q>, Q_LOAD_INSTS<T>>;
 template<class T> using v_s_t = opus::vector_t<typename T::D_ACC, S_ELEMS<T>>;
@@ -33,6 +37,8 @@ template<class T> using v_o_t = opus::vector_t<typename T::D_ACC, O_ELEMS<T>>;
 
 template<class T, int I> constexpr int kv_sub_tile_off = I * T::NUM_WARPS * T::smem_d_rpt * T::smem_brick;
 template<class T, int J> constexpr int kv_d_brick_off  = J * T::NUM_WARPS * T::smem_brick;
+
+// ----------------------------------------------------------------------------------- layouts
 
 template<class T>
 __device__ inline auto make_layout_q(int warp_id, int lane_id, int stride_q_h) {
@@ -132,7 +138,42 @@ __device__ inline auto make_layout_rk(int lane_id) {
         opus::unfold_p_coord(rk_dim, opus::tuple{lane_n % T::NUM_WARPS, lane_n / T::NUM_WARPS, lane_id / T::W_N}));
 }
 
-template<class Traits> __device__ auto make_layout_rv(int lane_id);
+template<class T>
+__device__ inline auto make_layout_rv(int lane_id) {
+    constexpr int lane_per_grp = 16;
+    constexpr int lane_lo = 4;
+    constexpr int lane_hi = lane_per_grp / lane_lo;
+    constexpr int num_grps = T::WARP_SIZE / lane_per_grp;
+    constexpr int grp_n = T::W_N / (lane_lo * T::VEC_TR_V);
+    constexpr int grp_k = num_grps / grp_n;
+
+    constexpr auto rv_shape = opus::make_tuple(
+        opus::number<V_N_TILES<T>>{},
+        opus::number<T::smem_n_sub_tile / T::W_K>{},
+        opus::number<lane_hi>{},
+        opus::number<T::W_K / (lane_hi * grp_k)>{},
+        opus::number<grp_k>{},
+        opus::number<grp_n>{},
+        opus::number<lane_lo>{},
+        opus::number<T::VEC_TR_V>{});
+
+    constexpr auto rv_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    const int grp_id = lane_id / lane_per_grp;
+    const int lane_in_grp = lane_id % lane_per_grp;
+
+    return opus::make_layout(
+        rv_shape,
+        opus::unfold_x_stride(rv_dim, rv_shape, opus::tuple{opus::number<grp_n * lane_lo * T::VEC_TR_V>{},
+                                                            opus::number<T::smem_brick>{},
+                                                            opus::number<T::D_128B_SIZE>{},
+                                                            1_I}),
+        opus::unfold_p_coord(rv_dim, opus::tuple{lane_in_grp / lane_lo, grp_id / grp_n, grp_id % grp_n, lane_in_grp % lane_lo}));
+}
 
 template<class T>
 __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h) {
@@ -155,6 +196,8 @@ __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h) {
         opus::unfold_p_coord(o_block_dim, opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
 }
 
+// ------------------------------------------------------------------------------------ memory
+
 template<class T, class G, class U>
 __device__ inline auto load_q(G& g_q, const U& u_q) {
     using namespace opus;
@@ -176,6 +219,19 @@ __device__ inline void async_load_kv_tile(G& g_kv, S& s_kv, const UG& u_gkv, con
                                     u_skv + opus::number<kv_sub_tile_off<T, ig.value>>{});
     });
 }
+
+template<class T, int IMM, class SM>
+__device__ inline auto tr_load_v(SM& s_kv, int off) {
+    using D_ATTN = typename T::D_ATTN;
+    static_assert(IMM >= 0 && IMM < (1 << 16));
+    opus::vector_t<opus::i32_t, 2> raw;
+    const opus::u32_t addr = static_cast<opus::u32_t>(
+        reinterpret_cast<__UINTPTR_TYPE__>(s_kv.ptr + off * static_cast<int>(sizeof(D_ATTN))));
+    asm volatile("ds_read_b64_tr_b16 %0, %1 offset:%2\n" : "=a"(raw) : "v"(addr), "i"(IMM) : "memory");
+    return __builtin_bit_cast(opus::vector_t<D_ATTN, T::VEC_TR_V>, raw);
+}
+
+// -------------------------------------------------------------------------------------- gemm
 
 template<class T, class U, class VQ, class VS>
 __device__ inline void compute_qk(char* smem_kv, const U& u_rk, const VQ& v_q, VS& v_s) {
@@ -212,6 +268,49 @@ __device__ inline void compute_qk(char* smem_kv, const U& u_rk, const VQ& v_q, V
         });
     });
 }
+
+template<class T, class U, class VP, class VO>
+__device__ inline void compute_pv(char* smem_kv, const U& u_rv, const VP& v_p, VO& v_o) {
+    using namespace opus;
+    using D_ATTN = typename T::D_ATTN;
+
+    auto mfma_pv = make_mfma<D_ATTN, D_ATTN, typename T::D_ACC>(
+        number<T::W_M>{}, number<T::W_N>{}, number<T::W_K>{}, mfma_adaptor_swap_ab{});
+    using o_tile_t = typename decltype(mfma_pv)::vtype_c;
+    using v_tile_t = typename decltype(mfma_pv)::vtype_b;
+    using p_tile_t = typename decltype(mfma_pv)::vtype_a;
+
+    auto offsets  = layout_to_offsets<T::VEC_TR_V>(u_rv);
+    auto p_chunks = reinterpret_cast<const p_tile_t*>(&v_p);
+    auto o_tiles  = reinterpret_cast<o_tile_t*>(&v_o);
+
+    static_for<T::smem_n_sub_tile_rpt>([&](auto ns) {
+        auto s_sub = make_smem(reinterpret_cast<D_ATTN*>(smem_kv) + kv_sub_tile_off<T, ns.value>);
+        static_for<T::smem_d_rpt_v>([&](auto ds) {
+            v_tile_t v[V_N_TILES<T>];
+            static_for<V_N_TILES<T>>([&](auto en) {
+                static_for<V_TR_PER_TILE<T>>([&](auto h) {
+                    constexpr int i = en.value * V_TR_PER_TILE<T> + h.value;
+                    vector_t<D_ATTN, T::VEC_TR_V> chunk;
+                    chunk = tr_load_v<T, (kv_d_brick_off<T, ds.value> + v_tr_issue_off<T, i>) * (int)sizeof(D_ATTN)>(s_sub, offsets[0]);
+                    s_waitcnt_lgkmcnt(0_I);
+                    __builtin_amdgcn_sched_barrier(0);
+                    set_slice(v[en.value], chunk, number<h.value * T::VEC_TR_V>{},
+                                                  number<(h.value + 1) * T::VEC_TR_V>{});
+                });
+            });
+            s_waitcnt_lgkmcnt(0_I);
+            static_for<V_N_TILES<T>>([&](auto en) {
+                constexpr int ot = ds.value * V_N_TILES<T> + en.value;
+                [[clang::amdgpu_pin_vgpr(O_VGPR_BASE + ot * S_VGPR_PER_TILE<T>)]]
+                o_tiles[ot] = mfma_pv(p_chunks[ns.value], v[en.value], o_tiles[ot]);
+            });
+            __builtin_amdgcn_sched_barrier(0);
+        });
+    });
+}
+
+// ----------------------------------------------------------------------------------- softmax
 
 template<int THR_X, int THR_Y>
 __device__ inline void attn_mask_vec2_imm(opus::u32_t rel, opus::u32_t neg_inf_v,
@@ -289,11 +388,11 @@ __device__ inline typename T::D_ACC attn_row_sum(const V& v_s) {
 template<class T, class VO>
 __device__ inline void scale_o_tile(VO& v_o, typename T::D_ACC scale) {
     using namespace opus;
-    using acc2_t = vector_t<typename T::D_ACC, 2>;
-    auto o_pairs = reinterpret_cast<acc2_t*>(&v_o);
-    static_for<O_ELEMS<T> / 2>([&](auto i) {
-        [[clang::amdgpu_pin_vgpr(O_VGPR_BASE + i.value * 2)]]
-        o_pairs[i.value] = o_pairs[i.value] * scale;
+    using acc_tile_t = vector_t<typename T::D_ACC, S_VGPR_PER_TILE<T>>;
+    auto o_tiles = reinterpret_cast<acc_tile_t*>(&v_o);
+    static_for<O_ELEMS<T> / S_VGPR_PER_TILE<T>>([&](auto i) {
+        [[clang::amdgpu_pin_vgpr(O_VGPR_BASE + i.value * S_VGPR_PER_TILE<T>)]]
+        o_tiles[i.value] = o_tiles[i.value] * scale;
     });
 }
 
@@ -326,6 +425,8 @@ __device__ inline void softmax_tile(VS& v_s, VP& v_p, VO& v_o,
     scale_o_tile<T>(v_o, rescale);
 }
 
+// ------------------------------------------------------------------------------------ driver
+
 template<class Traits>
 __device__ void attention_tiles(const dsa_v32_a16w16_kargs& kargs,
                                 int page_idx_begin, int valid_kv_len,
@@ -353,6 +454,7 @@ __device__ void attention_tiles(const dsa_v32_a16w16_kargs& kargs,
     auto u_gkv        = make_layout_gkv<T>(lane_id);
     auto u_skv        = make_layout_skv<T>(warp_id);
     auto u_rk         = make_layout_rk<T>(lane_id);
+    auto u_rv         = make_layout_rv<T>(lane_id);
 
     const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
 
@@ -374,6 +476,7 @@ __device__ void attention_tiles(const dsa_v32_a16w16_kargs& kargs,
 
         v_p_t<T> v_p;
         softmax_tile<T>(v_s, v_p, v_o, m_row, l_row, temperature_scale);
+        compute_pv<T>(smem_kv, u_rv, v_p, v_o);
 
     }
 }

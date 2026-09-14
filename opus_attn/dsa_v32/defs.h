@@ -209,9 +209,10 @@ struct dsa_v32_decode_a16w16_16mx4_64nx1_traits {
     static constexpr int GEMM1_E_N = SLICE_D / W_N;
     static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
 
-    static constexpr int VEC_Q  = 8;
+    static constexpr int VEC_Q = 8;
     static constexpr int VEC_KV = 8;
-    static constexpr int VEC_O  = 4;
+    static constexpr int VEC_TR_V = 4;
+    static constexpr int VEC_O = 4;
 
     static constexpr int dwordx4_size = 16;
     static constexpr int D_128B_SIZE = 128 / sizeof(D_ATTN);
@@ -219,6 +220,7 @@ struct dsa_v32_decode_a16w16_16mx4_64nx1_traits {
     static constexpr int smem_n_per_wave = smem_linear_wave / D_128B_SIZE;
     static constexpr int smem_n_rpt = KV_TILE_SIZE / smem_n_per_wave;
     static constexpr int smem_d_rpt = D_QK_SIZE / D_128B_SIZE;
+    static constexpr int smem_d_rpt_v = D_VO_SIZE / D_128B_SIZE;
     static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
     static constexpr int smem_brick = smem_linear_wave + smem_padding_32B;
 

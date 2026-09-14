@@ -233,8 +233,6 @@ void benchmark_dsa_v32_kernel(const KArgs& kargs, dim3 grid, dim3 block,
 
     const float avg_time = total_time / iterations;
 
-    using D_NOPE = typename Traits::D_NOPE;
-    using D_ROPE = typename Traits::D_ROPE;
     using D_OUT  = typename Traits::D_OUT;
     constexpr int D_QK = Traits::D_QK_SIZE;
     constexpr int D_V  = Traits::D_VO_SIZE;
@@ -242,9 +240,14 @@ void benchmark_dsa_v32_kernel(const KArgs& kargs, dim3 grid, dim3 block,
     const double flops = 2.0 * kargs.H * indices_prefix_sum * (D_QK + D_V);
     const double tflops = flops / (avg_time * 1e-3) / 1e12;
 
-    constexpr size_t row_bytes = Traits::D_NOPE_SIZE * sizeof(D_NOPE)
-                               + Traits::D_SCALE_SIZE * sizeof(uint8_t)
-                               + Traits::D_ROPE_SIZE * sizeof(D_ROPE);
+    constexpr size_t row_bytes = []() -> size_t {
+        if constexpr (requires { Traits::D_NOPE_SIZE; })
+            return Traits::D_NOPE_SIZE * sizeof(typename Traits::D_NOPE)
+                 + Traits::D_SCALE_SIZE * sizeof(uint8_t)
+                 + Traits::D_ROPE_SIZE * sizeof(typename Traits::D_ROPE);
+        else
+            return Traits::D_QK_SIZE * sizeof(typename Traits::D_ATTN);
+    }();
     const size_t q_bytes  = (size_t)kargs.B * kargs.H * row_bytes;
     const size_t o_bytes  = (size_t)kargs.B * kargs.H * D_V * sizeof(D_OUT);
     const size_t kv_bytes = (size_t)indices_prefix_sum * row_bytes;
@@ -438,8 +441,48 @@ void dsa_v32_attention_ref_fp8(
 }
 
 template<class PATraits>
-int run_dsa_v32_case(int H, int B, int total_tokens,
-                bool verify, bool dense_kv) {
+void dsa_v32_attention_ref_bf16(
+    const typename PATraits::D_ATTN* Q, const typename PATraits::D_ATTN* KV,
+    typename PATraits::D_OUT* O, float* LSE,
+    const int* kv_indptr, const int* kv_indices,
+    int B, int H)
+{
+    using O_t = typename PATraits::D_OUT;
+    constexpr int D_HEAD = PATraits::D_VO_SIZE;
+    constexpr int D_QK   = PATraits::D_QK_SIZE;
+    const int o_stride_n = H * D_HEAD;
+
+    #pragma omp parallel for collapse(2)
+    for (int h = 0; h < H; h++) {
+        for (int i = 0; i < B; i++) {
+            const int kv_begin = kv_indptr[i];
+            const int num_rows = kv_indptr[i + 1] - kv_begin;
+
+            O_t* o_row = O + (size_t)i * o_stride_n + h * D_HEAD;
+            float* lse_row = LSE + (size_t)i * H + h;
+            if (num_rows <= 0) {
+                for (int d = 0; d < D_HEAD; d++) o_row[d] = static_cast<O_t>(0.0f);
+                *lse_row = std::numeric_limits<float>::infinity();
+                continue;
+            }
+
+            std::vector<float> q_dense(D_QK);
+            const typename PATraits::D_ATTN* q_src = Q + ((size_t)i * H + h) * D_QK;
+            for (int d = 0; d < D_QK; d++) q_dense[d] = static_cast<float>(q_src[d]);
+
+            std::vector<float> kv_dense((size_t)num_rows * D_QK);
+            for (int p = 0; p < num_rows; p++) {
+                const typename PATraits::D_ATTN* k_src = KV + (size_t)kv_indices[kv_begin + p] * D_QK;
+                for (int d = 0; d < D_QK; d++) kv_dense[(size_t)p * D_QK + d] = static_cast<float>(k_src[d]);
+            }
+
+            dsa_v32_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, o_row, lse_row);
+        }
+    }
+}
+
+template<class PATraits>
+int run_dsa_v32_case_fp8(int H, int B, int total_tokens, bool verify, bool dense_kv) {
     using OType = typename PATraits::D_OUT;
     printf("DSA v3.2 Decode Attention: H_Q=%d, B=%d, D_QK=%d, D_V=%d, NoPE=fp8, RoPE=bf16, total_tokens=%d\n",
            H, B, PATraits::D_QK_SIZE, PATraits::D_VO_SIZE, total_tokens);
@@ -601,6 +644,139 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
     return rc;
 }
 
+template<class PATraits>
+int run_dsa_v32_case_bf16(int H, int B, int total_tokens, bool verify, bool dense_kv) {
+    using OType = typename PATraits::D_OUT;
+    printf("DSA v3.2 Decode Attention: H_Q=%d, B=%d, D_QK=%d, D_V=%d, dtype=bf16, total_tokens=%d\n",
+           H, B, PATraits::D_QK_SIZE, PATraits::D_VO_SIZE, total_tokens);
+
+    constexpr int D_HEAD = PATraits::D_VO_SIZE;
+    const size_t o_size = (size_t)B * H * D_HEAD;
+
+    auto host_o_ref = std::make_unique<OType[]>(o_size);
+    auto host_o_gpu = std::make_unique<OType[]>(o_size);
+    const size_t lse_size = (size_t)B * H;
+    auto host_lse_ref = std::make_unique<float[]>(lse_size);
+    auto host_lse_gpu = std::make_unique<float[]>(lse_size);
+
+    std::vector<int> host_kv_indptr, host_kv_indices;
+    if (dense_kv) {
+        init_dense_kv_indices(host_kv_indptr, host_kv_indices, B, total_tokens);
+    } else {
+        init_sparse_kv_indices(host_kv_indptr, host_kv_indices, B, total_tokens, PATraits::KV_TILE_SIZE, 5678);
+    }
+    const size_t total_kv_indices = host_kv_indices.size();
+    assert(total_kv_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
+    const int total_kv_count = static_cast<int>(total_kv_indices);
+
+    OType *dev_o;
+    float *dev_lse;
+    int *dev_kv_indptr, *dev_kv_indices;
+    const size_t kv_indices_alloc_size = std::max<size_t>(host_kv_indices.size(), 1);
+    CHECK_HIP(hipMalloc(&dev_o, o_size * sizeof(OType)));
+    CHECK_HIP(hipMalloc(&dev_lse, lse_size * sizeof(float)));
+    CHECK_HIP(hipMalloc(&dev_kv_indptr, host_kv_indptr.size() * sizeof(int)));
+    CHECK_HIP(hipMalloc(&dev_kv_indices, kv_indices_alloc_size * sizeof(int)));
+    CHECK_HIP(hipMemcpy(dev_kv_indptr, host_kv_indptr.data(), host_kv_indptr.size() * sizeof(int), hipMemcpyHostToDevice));
+    if (!host_kv_indices.empty())
+        CHECK_HIP(hipMemcpy(dev_kv_indices, host_kv_indices.data(), host_kv_indices.size() * sizeof(int), hipMemcpyHostToDevice));
+
+    const int num_h_blocks = ceil_div(H, PATraits::Q_TILE_SIZE * PATraits::T_M);
+    const int num_parts = std::max(1, DSA_V32_NUM_CU / num_h_blocks);
+    dim3 grid(num_parts, num_h_blocks, 1);
+    dim3 block(PATraits::BLOCK_SIZE);
+    printf("DSA v3.2 split-KV launch config: main grid=(%d,%d,%d) block=%d, num_parts=%d\n",
+           grid.x, grid.y, grid.z, block.x, num_parts);
+
+    const int total_splits = B + num_parts;
+    DsaSchedMeta* dev_sched_meta; int* dev_num_splits;
+    float *dev_o_accum, *dev_lse_accum;
+    CHECK_HIP(hipMalloc(&dev_sched_meta, num_parts * sizeof(DsaSchedMeta)));
+    CHECK_HIP(hipMalloc(&dev_num_splits, (B + 1) * sizeof(int)));
+    CHECK_HIP(hipMalloc(&dev_o_accum, (size_t)total_splits * H * PATraits::D_VO_SIZE * sizeof(float)));
+    CHECK_HIP(hipMalloc(&dev_lse_accum, (size_t)total_splits * H * sizeof(float)));
+
+    int rc = 0;
+    auto verify_and_bench = [&](const auto& kargs) {
+        dsa_v32_launch_pipeline(PATraits{}, kargs, grid, block, true);
+        CHECK_HIP_KERNEL_LAUNCH();
+        if (verify) {
+            printf("\nValidating GPU results against CPU reference...\n");
+            CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, o_size * sizeof(OType), hipMemcpyDeviceToHost));
+            CHECK_HIP(hipMemcpy(host_lse_gpu.get(), dev_lse, lse_size * sizeof(float), hipMemcpyDeviceToHost));
+            bool all_valid = validate_dsa_v32_results<OType>(host_o_ref.get(), host_o_gpu.get(), B, H, D_HEAD);
+            all_valid &= validate_dsa_v32_lse(host_lse_ref.get(), host_lse_gpu.get(), B, H);
+            printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
+            if (!all_valid) rc = 1;
+        }
+        if (!rc) {
+            printf("\n");
+            benchmark_dsa_v32_kernel<PATraits>(kargs, grid, block, total_kv_count);
+            printf("\n");
+        }
+    };
+
+    using D_ATTN = typename PATraits::D_ATTN;
+    constexpr int D_QK = PATraits::D_QK_SIZE;
+    const size_t q_size = (size_t)B * H * D_QK, kv_size = (size_t)total_tokens * D_QK;
+
+    auto host_q  = std::make_unique<D_ATTN[]>(q_size);
+    auto host_kv = std::make_unique<D_ATTN[]>(kv_size);
+    rand_vector(host_q.get(), q_size, -1.0f, 1.0f);
+    rand_vector(host_kv.get(), kv_size, -1.0f, 1.0f);
+
+    D_ATTN *dev_q, *dev_kv;
+    CHECK_HIP(hipMalloc(&dev_q, q_size * sizeof(D_ATTN)));
+    CHECK_HIP(hipMalloc(&dev_kv, kv_size * sizeof(D_ATTN)));
+    CHECK_HIP(hipMemcpy(dev_q, host_q.get(), q_size * sizeof(D_ATTN), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(dev_kv, host_kv.get(), kv_size * sizeof(D_ATTN), hipMemcpyHostToDevice));
+
+    if (verify)
+        dsa_v32_attention_ref_bf16<PATraits>(host_q.get(), host_kv.get(),
+                                             host_o_ref.get(), host_lse_ref.get(),
+                                             host_kv_indptr.data(), host_kv_indices.data(), B, H);
+
+    dsa_v32_a16w16_kargs kargs{};
+    kargs.q_ptr = dev_q;
+    kargs.kv_ptr = dev_kv;
+    kargs.out_ptr = dev_o;
+    kargs.lse_ptr = dev_lse;
+    kargs.kv_indptr = dev_kv_indptr;
+    kargs.kv_indices = dev_kv_indices;
+    kargs.sched_meta = dev_sched_meta;
+    kargs.num_splits = dev_num_splits;
+    kargs.o_accum = dev_o_accum;
+    kargs.lse_accum = dev_lse_accum;
+    kargs.num_parts = num_parts;
+    kargs.B = B;
+    kargs.H = H;
+    kargs.total_tokens = total_tokens;
+    kargs.stride_q_b = H * D_QK;
+    kargs.stride_q_h = D_QK;
+    kargs.stride_o_b = H * D_HEAD;
+    kargs.stride_o_h = D_HEAD;
+    kargs.stride_lse_b = H;
+    kargs.stride_kv_page = D_QK;
+    kargs.softmax_scale = 1.0f / std::sqrt(static_cast<float>(PATraits::D_QK_SIZE));
+
+    verify_and_bench(kargs);
+
+    CHECK_HIP(hipFree(dev_q));
+    CHECK_HIP(hipFree(dev_kv));
+
+    CHECK_HIP(hipFree(dev_sched_meta));
+    CHECK_HIP(hipFree(dev_num_splits));
+    CHECK_HIP(hipFree(dev_o_accum));
+    CHECK_HIP(hipFree(dev_lse_accum));
+
+    CHECK_HIP(hipFree(dev_o));
+    CHECK_HIP(hipFree(dev_lse));
+    CHECK_HIP(hipFree(dev_kv_indptr));
+    CHECK_HIP(hipFree(dev_kv_indices));
+
+    return rc;
+}
+
 int main(int argc, char** argv) {
     int H = 128;
     int B = 128;
@@ -650,12 +826,10 @@ int main(int argc, char** argv) {
     }
 
     if (std::strcmp(dtype, "fp8") == 0)
-        return run_dsa_v32_case<dsa_v32_decode_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(H, B, total_tokens, verify, dense_kv);
+        return run_dsa_v32_case_fp8<dsa_v32_decode_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(H, B, total_tokens, verify, dense_kv);
 
-    if (std::strcmp(dtype, "bf16") == 0) {
-        std::cerr << "bf16 decode is not implemented yet\n";
-        return 2;
-    }
+    if (std::strcmp(dtype, "bf16") == 0)
+        return run_dsa_v32_case_bf16<dsa_v32_decode_a16w16_16mx4_64nx1_traits<16, 64, 4, bf16_t, bf16_t>>(H, B, total_tokens, verify, dense_kv);
 
     std::cerr << "unknown -dtype '" << dtype << "'; available: fp8, bf16\n";
     return 1;
