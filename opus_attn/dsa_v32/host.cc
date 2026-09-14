@@ -237,7 +237,7 @@ void benchmark_dsa_v32_kernel(const KArgs& kargs, dim3 grid, dim3 block,
     using D_ROPE = typename Traits::D_ROPE;
     using D_OUT  = typename Traits::D_OUT;
     constexpr int D_QK = Traits::D_QK_SIZE;
-    constexpr int D_V  = Traits::D_V_SIZE;
+    constexpr int D_V  = Traits::D_VO_SIZE;
 
     const double flops = 2.0 * kargs.H * indices_prefix_sum * (D_QK + D_V);
     const double tflops = flops / (avg_time * 1e-3) / 1e12;
@@ -366,7 +366,7 @@ inline void dsa_v32_attention_compute(const float* q_dense, const float* kv_dens
                                       typename PATraits::D_OUT* o_row, float* lse_row) {
     using O_t = typename PATraits::D_OUT;
     constexpr int D_QK = PATraits::D_QK_SIZE;
-    constexpr int D_V  = PATraits::D_V_SIZE;
+    constexpr int D_V  = PATraits::D_VO_SIZE;
     const float softmax_scale = 1.0f / std::sqrt(static_cast<float>(D_QK));
 
     std::vector<float> scores(num_rows);
@@ -398,7 +398,7 @@ void dsa_v32_attention_ref_fp8(
     int B, int H)
 {
     using O_t = typename PATraits::D_OUT;
-    constexpr int D_HEAD = PATraits::D_V_SIZE;
+    constexpr int D_HEAD = PATraits::D_VO_SIZE;
     constexpr int D_QK   = PATraits::D_QK_SIZE;
     constexpr int NOPE   = PATraits::D_NOPE_SIZE;
     constexpr int SCALE  = PATraits::D_SCALE_SIZE;
@@ -442,9 +442,9 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
                 bool verify, bool dense_kv) {
     using OType = typename PATraits::D_OUT;
     printf("DSA v3.2 Decode Attention: H_Q=%d, B=%d, D_QK=%d, D_V=%d, NoPE=fp8, RoPE=bf16, total_tokens=%d\n",
-           H, B, PATraits::D_QK_SIZE, PATraits::D_V_SIZE, total_tokens);
+           H, B, PATraits::D_QK_SIZE, PATraits::D_VO_SIZE, total_tokens);
 
-    constexpr int D_HEAD = PATraits::D_V_SIZE;
+    constexpr int D_HEAD = PATraits::D_VO_SIZE;
     const size_t o_size = (size_t)B * H * D_HEAD;
 
     auto host_o_ref = std::make_unique<OType[]>(o_size);
@@ -487,7 +487,7 @@ int run_dsa_v32_case(int H, int B, int total_tokens,
     float *dev_o_accum, *dev_lse_accum;
     CHECK_HIP(hipMalloc(&dev_sched_meta, num_parts * sizeof(DsaSchedMeta)));
     CHECK_HIP(hipMalloc(&dev_num_splits, (B + 1) * sizeof(int)));
-    CHECK_HIP(hipMalloc(&dev_o_accum, (size_t)total_splits * H * PATraits::D_V_SIZE * sizeof(float)));
+    CHECK_HIP(hipMalloc(&dev_o_accum, (size_t)total_splits * H * PATraits::D_VO_SIZE * sizeof(float)));
     CHECK_HIP(hipMalloc(&dev_lse_accum, (size_t)total_splits * H * sizeof(float)));
 
     int rc = 0;

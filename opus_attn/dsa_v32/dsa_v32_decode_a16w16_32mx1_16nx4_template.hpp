@@ -49,7 +49,7 @@ __device__ void decode_one_req(const dsa_v32_a16w16_kargs& kargs, int batch_idx,
 }
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::MIN_WAVES_PER_EU)
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1)
 void dsa_v32_decode_a16w16_32mx1_16nx4_kernel(dsa_v32_a16w16_kargs kargs) {
     using namespace opus;
     using namespace dsa_v32_decode_a16w16_32mx1_16nx4;

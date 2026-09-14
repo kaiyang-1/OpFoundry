@@ -1454,7 +1454,7 @@ __device__ void dsa_v32_decode_one_req(dsa_v32_a8w8_kargs kargs, int batch_idx, 
 }
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::MIN_WAVES_PER_EU) void dsa_v32_decode_a8w8_16mx8_32nx1_kernel(dsa_v32_a8w8_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void dsa_v32_decode_a8w8_16mx8_32nx1_kernel(dsa_v32_a8w8_kargs kargs) {
     using namespace opus;
     using namespace dsa_v32_decode_a8w8_16mx8_32nx1;
     using T = opus::remove_cvref_t<Traits>;

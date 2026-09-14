@@ -95,7 +95,6 @@ struct dsa_v32_decode_a8w8_16mx8_32nx1_traits {
 
     static constexpr int WARP_SIZE = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
-    static constexpr int MIN_WAVES_PER_EU = 2;
 
     static constexpr int D_NOPE_SIZE = 512;
     static constexpr int D_ROPE_SIZE = 64;
@@ -104,7 +103,7 @@ struct dsa_v32_decode_a8w8_16mx8_32nx1_traits {
     static constexpr int D_SCALE_PADDED_SIZE = 32;
 
     static constexpr int D_QK_SIZE = D_HEAD_SIZE;
-    static constexpr int D_V_SIZE  = D_NOPE_SIZE;
+    static constexpr int D_VO_SIZE  = D_NOPE_SIZE;
 
     using D_NOPE = D_NOPE_;
     using D_ROPE = D_ROPE_;
@@ -183,10 +182,9 @@ struct dsa_v32_decode_a16w16_16mx4_64nx1_traits {
 
     static constexpr int WARP_SIZE = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
-    static constexpr int MIN_WAVES_PER_EU = 1;
 
     static constexpr int D_QK_SIZE = 576;
-    static constexpr int D_V_SIZE  = 512;
+    static constexpr int D_VO_SIZE  = 512;
 
     using D_ATTN = D_ATTN_;
     using D_OUT  = D_OUT_;
@@ -205,20 +203,31 @@ struct dsa_v32_decode_a16w16_16mx4_64nx1_traits {
     static constexpr int GEMM0_E_K = D_QK_SIZE / W_K;
 
     static constexpr int SLICE_D = 32;
-    static constexpr int NUM_D_SLICES = D_V_SIZE / SLICE_D;
+    static constexpr int NUM_D_SLICES = D_VO_SIZE / SLICE_D;
 
     static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
     static constexpr int GEMM1_E_N = SLICE_D / W_N;
     static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
 
-    static constexpr int VEC_O = 4;
+    static constexpr int VEC_Q  = 8;
+    static constexpr int VEC_KV = 8;
+    static constexpr int VEC_O  = 4;
 
-    static constexpr size_t smem_kv_bytes = (size_t)KV_TILE_SIZE * D_QK_SIZE * sizeof(D_ATTN);
+    static constexpr int dwordx4_size = 16;
+    static constexpr int D_128B_SIZE = 128 / sizeof(D_ATTN);
+    static constexpr int smem_linear_wave = WARP_SIZE * dwordx4_size / sizeof(D_ATTN);
+    static constexpr int smem_n_per_wave = smem_linear_wave / D_128B_SIZE;
+    static constexpr int smem_n_rpt = KV_TILE_SIZE / smem_n_per_wave;
+    static constexpr int smem_d_rpt = D_QK_SIZE / D_128B_SIZE;
+    static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
+    static constexpr int smem_brick = smem_linear_wave + smem_padding_32B;
+
+    static constexpr int smem_n_sub_tile = smem_n_per_wave * NUM_WARPS;
+    static constexpr int smem_n_sub_tile_rpt = KV_TILE_SIZE / smem_n_sub_tile;
+    static constexpr int kv_async_load_insts = smem_n_sub_tile_rpt * smem_d_rpt;
+
+    static constexpr size_t smem_kv_bytes = (size_t)smem_n_rpt * smem_d_rpt * smem_brick * sizeof(D_ATTN);
     static constexpr size_t smem_bytes() { return smem_kv_bytes; }
-
-    static_assert(D_QK_SIZE % W_K == 0);
-    static_assert(KV_TILE_SIZE % (W_N * T_N) == 0);
-    static_assert(T_M * T_N * T_K == NUM_WARPS);
 };
 
 template<int Q_TILE_SIZE_ = 32,
@@ -233,10 +242,9 @@ struct dsa_v32_decode_a16w16_32mx1_16nx4_traits {
 
     static constexpr int WARP_SIZE = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
-    static constexpr int MIN_WAVES_PER_EU = 1;
 
     static constexpr int D_QK_SIZE = 576;
-    static constexpr int D_V_SIZE  = 512;
+    static constexpr int D_VO_SIZE  = 512;
 
     using D_ATTN = D_ATTN_;
     using D_OUT  = D_OUT_;
@@ -255,20 +263,16 @@ struct dsa_v32_decode_a16w16_32mx1_16nx4_traits {
     static constexpr int GEMM0_E_K = D_QK_SIZE / W_K;
 
     static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
-    static constexpr int GEMM1_E_N = D_V_SIZE / (W_N * T_N);
+    static constexpr int GEMM1_E_N = D_VO_SIZE / (W_N * T_N);
     static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
 
+    static constexpr int VEC_Q = 8;
     static constexpr int VEC_O = 4;
 
     static constexpr int ML_SLOT_ELEMS = GEMM0_E_M * W_M * T_N;
     static constexpr size_t smem_ml_bytes = 2 * ML_SLOT_ELEMS * sizeof(D_ACC);
     static constexpr size_t smem_kv_bytes = (size_t)KV_TILE_SIZE * D_QK_SIZE * sizeof(D_ATTN);
     static constexpr size_t smem_bytes() { return smem_kv_bytes + smem_ml_bytes; }
-
-    static_assert(D_QK_SIZE % W_K == 0);
-    static_assert(KV_TILE_SIZE % (W_N * T_N) == 0);
-    static_assert(D_V_SIZE % (W_N * T_N) == 0);
-    static_assert(T_M * T_N * T_K == NUM_WARPS);
 };
 
 __host__ __device__ inline int ceil_div(int a, int b) {

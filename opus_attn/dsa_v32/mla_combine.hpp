@@ -21,7 +21,7 @@ __device__ void mla_combine_online(const KArgs& kargs, int b, int head,
     using D_ACC = typename T::D_ACC;
     using D_ACCx4 = opus::vector_t<D_ACC, 4>;
     constexpr int WARP = T::WARP_SIZE;
-    constexpr int D    = T::D_V_SIZE;
+    constexpr int D    = T::D_VO_SIZE;
     constexpr int VEC  = 4;
     constexpr int NVEC = D / (WARP * VEC);
 
@@ -90,7 +90,7 @@ __device__ void mla_combine_two_pass(const KArgs& kargs, int b, int head,
     using D_ACC = typename T::D_ACC;
     using D_ACCx4 = opus::vector_t<D_ACC, 4>;
     constexpr int WARP = T::WARP_SIZE;
-    constexpr int D    = T::D_V_SIZE;
+    constexpr int D    = T::D_VO_SIZE;
     constexpr int VEC  = 4;
     constexpr int NVEC = D / (WARP * VEC);
     constexpr int MAX_SPLITS = DSA_V32_NUM_CU;
