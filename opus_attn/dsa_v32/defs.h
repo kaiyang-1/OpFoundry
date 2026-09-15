@@ -229,7 +229,10 @@ struct dsa_v32_decode_a16w16_16mx4_64nx1_traits {
     static constexpr int kv_async_load_insts = smem_n_sub_tile_rpt * smem_d_rpt;
 
     static constexpr size_t smem_kv_bytes = (size_t)smem_n_rpt * smem_d_rpt * smem_brick * sizeof(D_ATTN);
-    static constexpr size_t smem_bytes() { return smem_kv_bytes; }
+
+    static constexpr int NUM_KV_BUFS = 2;
+    static constexpr int smem_slot_elems = (int)(smem_kv_bytes / sizeof(D_ATTN));
+    static constexpr size_t smem_bytes() { return NUM_KV_BUFS * smem_kv_bytes; }
 };
 
 template<int Q_TILE_SIZE_ = 32,
