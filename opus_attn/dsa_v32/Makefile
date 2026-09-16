@@ -6,11 +6,11 @@ COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -fopenmp -O3 -Wall --offload
 KERNEL_FLAGS = -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage
 
 BUILD = build
-OUT   = $(BUILD)/dsa_v32_decode.exe
+OUT   = $(BUILD)/mla_decode.exe
 
 KERNEL_SRCS = $(wildcard *_kernel.cc)
 HOST_SRC    = host.cc
-SHARED_HDRS = defs.h
+SHARED_HDRS = defs.h global_load.hpp
 KERNEL_OBJS = $(patsubst %.cc,$(BUILD)/%.o,$(KERNEL_SRCS))
 KERNEL_ASMS = $(patsubst %.cc,$(BUILD)/%.s,$(KERNEL_SRCS))
 HOST_OBJ    = $(BUILD)/host.o

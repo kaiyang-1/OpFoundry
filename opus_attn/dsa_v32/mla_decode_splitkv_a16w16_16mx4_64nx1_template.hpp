@@ -2,12 +2,12 @@
 
 #include <opus/opus.hpp>
 #include "defs.h"
-#include "dsa_v32_global_load.hpp"
+#include "global_load.hpp"
 #include <bit>
 
 using opus::operator""_I;
 
-namespace dsa_v32_decode_a16w16_16mx4_64nx1 {
+namespace opus_mla_decode_splitkv_a16w16_16mx4_64nx1 {
 // ------------------------------------------------------------- instruction scheduling masks
 
 constexpr int VALU_MASK       = 0x002;
@@ -724,7 +724,7 @@ __device__ inline void softmax_tile(VS& v_s, VP& v_p, VO& v_o,
 // ------------------------------------------------------------------------------------ driver
 
 template<class Traits>
-__device__ void attention_tiles(const dsa_v32_a16w16_kargs& kargs,
+__device__ void attention_tiles(const opus_mla_decode_splitkv_kargs& kargs,
                                 int page_idx_begin, int valid_kv_len,
                                 int tile_begin, int tile_end,
                                 char* smem_kv, const v_q_t<Traits>& v_q,
@@ -809,7 +809,7 @@ __device__ void attention_tiles(const dsa_v32_a16w16_kargs& kargs,
 }
 
 template<class Traits>
-__device__ void decode_one_req(const dsa_v32_a16w16_kargs& kargs, int batch_idx, int h_block_idx,
+__device__ void decode_one_req(const opus_mla_decode_splitkv_kargs& kargs, int batch_idx, int h_block_idx,
                                int page_idx_begin, int valid_kv_len,
                                int tile_begin, int tile_end, int slot,
                                char* smem_kv, typename Traits::D_ACC temperature_scale) {
@@ -867,7 +867,7 @@ __device__ void decode_one_req(const dsa_v32_a16w16_kargs& kargs, int batch_idx,
             const int64_t lse_offset = static_cast<int64_t>(batch_idx) * kargs.stride_lse_b + h_block_start;
             auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_ptr) + lse_offset,
                                    (size_t)(kargs.H - h_block_start) * sizeof(D_ACC));
-            const D_ACC lse = (l_row > D_ACC(0.0f)) ? (m_row + log2f(l_row)) * D_ACC(DSA_V32_LN_2)
+            const D_ACC lse = (l_row > D_ACC(0.0f)) ? (m_row + log2f(l_row)) * D_ACC(MLA_DECODE_SPLITKV_LN_2)
                                                     : numeric_limits<D_ACC>::infinity();
             g_lse.store(lse, warp_id_o * T::Q_TILE_SIZE + lane_id_o);
         }
@@ -893,16 +893,16 @@ __device__ void decode_one_req(const dsa_v32_a16w16_kargs& kargs, int batch_idx,
 
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1)
-void dsa_v32_decode_a16w16_16mx4_64nx1_kernel(dsa_v32_a16w16_kargs kargs) {
+void opus_mla_decode_splitkv_a16w16_16mx4_64nx1_kernel(opus_mla_decode_splitkv_kargs kargs) {
     using namespace opus;
-    using namespace dsa_v32_decode_a16w16_16mx4_64nx1;
+    using namespace opus_mla_decode_splitkv_a16w16_16mx4_64nx1;
     using T = opus::remove_cvref_t<Traits>;
 
     const int part = block_id_x();
     const int h_block_idx = block_id_y();
     if (part >= kargs.num_parts) return;
 
-    const DsaSchedMeta meta = kargs.sched_meta[part];
+    const opus_mla_decode_splitkv_sched_meta meta = kargs.sched_meta[part];
     if (meta.begin_req_idx >= kargs.B) return;
 
     __shared__ char smem_kv[T::smem_bytes()];

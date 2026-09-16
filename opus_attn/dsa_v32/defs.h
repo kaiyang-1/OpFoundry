@@ -7,11 +7,11 @@ using fp16_t = __fp16;
 using fp8_t  = _BitInt(8);
 using bf8_t  = unsigned _BitInt(8);
 
-static constexpr int DSA_V32_NUM_CU = 256;
-static constexpr int DSA_V32_FIXED_OVERHEAD = 5;
-static constexpr float DSA_V32_LN_2 = 0.69314718055994531f;
+static constexpr int MLA_DECODE_SPLITKV_NUM_CU = 256;
+static constexpr int MLA_DECODE_SPLITKV_FIXED_OVERHEAD = 5;
+static constexpr float MLA_DECODE_SPLITKV_LN_2 = 0.69314718055994531f;
 
-struct alignas(16) DsaSchedMeta {
+struct alignas(16) opus_mla_decode_splitkv_sched_meta {
     int begin_req_idx;
     int end_req_idx;
     int begin_tile_idx;
@@ -20,7 +20,7 @@ struct alignas(16) DsaSchedMeta {
     int _pad[3];
 };
 
-struct dsa_v32_a8w8_kargs {
+struct opus_mla_decode_splitkv_fp8_kargs {
     const void* __restrict__ q_nope_ptr;
     const void* __restrict__ q_scale_ptr;
     const void* __restrict__ q_rope_ptr;
@@ -32,7 +32,7 @@ struct dsa_v32_a8w8_kargs {
     const int* __restrict__ kv_indptr;
     const int* __restrict__ kv_indices;
 
-    const DsaSchedMeta* __restrict__ sched_meta;
+    const opus_mla_decode_splitkv_sched_meta* __restrict__ sched_meta;
     const int* __restrict__ num_splits;
     void* __restrict__ o_accum;
     void* __restrict__ lse_accum;
@@ -56,7 +56,7 @@ struct dsa_v32_a8w8_kargs {
     float softmax_scale;
 };
 
-struct dsa_v32_a16w16_kargs {
+struct opus_mla_decode_splitkv_kargs {
     const void* __restrict__ q_ptr;
     const void* __restrict__ kv_ptr;
     void* __restrict__ out_ptr;
@@ -64,7 +64,7 @@ struct dsa_v32_a16w16_kargs {
     const int* __restrict__ kv_indptr;
     const int* __restrict__ kv_indices;
 
-    const DsaSchedMeta* __restrict__ sched_meta;
+    const opus_mla_decode_splitkv_sched_meta* __restrict__ sched_meta;
     const int* __restrict__ num_splits;
     void* __restrict__ o_accum;
     void* __restrict__ lse_accum;
@@ -88,7 +88,7 @@ template<int Q_TILE_SIZE_ = 16,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct dsa_v32_decode_a8w8_16mx8_32nx1_traits {
+struct opus_mla_decode_splitkv_a8w8_16mx8_32nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
@@ -175,7 +175,7 @@ template<int Q_TILE_SIZE_ = 16,
          int NUM_WARPS_ = 4,
          typename D_ATTN_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct dsa_v32_decode_a16w16_16mx4_64nx1_traits {
+struct opus_mla_decode_splitkv_a16w16_16mx4_64nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
@@ -240,7 +240,7 @@ template<int Q_TILE_SIZE_ = 32,
          int NUM_WARPS_ = 4,
          typename D_ATTN_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct dsa_v32_decode_a16w16_32mx1_16nx4_traits {
+struct opus_mla_decode_splitkv_a16w16_32mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;

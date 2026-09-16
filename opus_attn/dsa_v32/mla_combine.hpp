@@ -10,7 +10,7 @@ __device__ inline void mla_write_lse(const KArgs& kargs, int b, int head, int la
     if (lane != 0) return;
     D_ACC* lse = reinterpret_cast<D_ACC*>(kargs.lse_ptr);
     lse[b * kargs.stride_lse_b + head] = (denom > D_ACC(0.0f))
-        ? (m + log2f(denom)) * D_ACC(DSA_V32_LN_2)
+        ? (m + log2f(denom)) * D_ACC(MLA_DECODE_SPLITKV_LN_2)
         : opus::numeric_limits<D_ACC>::infinity();
 }
 
@@ -93,7 +93,7 @@ __device__ void mla_combine_two_pass(const KArgs& kargs, int b, int head,
     constexpr int D    = T::D_VO_SIZE;
     constexpr int VEC  = 4;
     constexpr int NVEC = D / (WARP * VEC);
-    constexpr int MAX_SPLITS = DSA_V32_NUM_CU;
+    constexpr int MAX_SPLITS = MLA_DECODE_SPLITKV_NUM_CU;
     constexpr int NCHUNK = (MAX_SPLITS + WARP - 1) / WARP;
 
     const int H = kargs.H;

@@ -22,44 +22,44 @@ template<class Traits, class KArgs, int HEADS_PER_BLOCK = 8>
 __global__ void mla_combine_kernel(KArgs kargs);
 
 template<class Traits>
-__global__ void dsa_v32_decode_a8w8_16mx8_32nx1_kernel(dsa_v32_a8w8_kargs kargs);
+__global__ void opus_mla_decode_splitkv_a8w8_16mx8_32nx1_kernel(opus_mla_decode_splitkv_fp8_kargs kargs);
 template<class Traits>
-__global__ void dsa_v32_decode_a16w16_16mx4_64nx1_kernel(dsa_v32_a16w16_kargs kargs);
+__global__ void opus_mla_decode_splitkv_a16w16_16mx4_64nx1_kernel(opus_mla_decode_splitkv_kargs kargs);
 template<class Traits>
-__global__ void dsa_v32_decode_a16w16_32mx1_16nx4_kernel(dsa_v32_a16w16_kargs kargs);
+__global__ void opus_mla_decode_splitkv_a16w16_32mx1_16nx4_kernel(opus_mla_decode_splitkv_kargs kargs);
 
-static constexpr int DSA_V32_COMBINE_HEADS_PER_BLOCK = 8;
+static constexpr int MLA_DECODE_SPLITKV_COMBINE_HEADS_PER_BLOCK = 8;
 
 template<int Q, int KV, int NW, class DN, class DR, class DO>
-inline void dsa_v32_decode_launch(dsa_v32_decode_a8w8_16mx8_32nx1_traits<Q, KV, NW, DN, DR, DO>,
-                                  const dsa_v32_a8w8_kargs& kargs, dim3 grid, dim3 block) {
-    using Traits = dsa_v32_decode_a8w8_16mx8_32nx1_traits<Q, KV, NW, DN, DR, DO>;
-    dsa_v32_decode_a8w8_16mx8_32nx1_kernel<Traits><<<grid, block>>>(kargs);
+inline void mla_decode_splitkv_launch(opus_mla_decode_splitkv_a8w8_16mx8_32nx1_traits<Q, KV, NW, DN, DR, DO>,
+                                      const opus_mla_decode_splitkv_fp8_kargs& kargs, dim3 grid, dim3 block) {
+    using Traits = opus_mla_decode_splitkv_a8w8_16mx8_32nx1_traits<Q, KV, NW, DN, DR, DO>;
+    opus_mla_decode_splitkv_a8w8_16mx8_32nx1_kernel<Traits><<<grid, block>>>(kargs);
 }
 
 template<int Q, int KV, int NW, class DA, class DO>
-inline void dsa_v32_decode_launch(dsa_v32_decode_a16w16_16mx4_64nx1_traits<Q, KV, NW, DA, DO>,
-                                  const dsa_v32_a16w16_kargs& kargs, dim3 grid, dim3 block) {
-    using Traits = dsa_v32_decode_a16w16_16mx4_64nx1_traits<Q, KV, NW, DA, DO>;
-    dsa_v32_decode_a16w16_16mx4_64nx1_kernel<Traits><<<grid, block>>>(kargs);
+inline void mla_decode_splitkv_launch(opus_mla_decode_splitkv_a16w16_16mx4_64nx1_traits<Q, KV, NW, DA, DO>,
+                                      const opus_mla_decode_splitkv_kargs& kargs, dim3 grid, dim3 block) {
+    using Traits = opus_mla_decode_splitkv_a16w16_16mx4_64nx1_traits<Q, KV, NW, DA, DO>;
+    opus_mla_decode_splitkv_a16w16_16mx4_64nx1_kernel<Traits><<<grid, block>>>(kargs);
 }
 
 template<int Q, int KV, int NW, class DA, class DO>
-inline void dsa_v32_decode_launch(dsa_v32_decode_a16w16_32mx1_16nx4_traits<Q, KV, NW, DA, DO>,
-                                  const dsa_v32_a16w16_kargs& kargs, dim3 grid, dim3 block) {
-    using Traits = dsa_v32_decode_a16w16_32mx1_16nx4_traits<Q, KV, NW, DA, DO>;
-    dsa_v32_decode_a16w16_32mx1_16nx4_kernel<Traits><<<grid, block>>>(kargs);
+inline void mla_decode_splitkv_launch(opus_mla_decode_splitkv_a16w16_32mx1_16nx4_traits<Q, KV, NW, DA, DO>,
+                                      const opus_mla_decode_splitkv_kargs& kargs, dim3 grid, dim3 block) {
+    using Traits = opus_mla_decode_splitkv_a16w16_32mx1_16nx4_traits<Q, KV, NW, DA, DO>;
+    opus_mla_decode_splitkv_a16w16_32mx1_16nx4_kernel<Traits><<<grid, block>>>(kargs);
 }
 
 template<class Traits, class KArgs>
-inline void dsa_v32_launch_pipeline(Traits, const KArgs& kargs,
-                                    dim3 grid_main, dim3 block_main, bool run_metadata = true) {
+inline void mla_decode_splitkv_launch_pipeline(Traits, const KArgs& kargs,
+                                               dim3 grid_main, dim3 block_main, bool run_metadata = true) {
     if (run_metadata)
         get_mla_metadata_kernel<Traits><<<dim3(1), dim3(Traits::WARP_SIZE), (2 * kargs.B + 1) * (int)sizeof(int)>>>(kargs);
-    dsa_v32_decode_launch(Traits{}, kargs, grid_main, block_main);
-    const int n_head_blocks = ceil_div(kargs.H, DSA_V32_COMBINE_HEADS_PER_BLOCK);
+    mla_decode_splitkv_launch(Traits{}, kargs, grid_main, block_main);
+    const int n_head_blocks = ceil_div(kargs.H, MLA_DECODE_SPLITKV_COMBINE_HEADS_PER_BLOCK);
     dim3 grid_combine(kargs.B, n_head_blocks, 1);
-    dim3 block_combine(DSA_V32_COMBINE_HEADS_PER_BLOCK * Traits::WARP_SIZE);
+    dim3 block_combine(MLA_DECODE_SPLITKV_COMBINE_HEADS_PER_BLOCK * Traits::WARP_SIZE);
     mla_combine_kernel<Traits><<<grid_combine, block_combine>>>(kargs);
 }
 
@@ -89,7 +89,7 @@ void rand_vector(T* ptr, size_t size, float min_val = 0.0f, float max_val = 1.0f
 }
 
 template<class PATraits>
-void init_fp8_dsa_split(typename PATraits::D_NOPE* nope_ptr,
+void init_fp8_mla_split(typename PATraits::D_NOPE* nope_ptr,
                         uint8_t* scale_ptr,
                         typename PATraits::D_ROPE* rope_ptr, size_t rows) {
     using D_ROPE = typename PATraits::D_ROPE;
@@ -200,15 +200,15 @@ void init_dense_kv_indices(std::vector<int>& kv_indptr,
 }
 
 template<class Traits, class KArgs>
-void benchmark_dsa_v32_kernel(const KArgs& kargs, dim3 grid, dim3 block,
-                              int indices_prefix_sum, int warmup = 100, int iterations = 50) {
+void benchmark_mla_decode_splitkv_kernel(const KArgs& kargs, dim3 grid, dim3 block,
+                                         int indices_prefix_sum, int warmup = 100, int iterations = 50) {
 
     get_mla_metadata_kernel<Traits><<<dim3(1), dim3(Traits::WARP_SIZE), (2 * kargs.B + 1) * (int)sizeof(int)>>>(kargs);
     CHECK_HIP_KERNEL_LAUNCH();
     CHECK_HIP(hipDeviceSynchronize());
 
     for (int i = 0; i < warmup; ++i) {
-        dsa_v32_launch_pipeline(Traits{}, kargs, grid, block, false);
+        mla_decode_splitkv_launch_pipeline(Traits{}, kargs, grid, block, false);
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipDeviceSynchronize());
@@ -219,7 +219,7 @@ void benchmark_dsa_v32_kernel(const KArgs& kargs, dim3 grid, dim3 block,
 
     CHECK_HIP(hipEventRecord(start));
     for (int i = 0; i < iterations; ++i) {
-        dsa_v32_launch_pipeline(Traits{}, kargs, grid, block, false);
+        mla_decode_splitkv_launch_pipeline(Traits{}, kargs, grid, block, false);
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipEventRecord(stop));
@@ -253,15 +253,15 @@ void benchmark_dsa_v32_kernel(const KArgs& kargs, dim3 grid, dim3 block,
     const size_t kv_bytes = (size_t)indices_prefix_sum * row_bytes;
     const double tbps = double(q_bytes + o_bytes + kv_bytes) / (avg_time * 1e-3) / 1e12;
 
-    printf("DSA v3.2 Decode Kernel Performance: avg_time=%.3f ms, %.2f TFlops, %.2f TB/s\n",
+    printf("MLA decode split-KV performance: avg_time=%.3f ms, %.2f TFlops, %.2f TB/s\n",
            avg_time, tflops, tbps);
 }
 
 template<typename DType>
-bool validate_dsa_v32_results(const DType* ref, const DType* gpu,
-                          int B, int H, int D,
-                          float rtol = 1e-2f, float atol = 1e-2f,
-                          float tol_err_ratio = 0.05f) {
+bool validate_mla_decode_splitkv_results(const DType* ref, const DType* gpu,
+                                         int B, int H, int D,
+                                         float rtol = 1e-2f, float atol = 1e-2f,
+                                         float tol_err_ratio = 0.05f) {
     const size_t total_elements = (size_t)B * H * D;
     constexpr size_t printNum = 10;
 
@@ -314,8 +314,8 @@ bool validate_dsa_v32_results(const DType* ref, const DType* gpu,
     return all_valid;
 }
 
-bool validate_dsa_v32_lse(const float* ref, const float* gpu, int B, int H,
-                          float rtol = 1e-3f, float atol = 1e-3f) {
+bool validate_mla_decode_splitkv_lse(const float* ref, const float* gpu, int B, int H,
+                                     float rtol = 1e-3f, float atol = 1e-3f) {
     const size_t total = (size_t)B * H;
     constexpr size_t printNum = 10;
 
@@ -352,7 +352,7 @@ bool validate_dsa_v32_lse(const float* ref, const float* gpu, int B, int H,
 }
 
 template<class PATraits>
-inline void dequant_dsa_row_fp8(const typename PATraits::D_NOPE* nrow,
+inline void dequant_mla_row_fp8(const typename PATraits::D_NOPE* nrow,
                                 const uint8_t* srow,
                                 const typename PATraits::D_ROPE* rrow, float* out) {
     constexpr int NOPE = PATraits::D_NOPE_SIZE;
@@ -365,8 +365,8 @@ inline void dequant_dsa_row_fp8(const typename PATraits::D_NOPE* nrow,
 }
 
 template<class PATraits>
-inline void dsa_v32_attention_compute(const float* q_dense, const float* kv_dense, int num_rows,
-                                      typename PATraits::D_OUT* o_row, float* lse_row) {
+inline void mla_decode_splitkv_attention_compute(const float* q_dense, const float* kv_dense, int num_rows,
+                                                 typename PATraits::D_OUT* o_row, float* lse_row) {
     using O_t = typename PATraits::D_OUT;
     constexpr int D_QK = PATraits::D_QK_SIZE;
     constexpr int D_V  = PATraits::D_VO_SIZE;
@@ -393,7 +393,7 @@ inline void dsa_v32_attention_compute(const float* q_dense, const float* kv_dens
 }
 
 template<class PATraits>
-void dsa_v32_attention_ref_fp8(
+void mla_decode_splitkv_attention_ref_fp8(
     const typename PATraits::D_NOPE* Q_nope, const uint8_t* Q_scale, const typename PATraits::D_ROPE* Q_rope,
     const typename PATraits::D_NOPE* KV_nope, const uint8_t* KV_scale, const typename PATraits::D_ROPE* KV_rope,
     typename PATraits::D_OUT* O, float* LSE,
@@ -425,23 +425,23 @@ void dsa_v32_attention_ref_fp8(
 
             std::vector<float> q_dense(D_QK);
             const size_t q_row = (size_t)i * H + h;
-            dequant_dsa_row_fp8<PATraits>(Q_nope + q_row * NOPE, Q_scale + q_row * SCALE, Q_rope + q_row * ROPE, q_dense.data());
+            dequant_mla_row_fp8<PATraits>(Q_nope + q_row * NOPE, Q_scale + q_row * SCALE, Q_rope + q_row * ROPE, q_dense.data());
 
             std::vector<float> kv_dense((size_t)num_rows * D_QK);
             for (int p = 0; p < num_rows; p++) {
                 const int kv_row = kv_indices[kv_begin + p];
-                dequant_dsa_row_fp8<PATraits>(KV_nope + (size_t)kv_row * NOPE, KV_scale + (size_t)kv_row * SCALE,
+                dequant_mla_row_fp8<PATraits>(KV_nope + (size_t)kv_row * NOPE, KV_scale + (size_t)kv_row * SCALE,
                                               KV_rope + (size_t)kv_row * ROPE,
                                               kv_dense.data() + (size_t)p * D_QK);
             }
 
-            dsa_v32_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, o_row, lse_row);
+            mla_decode_splitkv_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, o_row, lse_row);
         }
     }
 }
 
 template<class PATraits>
-void dsa_v32_attention_ref_bf16(
+void mla_decode_splitkv_attention_ref_bf16(
     const typename PATraits::D_ATTN* Q, const typename PATraits::D_ATTN* KV,
     typename PATraits::D_OUT* O, float* LSE,
     const int* kv_indptr, const int* kv_indices,
@@ -476,15 +476,15 @@ void dsa_v32_attention_ref_bf16(
                 for (int d = 0; d < D_QK; d++) kv_dense[(size_t)p * D_QK + d] = static_cast<float>(k_src[d]);
             }
 
-            dsa_v32_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, o_row, lse_row);
+            mla_decode_splitkv_attention_compute<PATraits>(q_dense.data(), kv_dense.data(), num_rows, o_row, lse_row);
         }
     }
 }
 
 template<class PATraits>
-int run_dsa_v32_case_fp8(int H, int B, int total_tokens, bool verify, bool dense_kv) {
+int run_mla_decode_splitkv_case_fp8(int H, int B, int total_tokens, bool verify, bool dense_kv) {
     using OType = typename PATraits::D_OUT;
-    printf("DSA v3.2 Decode Attention: H_Q=%d, B=%d, D_QK=%d, D_V=%d, NoPE=fp8, RoPE=bf16, total_tokens=%d\n",
+    printf("MLA decode split-KV attention: H_Q=%d, B=%d, D_QK=%d, D_V=%d, NoPE=fp8, RoPE=bf16, total_tokens=%d\n",
            H, B, PATraits::D_QK_SIZE, PATraits::D_VO_SIZE, total_tokens);
 
     constexpr int D_HEAD = PATraits::D_VO_SIZE;
@@ -519,36 +519,36 @@ int run_dsa_v32_case_fp8(int H, int B, int total_tokens, bool verify, bool dense
         CHECK_HIP(hipMemcpy(dev_kv_indices, host_kv_indices.data(), host_kv_indices.size() * sizeof(int), hipMemcpyHostToDevice));
 
     const int num_h_blocks = ceil_div(H, PATraits::Q_TILE_SIZE * PATraits::T_M);
-    const int num_parts = std::max(1, DSA_V32_NUM_CU / num_h_blocks);
+    const int num_parts = std::max(1, MLA_DECODE_SPLITKV_NUM_CU / num_h_blocks);
     dim3 grid(num_parts, num_h_blocks, 1);
     dim3 block(PATraits::BLOCK_SIZE);
-    printf("DSA v3.2 split-KV launch config: main grid=(%d,%d,%d) block=%d, num_parts=%d\n",
+    printf("MLA decode split-KV launch config: main grid=(%d,%d,%d) block=%d, num_parts=%d\n",
            grid.x, grid.y, grid.z, block.x, num_parts);
 
     const int total_splits = B + num_parts;
-    DsaSchedMeta* dev_sched_meta; int* dev_num_splits;
+    opus_mla_decode_splitkv_sched_meta* dev_sched_meta; int* dev_num_splits;
     float *dev_o_accum, *dev_lse_accum;
-    CHECK_HIP(hipMalloc(&dev_sched_meta, num_parts * sizeof(DsaSchedMeta)));
+    CHECK_HIP(hipMalloc(&dev_sched_meta, num_parts * sizeof(opus_mla_decode_splitkv_sched_meta)));
     CHECK_HIP(hipMalloc(&dev_num_splits, (B + 1) * sizeof(int)));
     CHECK_HIP(hipMalloc(&dev_o_accum, (size_t)total_splits * H * PATraits::D_VO_SIZE * sizeof(float)));
     CHECK_HIP(hipMalloc(&dev_lse_accum, (size_t)total_splits * H * sizeof(float)));
 
     int rc = 0;
     auto verify_and_bench = [&](const auto& kargs) {
-        dsa_v32_launch_pipeline(PATraits{}, kargs, grid, block, true);
+        mla_decode_splitkv_launch_pipeline(PATraits{}, kargs, grid, block, true);
         CHECK_HIP_KERNEL_LAUNCH();
         if (verify) {
             printf("\nValidating GPU results against CPU reference...\n");
             CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, o_size * sizeof(OType), hipMemcpyDeviceToHost));
             CHECK_HIP(hipMemcpy(host_lse_gpu.get(), dev_lse, lse_size * sizeof(float), hipMemcpyDeviceToHost));
-            bool all_valid = validate_dsa_v32_results<OType>(host_o_ref.get(), host_o_gpu.get(), B, H, D_HEAD);
-            all_valid &= validate_dsa_v32_lse(host_lse_ref.get(), host_lse_gpu.get(), B, H);
+            bool all_valid = validate_mla_decode_splitkv_results<OType>(host_o_ref.get(), host_o_gpu.get(), B, H, D_HEAD);
+            all_valid &= validate_mla_decode_splitkv_lse(host_lse_ref.get(), host_lse_gpu.get(), B, H);
             printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
             if (!all_valid) rc = 1;
         }
         if (!rc) {
             printf("\n");
-            benchmark_dsa_v32_kernel<PATraits>(kargs, grid, block, total_kv_count);
+            benchmark_mla_decode_splitkv_kernel<PATraits>(kargs, grid, block, total_kv_count);
             printf("\n");
         }
     };
@@ -568,8 +568,8 @@ int run_dsa_v32_case_fp8(int H, int B, int total_tokens, bool verify, bool dense
     auto host_kv_nope = std::make_unique<D_NOPE[]>(kv_nope_size);
     auto host_kv_scale = std::make_unique<uint8_t[]>(kv_scale_size);
     auto host_kv_rope = std::make_unique<D_ROPE[]>(kv_rope_size);
-    init_fp8_dsa_split<PATraits>(host_q_nope.get(), host_q_scale.get(), host_q_rope.get(), (size_t)B * H);
-    init_fp8_dsa_split<PATraits>(host_kv_nope.get(), host_kv_scale.get(), host_kv_rope.get(), (size_t)total_tokens);
+    init_fp8_mla_split<PATraits>(host_q_nope.get(), host_q_scale.get(), host_q_rope.get(), (size_t)B * H);
+    init_fp8_mla_split<PATraits>(host_kv_nope.get(), host_kv_scale.get(), host_kv_rope.get(), (size_t)total_tokens);
 
     D_NOPE *dev_q_nope, *dev_kv_nope;
     D_ROPE *dev_q_rope, *dev_kv_rope;
@@ -588,12 +588,12 @@ int run_dsa_v32_case_fp8(int H, int B, int total_tokens, bool verify, bool dense
     CHECK_HIP(hipMemcpy(dev_kv_rope, host_kv_rope.get(), kv_rope_size * sizeof(D_ROPE), hipMemcpyHostToDevice));
 
     if (verify)
-        dsa_v32_attention_ref_fp8<PATraits>(host_q_nope.get(), host_q_scale.get(), host_q_rope.get(),
-                                            host_kv_nope.get(), host_kv_scale.get(), host_kv_rope.get(),
-                                            host_o_ref.get(), host_lse_ref.get(),
-                                            host_kv_indptr.data(), host_kv_indices.data(), B, H);
+        mla_decode_splitkv_attention_ref_fp8<PATraits>(host_q_nope.get(), host_q_scale.get(), host_q_rope.get(),
+                                                       host_kv_nope.get(), host_kv_scale.get(), host_kv_rope.get(),
+                                                       host_o_ref.get(), host_lse_ref.get(),
+                                                       host_kv_indptr.data(), host_kv_indices.data(), B, H);
 
-    dsa_v32_a8w8_kargs kargs{};
+    opus_mla_decode_splitkv_fp8_kargs kargs{};
     kargs.q_nope_ptr = dev_q_nope;
     kargs.q_scale_ptr = dev_q_scale;
     kargs.q_rope_ptr = dev_q_rope;
@@ -645,9 +645,9 @@ int run_dsa_v32_case_fp8(int H, int B, int total_tokens, bool verify, bool dense
 }
 
 template<class PATraits>
-int run_dsa_v32_case_bf16(int H, int B, int total_tokens, bool verify, bool dense_kv) {
+int run_mla_decode_splitkv_case_bf16(int H, int B, int total_tokens, bool verify, bool dense_kv) {
     using OType = typename PATraits::D_OUT;
-    printf("DSA v3.2 Decode Attention: H_Q=%d, B=%d, D_QK=%d, D_V=%d, dtype=bf16, total_tokens=%d\n",
+    printf("MLA decode split-KV attention: H_Q=%d, B=%d, D_QK=%d, D_V=%d, dtype=bf16, total_tokens=%d\n",
            H, B, PATraits::D_QK_SIZE, PATraits::D_VO_SIZE, total_tokens);
 
     constexpr int D_HEAD = PATraits::D_VO_SIZE;
@@ -682,36 +682,36 @@ int run_dsa_v32_case_bf16(int H, int B, int total_tokens, bool verify, bool dens
         CHECK_HIP(hipMemcpy(dev_kv_indices, host_kv_indices.data(), host_kv_indices.size() * sizeof(int), hipMemcpyHostToDevice));
 
     const int num_h_blocks = ceil_div(H, PATraits::Q_TILE_SIZE * PATraits::T_M);
-    const int num_parts = std::max(1, DSA_V32_NUM_CU / num_h_blocks);
+    const int num_parts = std::max(1, MLA_DECODE_SPLITKV_NUM_CU / num_h_blocks);
     dim3 grid(num_parts, num_h_blocks, 1);
     dim3 block(PATraits::BLOCK_SIZE);
-    printf("DSA v3.2 split-KV launch config: main grid=(%d,%d,%d) block=%d, num_parts=%d\n",
+    printf("MLA decode split-KV launch config: main grid=(%d,%d,%d) block=%d, num_parts=%d\n",
            grid.x, grid.y, grid.z, block.x, num_parts);
 
     const int total_splits = B + num_parts;
-    DsaSchedMeta* dev_sched_meta; int* dev_num_splits;
+    opus_mla_decode_splitkv_sched_meta* dev_sched_meta; int* dev_num_splits;
     float *dev_o_accum, *dev_lse_accum;
-    CHECK_HIP(hipMalloc(&dev_sched_meta, num_parts * sizeof(DsaSchedMeta)));
+    CHECK_HIP(hipMalloc(&dev_sched_meta, num_parts * sizeof(opus_mla_decode_splitkv_sched_meta)));
     CHECK_HIP(hipMalloc(&dev_num_splits, (B + 1) * sizeof(int)));
     CHECK_HIP(hipMalloc(&dev_o_accum, (size_t)total_splits * H * PATraits::D_VO_SIZE * sizeof(float)));
     CHECK_HIP(hipMalloc(&dev_lse_accum, (size_t)total_splits * H * sizeof(float)));
 
     int rc = 0;
     auto verify_and_bench = [&](const auto& kargs) {
-        dsa_v32_launch_pipeline(PATraits{}, kargs, grid, block, true);
+        mla_decode_splitkv_launch_pipeline(PATraits{}, kargs, grid, block, true);
         CHECK_HIP_KERNEL_LAUNCH();
         if (verify) {
             printf("\nValidating GPU results against CPU reference...\n");
             CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, o_size * sizeof(OType), hipMemcpyDeviceToHost));
             CHECK_HIP(hipMemcpy(host_lse_gpu.get(), dev_lse, lse_size * sizeof(float), hipMemcpyDeviceToHost));
-            bool all_valid = validate_dsa_v32_results<OType>(host_o_ref.get(), host_o_gpu.get(), B, H, D_HEAD);
-            all_valid &= validate_dsa_v32_lse(host_lse_ref.get(), host_lse_gpu.get(), B, H);
+            bool all_valid = validate_mla_decode_splitkv_results<OType>(host_o_ref.get(), host_o_gpu.get(), B, H, D_HEAD);
+            all_valid &= validate_mla_decode_splitkv_lse(host_lse_ref.get(), host_lse_gpu.get(), B, H);
             printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
             if (!all_valid) rc = 1;
         }
         if (!rc) {
             printf("\n");
-            benchmark_dsa_v32_kernel<PATraits>(kargs, grid, block, total_kv_count);
+            benchmark_mla_decode_splitkv_kernel<PATraits>(kargs, grid, block, total_kv_count);
             printf("\n");
         }
     };
@@ -732,11 +732,11 @@ int run_dsa_v32_case_bf16(int H, int B, int total_tokens, bool verify, bool dens
     CHECK_HIP(hipMemcpy(dev_kv, host_kv.get(), kv_size * sizeof(D_ATTN), hipMemcpyHostToDevice));
 
     if (verify)
-        dsa_v32_attention_ref_bf16<PATraits>(host_q.get(), host_kv.get(),
-                                             host_o_ref.get(), host_lse_ref.get(),
-                                             host_kv_indptr.data(), host_kv_indices.data(), B, H);
+        mla_decode_splitkv_attention_ref_bf16<PATraits>(host_q.get(), host_kv.get(),
+                                                        host_o_ref.get(), host_lse_ref.get(),
+                                                        host_kv_indptr.data(), host_kv_indices.data(), B, H);
 
-    dsa_v32_a16w16_kargs kargs{};
+    opus_mla_decode_splitkv_kargs kargs{};
     kargs.q_ptr = dev_q;
     kargs.kv_ptr = dev_kv;
     kargs.out_ptr = dev_o;
@@ -826,12 +826,18 @@ int main(int argc, char** argv) {
     }
 
     if (std::strcmp(dtype, "fp8") == 0)
-        return run_dsa_v32_case_fp8<dsa_v32_decode_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(H, B, total_tokens, verify, dense_kv);
+        return run_mla_decode_splitkv_case_fp8<
+            opus_mla_decode_splitkv_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(
+            H, B, total_tokens, verify, dense_kv);
 
     if (std::strcmp(dtype, "bf16") == 0) {
         if (H <= 32)
-            return run_dsa_v32_case_bf16<dsa_v32_decode_a16w16_32mx1_16nx4_traits<32, 64, 4, bf16_t, bf16_t>>(H, B, total_tokens, verify, dense_kv);
-        return run_dsa_v32_case_bf16<dsa_v32_decode_a16w16_16mx4_64nx1_traits<16, 64, 4, bf16_t, bf16_t>>(H, B, total_tokens, verify, dense_kv);
+            return run_mla_decode_splitkv_case_bf16<
+                opus_mla_decode_splitkv_a16w16_32mx1_16nx4_traits<32, 64, 4, bf16_t, bf16_t>>(
+                H, B, total_tokens, verify, dense_kv);
+        return run_mla_decode_splitkv_case_bf16<
+            opus_mla_decode_splitkv_a16w16_16mx4_64nx1_traits<16, 64, 4, bf16_t, bf16_t>>(
+            H, B, total_tokens, verify, dense_kv);
     }
 
     std::cerr << "unknown -dtype '" << dtype << "'; available: fp8, bf16\n";
