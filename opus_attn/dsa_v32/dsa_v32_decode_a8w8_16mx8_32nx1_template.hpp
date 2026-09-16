@@ -2,6 +2,7 @@
 
 #include <opus/opus.hpp>
 #include "defs.h"
+#include "dsa_v32_global_load.hpp"
 #include <bit>
 #include <cstdint>
 
@@ -519,10 +520,10 @@ __device__ void dsa_v32_decode_le2_tiles(dsa_v32_a8w8_kargs kargs,
     asm volatile("" : "+v"(lane_id));
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    auto g_k_nope     = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.kv_nope_ptr), kargs.total_tokens * kargs.stride_kv_nope_page * sizeof(D_NOPE));
-    auto g_k_rope     = make_gmem(reinterpret_cast<const D_ROPE*>(kargs.kv_rope_ptr), kargs.total_tokens * kargs.stride_kv_rope_page * sizeof(D_ROPE));
+    const auto* p_k_nope  = reinterpret_cast<const D_NOPE*>(kargs.kv_nope_ptr);
+    const auto* p_k_rope  = reinterpret_cast<const D_ROPE*>(kargs.kv_rope_ptr);
+    const auto* p_kv_scale = reinterpret_cast<const D_NOPE*>(kargs.kv_scale_ptr);
     auto g_kv_indices = make_gmem(kargs.kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
-    auto g_kv_scale   = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.kv_scale_ptr), kargs.total_tokens * kargs.stride_kv_scale_page * sizeof(D_NOPE));
 
     auto s_k_nope = make_smem(reinterpret_cast<D_NOPE*>(smem_kv));
     auto s_k_rope = make_smem(reinterpret_cast<D_ROPE*>(smem_kv + T::smem_k_nope_bytes));
@@ -583,8 +584,9 @@ __device__ void dsa_v32_decode_le2_tiles(dsa_v32_a8w8_kargs kargs,
     };
 
     auto load_kv_page = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
-    auto kv_nope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_nope_page; };
-    auto kv_rope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_rope_page; };
+    auto kv_nope_ptr  = [&](int t) { return p_k_nope  + static_cast<int64_t>(t) * kargs.stride_kv_nope_page; };
+    auto kv_rope_ptr  = [&](int t) { return p_k_rope  + static_cast<int64_t>(t) * kargs.stride_kv_rope_page; };
+    auto kv_scale_ptr = [&](int t) { return p_kv_scale + static_cast<int64_t>(t) * kargs.stride_kv_scale_page; };
 
     auto compute_qk_nope = [&](auto& s, auto& q, auto& k, auto& scale_q, auto& v_k_mxscl) {
         clear(s);
@@ -636,11 +638,11 @@ __device__ void dsa_v32_decode_le2_tiles(dsa_v32_a8w8_kargs kargs,
 
     for (int tile_idx = tile_begin; tile_idx < tile_end; ++tile_idx) {
         const int kv_page = load_kv_page(tile_idx);
-        async_load<T::VEC_KV_NOPE>(g_k_nope, s_k_nope.ptr, u_gk_nope + kv_nope_offset(kv_page), u_sk_nope);
+        global_load<T::VEC_KV_NOPE>(kv_nope_ptr(kv_page), s_k_nope.ptr, u_gk_nope, u_sk_nope);
         if (warp_id < 4) {
-            async_load<T::VEC_KV_ROPE>(g_k_rope, s_k_rope.ptr, u_gk_rope + kv_rope_offset(kv_page), u_sk_rope);
+            global_load<T::VEC_KV_ROPE>(kv_rope_ptr(kv_page), s_k_rope.ptr, u_gk_rope, u_sk_rope);
         } else {
-            async_load<4>(g_kv_scale, s_k_mxscl.ptr, u_gk_mxscl + kv_page * kargs.stride_kv_scale_page, u_sk_mxscl);
+            global_load<4>(kv_scale_ptr(kv_page), s_k_mxscl.ptr, u_gk_mxscl, u_sk_mxscl);
         }
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
@@ -711,10 +713,10 @@ __device__ void dsa_v32_decode_pipelined(dsa_v32_a8w8_kargs kargs,
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     const int stagger = warp_id / 4;
 
-    auto g_k_nope     = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.kv_nope_ptr), kargs.total_tokens * kargs.stride_kv_nope_page * sizeof(D_NOPE));
-    auto g_k_rope     = make_gmem(reinterpret_cast<const D_ROPE*>(kargs.kv_rope_ptr), kargs.total_tokens * kargs.stride_kv_rope_page * sizeof(D_ROPE));
+    const auto* p_k_nope  = reinterpret_cast<const D_NOPE*>(kargs.kv_nope_ptr);
+    const auto* p_k_rope  = reinterpret_cast<const D_ROPE*>(kargs.kv_rope_ptr);
+    const auto* p_kv_scale = reinterpret_cast<const D_NOPE*>(kargs.kv_scale_ptr);
     auto g_kv_indices = make_gmem(kargs.kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
-    auto g_kv_scale   = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.kv_scale_ptr), kargs.total_tokens * kargs.stride_kv_scale_page * sizeof(D_NOPE));
 
     auto s_k_nope  = make_smem(reinterpret_cast<D_NOPE*>(smem_kv));
     auto s_k_rope  = make_smem(reinterpret_cast<D_ROPE*>(smem_kv + T::smem_k_nope_bytes));
@@ -792,17 +794,17 @@ __device__ void dsa_v32_decode_pipelined(dsa_v32_a8w8_kargs kargs,
 
     int kv_page[4];
     auto load_kv_page = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
-    auto kv_nope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_nope_page; };
-    auto kv_rope_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_rope_page; };
-    auto kv_scale_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_scale_page; };
+    auto kv_nope_ptr  = [&](int t) { return p_k_nope  + static_cast<int64_t>(t) * kargs.stride_kv_nope_page; };
+    auto kv_rope_ptr  = [&](int t) { return p_k_rope  + static_cast<int64_t>(t) * kargs.stride_kv_rope_page; };
+    auto kv_scale_ptr = [&](int t) { return p_kv_scale + static_cast<int64_t>(t) * kargs.stride_kv_scale_page; };
 
     auto async_load_kv = [&](auto slot_n, int token_idx) {
         constexpr int sl = decltype(slot_n)::value;
-        async_load<T::VEC_KV_NOPE>(g_k_nope, s_k_nope.ptr, u_gk_nope + kv_nope_offset(token_idx), u_sk_nope + number<sl * (T::smem_kv_bytes() / sizeof(D_NOPE))>{});
+        global_load<T::VEC_KV_NOPE>(kv_nope_ptr(token_idx), s_k_nope.ptr, u_gk_nope, u_sk_nope + number<sl * (T::smem_kv_bytes() / sizeof(D_NOPE))>{});
         if (warp_id < 4) {
-            async_load<T::VEC_KV_ROPE>(g_k_rope, s_k_rope.ptr, u_gk_rope + kv_rope_offset(token_idx), u_sk_rope + number<sl * (T::smem_kv_bytes() / sizeof(D_ROPE))>{});
+            global_load<T::VEC_KV_ROPE>(kv_rope_ptr(token_idx), s_k_rope.ptr, u_gk_rope, u_sk_rope + number<sl * (T::smem_kv_bytes() / sizeof(D_ROPE))>{});
         } else {
-            async_load<4>(g_kv_scale, s_k_mxscl.ptr, u_gk_mxscl + kv_scale_offset(token_idx), u_sk_mxscl + number<sl * (T::smem_mxscl_bytes / sizeof(D_NOPE))>{});
+            global_load<4>(kv_scale_ptr(token_idx), s_k_mxscl.ptr, u_gk_mxscl, u_sk_mxscl + number<sl * (T::smem_mxscl_bytes / sizeof(D_NOPE))>{});
         }
     };
 
@@ -1372,9 +1374,9 @@ __device__ void dsa_v32_decode_one_req(dsa_v32_a8w8_kargs kargs, int batch_idx, 
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE;
-    const int q_nope_gmem_offset  = batch_idx * kargs.stride_q_nope_b  + h_block_start * kargs.stride_q_nope_h;
-    const int q_rope_gmem_offset  = batch_idx * kargs.stride_q_rope_b  + h_block_start * kargs.stride_q_rope_h;
-    const int q_scale_gmem_offset = batch_idx * kargs.stride_q_scale_b + h_block_start * kargs.stride_q_scale_h;
+    const int64_t q_nope_gmem_offset  = static_cast<int64_t>(batch_idx) * kargs.stride_q_nope_b  + static_cast<int64_t>(h_block_start) * kargs.stride_q_nope_h;
+    const int64_t q_rope_gmem_offset  = static_cast<int64_t>(batch_idx) * kargs.stride_q_rope_b  + static_cast<int64_t>(h_block_start) * kargs.stride_q_rope_h;
+    const int64_t q_scale_gmem_offset = static_cast<int64_t>(batch_idx) * kargs.stride_q_scale_b + static_cast<int64_t>(h_block_start) * kargs.stride_q_scale_h;
 
     auto g_q_nope = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.q_nope_ptr) + q_nope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_nope_h * sizeof(D_NOPE));
     auto g_q_rope = make_gmem(reinterpret_cast<const D_ROPE*>(kargs.q_rope_ptr) + q_rope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_rope_h * sizeof(D_ROPE));
@@ -1419,14 +1421,14 @@ __device__ void dsa_v32_decode_one_req(dsa_v32_a8w8_kargs kargs, int batch_idx, 
     int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     if (slot < 0) {
-        const int o_gmem_offset = batch_idx * kargs.stride_o_b + h_block_start * kargs.stride_o_h;
+        const int64_t o_gmem_offset = static_cast<int64_t>(batch_idx) * kargs.stride_o_b + static_cast<int64_t>(h_block_start) * kargs.stride_o_h;
         auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
         auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
         auto v_o_out = cast<D_OUT>(v_o);
         store<T::VEC_O>(g_o, v_o_out, u_o);
 
         if (lane_id_o < T::W_M) {
-            const int lse_offset = batch_idx * kargs.stride_lse_b + h_block_start;
+            const int64_t lse_offset = static_cast<int64_t>(batch_idx) * kargs.stride_lse_b + h_block_start;
             auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_ptr) + lse_offset,
                                    (kargs.H - h_block_start) * sizeof(D_ACC));
             const D_ACC lse = (l_row > D_ACC(0.0f)) ? (m_row + log2f(l_row)) * D_ACC(DSA_V32_LN_2)
@@ -1435,13 +1437,13 @@ __device__ void dsa_v32_decode_one_req(dsa_v32_a8w8_kargs kargs, int batch_idx, 
         }
     }
     if (slot >= 0) {
-        const int oa_offset = slot * kargs.H * T::D_NOPE_SIZE + h_block_start * T::D_NOPE_SIZE;
+        const int64_t oa_offset = (static_cast<int64_t>(slot) * kargs.H + h_block_start) * T::D_NOPE_SIZE;
         auto g_oa = make_gmem(reinterpret_cast<D_ACC*>(kargs.o_accum) + oa_offset, (kargs.H - h_block_start) * T::D_NOPE_SIZE * sizeof(D_ACC));
         auto u_oa = make_layout_o<T>(warp_id_o, lane_id_o, T::D_NOPE_SIZE);
         store<T::VEC_O>(g_oa, v_o, u_oa);
 
         if (lane_id_o < T::W_M) {
-            const int lse_offset = slot * kargs.H + h_block_start;
+            const int64_t lse_offset = static_cast<int64_t>(slot) * kargs.H + h_block_start;
             auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_accum) + lse_offset,
                                    (kargs.H - h_block_start) * sizeof(D_ACC));
             const D_ACC lse = (l_row > D_ACC(0.0f)) ? (m_row + log2f(l_row))

@@ -2,6 +2,7 @@
 
 #include <opus/opus.hpp>
 #include "defs.h"
+#include "dsa_v32_global_load.hpp"
 #include <bit>
 
 using opus::operator""_I;
@@ -295,22 +296,34 @@ __device__ inline auto kv_lds_bases(char* smem_kv, const US& u_skv) {
     return bases;
 }
 
-template<class T, int SLOT, int IDX, class G, class LB, class UG, class US, class VP>
-__device__ inline void async_load_kv_inst(G& g_kv, const LB& lds_bases, const UG& u_gkv, const US& u_skv,
-                                          const VP& kv_pages, int stride_kv_page) {
-    constexpr int ig = IDX / T::smem_d_rpt;
-    constexpr int id = IDX % T::smem_d_rpt;
-    auto g_off = opus::layout_to_offsets<T::VEC_KV>(u_gkv + kv_pages[ig] * stride_kv_page);
-    auto s_off = opus::layout_to_offsets<T::VEC_KV>(
-        u_skv + opus::number<kv_slot_off<T, SLOT> + kv_sub_tile_off<T, ig>>{});
-    opus::async_load<T::VEC_KV>(g_kv, reinterpret_cast<void*>(lds_bases[ig] + (s_off[id] - s_off[0])), g_off[id]);
+template<class T, class UG, class VP>
+__device__ inline auto kv_gmem_bases(const typename T::D_ATTN* p_kv, const UG& u_gkv,
+                                     const VP& kv_pages, int stride_kv_page) {
+    opus::array<const typename T::D_ATTN*, T::smem_n_sub_tile_rpt> bases;
+    auto g_off = opus::layout_to_offsets<T::VEC_KV>(u_gkv);
+    opus::static_for<T::smem_n_sub_tile_rpt>([&](auto ig) {
+        bases[ig.value] = p_kv + static_cast<int64_t>(kv_pages[ig.value]) * stride_kv_page + g_off[0];
+    });
+    return bases;
 }
 
-template<class T, int SLOT, class G, class LB, class UG, class US, class VP>
-__device__ inline void async_load_kv_tile(G& g_kv, const LB& lds_bases, const UG& u_gkv, const US& u_skv,
-                                          const VP& kv_pages, int stride_kv_page) {
+template<class T, int SLOT, int IDX, class GB, class LB, class US>
+__device__ inline void async_load_kv_inst(const GB& gmem_bases, const LB& lds_bases, const US& u_skv) {
+    constexpr int ig = IDX / T::smem_d_rpt;
+    constexpr int id = IDX % T::smem_d_rpt;
+    constexpr int ELEM = (int)sizeof(typename T::D_ATTN);
+    constexpr auto s_imm = opus::layout_imm_offsets_v<
+        opus::remove_cvref_t<decltype(u_skv + opus::number<kv_slot_off<T, SLOT> + kv_sub_tile_off<T, ig>>{})>,
+        T::VEC_KV>;
+    constexpr int g_imm  = id * T::D_128B_SIZE * ELEM;
+    constexpr int m0_imm = (s_imm[id] - s_imm[0]) * ELEM - g_imm;
+    global_load_lds<T::VEC_KV, m0_imm, g_imm>(gmem_bases[ig], lds_bases[ig]);
+}
+
+template<class T, int SLOT, class GB, class LB, class US>
+__device__ inline void async_load_kv_tile(const GB& gmem_bases, const LB& lds_bases, const US& u_skv) {
     opus::static_for<T::kv_async_load_insts>([&](auto i) {
-        async_load_kv_inst<T, SLOT, i.value>(g_kv, lds_bases, u_gkv, u_skv, kv_pages, stride_kv_page);
+        async_load_kv_inst<T, SLOT, i.value>(gmem_bases, lds_bases, u_skv);
     });
 }
 
@@ -730,8 +743,7 @@ __device__ void attention_tiles(const dsa_v32_a16w16_kargs& kargs,
     asm volatile("" : "+v"(lane_id));
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    auto g_kv = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.kv_ptr),
-                          kargs.total_tokens * kargs.stride_kv_page * sizeof(D_ATTN));
+    const auto* p_kv = reinterpret_cast<const D_ATTN*>(kargs.kv_ptr);
     auto g_kv_indices = make_gmem(kargs.kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
 
     auto u_kv_indices = make_layout_kv_indices<T>(warp_id, lane_id);
@@ -754,10 +766,10 @@ __device__ void attention_tiles(const dsa_v32_a16w16_kargs& kargs,
         constexpr int CUR = decltype(cur)::value;
         constexpr int NXT = 1 - CUR;
 
-        auto lds_bases = kv_lds_bases<T, NXT>(smem_kv, u_skv);
+        auto lds_bases  = kv_lds_bases<T, NXT>(smem_kv, u_skv);
+        auto gmem_bases = kv_gmem_bases<T>(p_kv, u_gkv, kv_pages, kargs.stride_kv_page);
         auto issue_kv_load = [&](auto idx) {
-            async_load_kv_inst<T, NXT, decltype(idx)::value>(
-                g_kv, lds_bases, u_gkv, u_skv, kv_pages, kargs.stride_kv_page);
+            async_load_kv_inst<T, NXT, decltype(idx)::value>(gmem_bases, lds_bases, u_skv);
         };
 
         clear(v_s);
@@ -776,8 +788,8 @@ __device__ void attention_tiles(const dsa_v32_a16w16_kargs& kargs,
     __builtin_amdgcn_s_barrier();
     kv_pages = load_pages(tile_begin);
     s_waitcnt_vmcnt(0_I);
-    async_load_kv_tile<T, 0>(g_kv, kv_lds_bases<T, 0>(smem_kv, u_skv), u_gkv, u_skv,
-                             kv_pages, kargs.stride_kv_page);
+    async_load_kv_tile<T, 0>(kv_gmem_bases<T>(p_kv, u_gkv, kv_pages, kargs.stride_kv_page),
+                             kv_lds_bases<T, 0>(smem_kv, u_skv), u_skv);
     kv_pages = load_pages(tile_begin + 1);
     s_waitcnt_vmcnt(0_I);
     __builtin_amdgcn_s_barrier();
@@ -812,10 +824,11 @@ __device__ void decode_one_req(const dsa_v32_a16w16_kargs& kargs, int batch_idx,
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE;
-    const int q_gmem_offset = batch_idx * kargs.stride_q_b + h_block_start * kargs.stride_q_h;
+    const int64_t q_gmem_offset = static_cast<int64_t>(batch_idx) * kargs.stride_q_b
+                                + static_cast<int64_t>(h_block_start) * kargs.stride_q_h;
 
     auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.q_ptr) + q_gmem_offset,
-                         (kargs.H - h_block_start) * kargs.stride_q_h * sizeof(D_ATTN));
+                         (size_t)(kargs.H - h_block_start) * kargs.stride_q_h * sizeof(D_ATTN));
     auto u_gq  = make_layout_gq<T>(lane_id, kargs.stride_q_h);
     auto u_skv = make_layout_skv<T>(warp_id);
     auto u_rq  = make_layout_rq<T>(lane_id);
@@ -843,31 +856,32 @@ __device__ void decode_one_req(const dsa_v32_a16w16_kargs& kargs, int batch_idx,
     const int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     if (slot < 0) {
-        const int o_gmem_offset = batch_idx * kargs.stride_o_b + h_block_start * kargs.stride_o_h;
+        const int64_t o_gmem_offset = static_cast<int64_t>(batch_idx) * kargs.stride_o_b
+                                    + static_cast<int64_t>(h_block_start) * kargs.stride_o_h;
         auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset,
-                             (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
+                             (size_t)(kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
         auto u_o = make_layout_o_packed<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
         store_o_packed<T>(g_o, v_o, u_o);
 
         if (lane_id_o < T::W_M) {
-            const int lse_offset = batch_idx * kargs.stride_lse_b + h_block_start;
+            const int64_t lse_offset = static_cast<int64_t>(batch_idx) * kargs.stride_lse_b + h_block_start;
             auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_ptr) + lse_offset,
-                                   (kargs.H - h_block_start) * sizeof(D_ACC));
+                                   (size_t)(kargs.H - h_block_start) * sizeof(D_ACC));
             const D_ACC lse = (l_row > D_ACC(0.0f)) ? (m_row + log2f(l_row)) * D_ACC(DSA_V32_LN_2)
                                                     : numeric_limits<D_ACC>::infinity();
             g_lse.store(lse, warp_id_o * T::Q_TILE_SIZE + lane_id_o);
         }
     } else {
-        const int oa_offset = (slot * kargs.H + h_block_start) * T::D_VO_SIZE;
+        const int64_t oa_offset = (static_cast<int64_t>(slot) * kargs.H + h_block_start) * T::D_VO_SIZE;
         auto g_oa = make_gmem(reinterpret_cast<D_ACC*>(kargs.o_accum) + oa_offset,
-                              (kargs.H - h_block_start) * T::D_VO_SIZE * sizeof(D_ACC));
+                              (size_t)(kargs.H - h_block_start) * T::D_VO_SIZE * sizeof(D_ACC));
         auto u_oa = make_layout_o<T>(warp_id_o, lane_id_o, T::D_VO_SIZE);
         store<T::VEC_O>(g_oa, v_o, u_oa);
 
         if (lane_id_o < T::W_M) {
-            const int lse_offset = slot * kargs.H + h_block_start;
+            const int64_t lse_offset = static_cast<int64_t>(slot) * kargs.H + h_block_start;
             auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_accum) + lse_offset,
-                                   (kargs.H - h_block_start) * sizeof(D_ACC));
+                                   (size_t)(kargs.H - h_block_start) * sizeof(D_ACC));
             const D_ACC lse = (l_row > D_ACC(0.0f)) ? (m_row + log2f(l_row))
                                                     : numeric_limits<D_ACC>::lowest();
             g_lse.store(lse, warp_id_o * T::Q_TILE_SIZE + lane_id_o);
