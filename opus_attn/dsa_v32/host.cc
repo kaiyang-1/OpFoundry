@@ -828,8 +828,11 @@ int main(int argc, char** argv) {
     if (std::strcmp(dtype, "fp8") == 0)
         return run_dsa_v32_case_fp8<dsa_v32_decode_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(H, B, total_tokens, verify, dense_kv);
 
-    if (std::strcmp(dtype, "bf16") == 0)
+    if (std::strcmp(dtype, "bf16") == 0) {
+        if (H <= 32)
+            return run_dsa_v32_case_bf16<dsa_v32_decode_a16w16_32mx1_16nx4_traits<32, 64, 4, bf16_t, bf16_t>>(H, B, total_tokens, verify, dense_kv);
         return run_dsa_v32_case_bf16<dsa_v32_decode_a16w16_16mx4_64nx1_traits<16, 64, 4, bf16_t, bf16_t>>(H, B, total_tokens, verify, dense_kv);
+    }
 
     std::cerr << "unknown -dtype '" << dtype << "'; available: fp8, bf16\n";
     return 1;

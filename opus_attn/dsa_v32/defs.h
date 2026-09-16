@@ -272,12 +272,38 @@ struct dsa_v32_decode_a16w16_32mx1_16nx4_traits {
     static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
 
     static constexpr int VEC_Q = 8;
+    static constexpr int VEC_KV = 8;
+    static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O = 4;
 
+    static constexpr int dwordx4_size = 16;
+    static constexpr int D_128B_SIZE = 128 / sizeof(D_ATTN);
+    static constexpr int smem_linear_wave = WARP_SIZE * dwordx4_size / sizeof(D_ATTN);
+    static constexpr int smem_n_per_wave = smem_linear_wave / D_128B_SIZE;
+    static constexpr int smem_n_rpt = KV_TILE_SIZE / smem_n_per_wave;
+    static constexpr int smem_d_rpt = D_QK_SIZE / D_128B_SIZE;
+    static constexpr int smem_d_rpt_v = D_VO_SIZE / D_128B_SIZE;
+    static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
+    static constexpr int smem_brick = smem_linear_wave + smem_padding_32B;
+
+    static constexpr int smem_n_sub_tile = smem_n_per_wave * NUM_WARPS;
+    static constexpr int smem_n_sub_tile_rpt = KV_TILE_SIZE / smem_n_sub_tile;
+    static constexpr int kv_async_load_insts = smem_n_sub_tile_rpt * smem_d_rpt;
+
+    static constexpr size_t smem_kv_bytes = (size_t)smem_n_rpt * smem_d_rpt * smem_brick * sizeof(D_ATTN);
+
+    static constexpr int NUM_KV_BUFS = 2;
+    static constexpr int smem_slot_elems = (int)(smem_kv_bytes / sizeof(D_ATTN));
+
+    static constexpr int ML_ELEMS = GEMM0_E_M;
     static constexpr int ML_SLOT_ELEMS = GEMM0_E_M * W_M * T_N;
-    static constexpr size_t smem_ml_bytes = 2 * ML_SLOT_ELEMS * sizeof(D_ACC);
-    static constexpr size_t smem_kv_bytes = (size_t)KV_TILE_SIZE * D_QK_SIZE * sizeof(D_ATTN);
-    static constexpr size_t smem_bytes() { return smem_kv_bytes + smem_ml_bytes; }
+    static constexpr int P_SLOT_ELEMS = Q_TILE_SIZE * KV_TILE_SIZE;
+    static constexpr size_t smem_ml_bytes = 2 * (size_t)ML_SLOT_ELEMS * sizeof(D_ACC);
+    static constexpr size_t smem_p_bytes  = 2 * (size_t)P_SLOT_ELEMS * sizeof(D_ATTN);
+
+    static constexpr size_t smem_bytes() {
+        return NUM_KV_BUFS * smem_kv_bytes + smem_ml_bytes + smem_p_bytes;
+    }
 };
 
 __host__ __device__ inline int ceil_div(int a, int b) {

@@ -9,9 +9,11 @@ using opus::operator""_I;
 namespace dsa_v32_decode_a16w16_16mx4_64nx1 {
 // ------------------------------------------------------------- instruction scheduling masks
 
-constexpr int MFMA_MASK    = 0x008;
-constexpr int VMEM_MASK    = 0x010;
-constexpr int DS_READ_MASK = 0x100;
+constexpr int VALU_MASK       = 0x002;
+constexpr int MFMA_MASK       = 0x008;
+constexpr int DS_READ_MASK    = 0x100;
+constexpr int VMEM_MASK       = 0x010;
+constexpr int VMEM_WRITE_MASK = 0x040;
 
 // ------------------------------------------------------- register budget and operand shapes
 
@@ -52,26 +54,66 @@ template<class T, int I> constexpr int kv_sub_tile_off = I * T::NUM_WARPS * T::s
 template<class T, int J> constexpr int kv_d_brick_off  = J * T::NUM_WARPS * T::smem_brick;
 template<class T, int SLOT> constexpr int kv_slot_off  = SLOT * T::smem_slot_elems;
 
+template<class T> constexpr int VEC_O2 = 2 * T::VEC_O;
+template<class T> constexpr int Q_HEADS         = T::Q_TILE_SIZE * T::T_M;
+template<class T> constexpr int Q_SUB_TILE_RPT  = Q_HEADS<T> / T::smem_n_sub_tile;
+template<class T> constexpr int Q_ASYNC_INSTS   = Q_SUB_TILE_RPT<T> * T::smem_d_rpt;
+constexpr int Q_LDS_SLOT = 1;
+
 // ----------------------------------------------------------------------------------- layouts
 
 template<class T>
-__device__ inline auto make_layout_q(int warp_id, int lane_id, int stride_q_h) {
-    constexpr auto q_block_shape = opus::make_tuple(
-        opus::number<T::GEMM0_E_M>{},
-        opus::number<T::T_M>{},
-        opus::number<T::W_M>{},
-        opus::number<T::GEMM0_E_K>{},
-        opus::number<T::WARP_SIZE / T::W_M>{},
+__device__ inline auto make_layout_gq(int lane_id, int stride_q_h) {
+    constexpr int threads_d = T::D_128B_SIZE / T::VEC_Q;
+
+    constexpr auto gq_shape = opus::make_tuple(
+        opus::number<T::smem_n_per_wave>{},
+        opus::number<T::smem_d_rpt>{},
+        opus::number<threads_d>{},
         opus::number<T::VEC_Q>{});
 
-    constexpr auto q_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
+    constexpr auto gq_dim = opus::make_tuple(
+        opus::make_tuple(opus::p_dim{}),
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
 
     return opus::make_layout(
-        q_block_shape,
-        opus::unfold_x_stride(q_block_dim, q_block_shape, opus::tuple{stride_q_h, 1_I}),
-        opus::unfold_p_coord(q_block_dim, opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
+        gq_shape,
+        opus::unfold_x_stride(gq_dim, gq_shape, opus::tuple{stride_q_h, 1_I}),
+        opus::unfold_p_coord(gq_dim, opus::tuple{lane_id / threads_d, lane_id % threads_d}));
+}
+
+template<class T>
+__device__ inline auto make_layout_rq(int lane_id) {
+    constexpr int heads_per_brick = T::smem_n_per_wave;
+    constexpr int bricks_per_m    = T::W_M / heads_per_brick;
+    constexpr int lane_groups     = T::WARP_SIZE / T::W_M;
+    constexpr int ek_lo           = T::D_128B_SIZE / (lane_groups * T::VEC_Q);
+
+    constexpr auto rq_shape = opus::make_tuple(
+        opus::number<T::GEMM0_E_M>{},
+        opus::number<bricks_per_m>{},
+        opus::number<heads_per_brick>{},
+        opus::number<T::smem_d_rpt>{},
+        opus::number<ek_lo>{},
+        opus::number<lane_groups>{},
+        opus::number<T::VEC_Q>{});
+
+    constexpr auto rq_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    const int lane_m = lane_id % T::W_M;
+
+    return opus::make_layout(
+        rq_shape,
+        opus::unfold_x_stride(rq_dim, rq_shape, opus::tuple{opus::number<T::smem_brick>{},
+                                                            opus::number<T::D_128B_SIZE>{},
+                                                            opus::number<T::NUM_WARPS * T::smem_brick>{},
+                                                            1_I}),
+        opus::unfold_p_coord(rq_dim, opus::tuple{lane_m / heads_per_brick, lane_m % heads_per_brick,
+                                                 lane_id / T::W_M}));
 }
 
 template<class T>
@@ -210,19 +252,30 @@ __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h) {
         opus::unfold_p_coord(o_block_dim, opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
 }
 
-// ------------------------------------------------------------------ global / lds transfers
+template<class T>
+__device__ inline auto make_layout_o_packed(int warp_id, int lane_id, int stride_o_h) {
+    constexpr auto o_block_shape = opus::make_tuple(
+        opus::number<T::GEMM1_E_M>{},
+        opus::number<T::T_M>{},
+        opus::number<T::W_M>{},
+        opus::number<T::D_VO_SIZE / (2 * T::W_N)>{},
+        opus::number<2>{},
+        opus::number<2>{},
+        opus::number<VEC_O2<T>>{});
 
-template<class T, class G, class U>
-__device__ inline auto load_q(G& g_q, const U& u_q) {
-    using namespace opus;
-    auto q_offsets = layout_to_offsets<T::VEC_Q>(u_q);
-    v_q_t<T> v_q;
-    static_for<Q_LOAD_INSTS<T>>([&](auto i) {
-        [[clang::amdgpu_pin_agpr(Q_AGPR_BASE + i.value * Q_AGPR_PER_LOAD<T>)]]
-        v_q[i.value] = load<T::VEC_Q>(g_q, q_offsets[i.value]);
-    });
-    return v_q;
+    constexpr auto o_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    const int lane_g = lane_id / T::W_M;
+
+    return opus::make_layout(
+        o_block_shape,
+        opus::unfold_x_stride(o_block_dim, o_block_shape, opus::tuple{stride_o_h, 1_I}),
+        opus::unfold_p_coord(o_block_dim, opus::tuple{warp_id, lane_id % T::W_M, lane_g % 2, lane_g / 2}));
 }
+
+// ------------------------------------------------------------------ global / lds transfers
 
 template<class T, int SLOT, int IG, class US>
 __device__ inline auto kv_lds_sub_tile_base(char* smem_kv, const US& u_skv) {
@@ -231,6 +284,15 @@ __device__ inline auto kv_lds_sub_tile_base(char* smem_kv, const US& u_skv) {
     auto* base = reinterpret_cast<typename T::D_ATTN*>(smem_kv) + s_off[0];
     asm volatile("" : "+s"(base));
     return base;
+}
+
+template<class T, int SLOT, class US>
+__device__ inline auto kv_lds_bases(char* smem_kv, const US& u_skv) {
+    opus::array<typename T::D_ATTN*, T::smem_n_sub_tile_rpt> bases;
+    opus::static_for<T::smem_n_sub_tile_rpt>([&](auto ig) {
+        bases[ig.value] = kv_lds_sub_tile_base<T, SLOT, ig.value>(smem_kv, u_skv);
+    });
+    return bases;
 }
 
 template<class T, int SLOT, int IDX, class G, class LB, class UG, class US, class VP>
@@ -242,15 +304,6 @@ __device__ inline void async_load_kv_inst(G& g_kv, const LB& lds_bases, const UG
     auto s_off = opus::layout_to_offsets<T::VEC_KV>(
         u_skv + opus::number<kv_slot_off<T, SLOT> + kv_sub_tile_off<T, ig>>{});
     opus::async_load<T::VEC_KV>(g_kv, reinterpret_cast<void*>(lds_bases[ig] + (s_off[id] - s_off[0])), g_off[id]);
-}
-
-template<class T, int SLOT, class US>
-__device__ inline auto kv_lds_bases(char* smem_kv, const US& u_skv) {
-    opus::array<typename T::D_ATTN*, T::smem_n_sub_tile_rpt> bases;
-    opus::static_for<T::smem_n_sub_tile_rpt>([&](auto ig) {
-        bases[ig.value] = kv_lds_sub_tile_base<T, SLOT, ig.value>(smem_kv, u_skv);
-    });
-    return bases;
 }
 
 template<class T, int SLOT, class G, class LB, class UG, class US, class VP>
@@ -270,6 +323,85 @@ __device__ inline auto tr_load_v(SM& s_base, int lane_off) {
         reinterpret_cast<__UINTPTR_TYPE__>(s_base.ptr + lane_off * static_cast<int>(sizeof(D_ATTN))));
     asm volatile("ds_read_b64_tr_b16 %0, %1 offset:%2\n" : "=a"(raw) : "v"(addr), "i"(IMM) : "memory");
     return __builtin_bit_cast(opus::vector_t<D_ATTN, T::VEC_TR_V>, raw);
+}
+
+template<class T>
+__device__ inline int q_lds_warp_off(int warp_id) {
+    const int head_base = (T::T_M > 1) ? warp_id * T::W_M : 0;
+    return (head_base / T::smem_n_sub_tile) * kv_sub_tile_off<T, 1>
+         + ((head_base % T::smem_n_sub_tile) / T::smem_n_per_wave) * T::smem_brick;
+}
+
+template<class T, int IDX, class G, class LB, class UG, class US>
+__device__ inline void async_load_q_inst(G& g_q, const LB& lds_bases, const UG& u_gq, const US& u_skv,
+                                         int warp_id, int stride_q_h) {
+    constexpr int ig = IDX / T::smem_d_rpt;
+    constexpr int id = IDX % T::smem_d_rpt;
+    auto g_off = opus::layout_to_offsets<T::VEC_Q>(u_gq);
+    auto s_off = opus::layout_to_offsets<T::VEC_Q>(
+        u_skv + opus::number<kv_slot_off<T, Q_LDS_SLOT> + kv_sub_tile_off<T, ig>>{});
+    const int head_base = ig * T::smem_n_sub_tile + warp_id * T::smem_n_per_wave;
+    opus::async_load<T::VEC_Q>(g_q, reinterpret_cast<void*>(lds_bases[ig] + (s_off[id] - s_off[0])),
+                               g_off[id], head_base * stride_q_h);
+}
+
+template<class T, class G, class LB, class UG, class US>
+__device__ inline void async_load_q_tile(G& g_q, const LB& lds_bases, const UG& u_gq, const US& u_skv,
+                                         int warp_id, int stride_q_h) {
+    opus::static_for<Q_ASYNC_INSTS<T>>([&](auto i) {
+        async_load_q_inst<T, i.value>(g_q, lds_bases, u_gq, u_skv, warp_id, stride_q_h);
+    });
+}
+
+template<class T, class UQ>
+__device__ inline auto load_q_lds(char* smem_kv, int warp_off, const UQ& u_rq) {
+    using namespace opus;
+    auto s_q = make_smem(reinterpret_cast<typename T::D_ATTN*>(smem_kv)
+                         + kv_slot_off<T, Q_LDS_SLOT> + warp_off);
+    auto q_offsets = layout_to_offsets<T::VEC_Q>(u_rq);
+    v_q_t<T> v_q;
+    static_for<Q_LOAD_INSTS<T>>([&](auto i) {
+        [[clang::amdgpu_pin_agpr(Q_AGPR_BASE + i.value * Q_AGPR_PER_LOAD<T>)]]
+        v_q[i.value] = load<T::VEC_Q>(s_q, q_offsets[i.value]);
+    });
+    s_waitcnt_lgkmcnt(0_I);
+    return v_q;
+}
+
+template<class T, class G, class VO, class UO>
+__device__ inline void store_o_packed(G& g_o, const VO& v_o, const UO& u_o) {
+    using namespace opus;
+    using D_OUT = typename T::D_OUT;
+    constexpr int VEC  = VEC_O2<T>;
+    constexpr int NC   = O_ELEMS<T> / VEC;
+    constexpr int U32C = VEC * (int)sizeof(D_OUT) / (int)sizeof(u32_t);
+
+    auto o_offsets = layout_to_offsets<VEC>(u_o);
+    vector_t<D_OUT, VEC> buf[2];
+
+    auto cvt_chunk = [&](auto c) {
+        buf[decltype(c)::value % 2] = cast<D_OUT>(
+            slice(v_o, number<decltype(c)::value * VEC>{}, number<(decltype(c)::value + 1) * VEC>{}));
+    };
+    auto pack_store_chunk = [&](auto c) {
+        constexpr int s = decltype(c)::value % 2;
+        auto* p = reinterpret_cast<u32_t*>(&buf[s]);
+        auto r0 = __builtin_amdgcn_permlane16_swap(p[0], p[2], false, true);
+        auto r1 = __builtin_amdgcn_permlane16_swap(p[1], p[3], false, true);
+        p[0] = r0[0]; p[2] = r0[1];
+        p[1] = r1[0]; p[3] = r1[1];
+        store<VEC>(g_o, buf[s], o_offsets[decltype(c)::value]);
+    };
+
+    __builtin_amdgcn_sched_barrier(0);
+    cvt_chunk(number<0>{});
+    static_for<NC>([&](auto c) {
+        if constexpr (c.value + 1 < NC) cvt_chunk(number<c.value + 1>{});
+        pack_store_chunk(c);
+        __builtin_amdgcn_sched_group_barrier(VALU_MASK, U32C + 2, 0);
+        __builtin_amdgcn_sched_group_barrier(VMEM_WRITE_MASK, 1, 0);
+    });
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 // -------------------------------------------------------------------------------------- gemm
@@ -684,8 +816,16 @@ __device__ void decode_one_req(const dsa_v32_a16w16_kargs& kargs, int batch_idx,
 
     auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.q_ptr) + q_gmem_offset,
                          (kargs.H - h_block_start) * kargs.stride_q_h * sizeof(D_ATTN));
-    auto u_q = make_layout_q<T>(warp_id, lane_id, kargs.stride_q_h);
-    auto v_q = load_q<T>(g_q, u_q);
+    auto u_gq  = make_layout_gq<T>(lane_id, kargs.stride_q_h);
+    auto u_skv = make_layout_skv<T>(warp_id);
+    auto u_rq  = make_layout_rq<T>(lane_id);
+
+    __builtin_amdgcn_s_barrier();
+    async_load_q_tile<T>(g_q, kv_lds_bases<T, Q_LDS_SLOT>(smem_kv, u_skv), u_gq, u_skv,
+                         warp_id, kargs.stride_q_h);
+    s_waitcnt_vmcnt(0_I);
+    __builtin_amdgcn_s_barrier();
+    auto v_q = load_q_lds<T>(smem_kv, q_lds_warp_off<T>(warp_id), u_rq);
 
     v_o_t<T> v_o;
     clear(v_o);
@@ -706,9 +846,8 @@ __device__ void decode_one_req(const dsa_v32_a16w16_kargs& kargs, int batch_idx,
         const int o_gmem_offset = batch_idx * kargs.stride_o_b + h_block_start * kargs.stride_o_h;
         auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset,
                              (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
-        auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
-        auto v_o_out = cast<D_OUT>(v_o);
-        store<T::VEC_O>(g_o, v_o_out, u_o);
+        auto u_o = make_layout_o_packed<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
+        store_o_packed<T>(g_o, v_o, u_o);
 
         if (lane_id_o < T::W_M) {
             const int lse_offset = batch_idx * kargs.stride_lse_b + h_block_start;
