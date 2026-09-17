@@ -978,7 +978,7 @@ __device__ void attention_tiles(const opus_mla_decode_kargs& kargs,
     s_waitcnt_vmcnt(0_I);
     static_for<DIST>([&](auto i) { stage_tile(i, pages[i.value]); });
     kv_pages = load_pages(tile_begin + DIST);
-    s_waitcnt_vmcnt(number<(DIST - 1) * T::kv_async_load_insts + 1>{});
+    s_waitcnt_vmcnt(0_I);
     __builtin_amdgcn_s_barrier();
 
     // A producer wave stages its share and nothing else. Splitting the roles above the tile loop
