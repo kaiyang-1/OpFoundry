@@ -50,11 +50,11 @@ inline float fp8_e4m3_to_float(fp8_t v) {
     return __builtin_bit_cast(float, sign | ((exp + 120) << 23) | (mant << 20));
 }
 
-static constexpr int MLA_DECODE_SPLITKV_NUM_CU = 256;
-static constexpr int MLA_DECODE_SPLITKV_FIXED_OVERHEAD = 5;
-static constexpr float MLA_DECODE_SPLITKV_LN_2 = 0.69314718055994531f;
+static constexpr int MLA_DECODE_NUM_CU = 256;
+static constexpr int MLA_DECODE_FIXED_OVERHEAD = 5;
+static constexpr float MLA_DECODE_LN_2 = 0.69314718055994531f;
 
-struct alignas(16) opus_mla_decode_splitkv_sched_meta {
+struct alignas(16) opus_mla_decode_sched_meta {
     int begin_req_idx;
     int end_req_idx;
     int begin_tile_idx;
@@ -63,7 +63,7 @@ struct alignas(16) opus_mla_decode_splitkv_sched_meta {
     int _pad[3];
 };
 
-struct opus_mla_decode_splitkv_fp8_kargs {
+struct opus_mla_decode_fp8_kargs {
     const void* __restrict__ q_nope_ptr;
     const void* __restrict__ q_scale_ptr;
     const void* __restrict__ q_rope_ptr;
@@ -75,7 +75,7 @@ struct opus_mla_decode_splitkv_fp8_kargs {
     const int* __restrict__ kv_indptr;
     const int* __restrict__ kv_indices;
 
-    const opus_mla_decode_splitkv_sched_meta* __restrict__ sched_meta;
+    const opus_mla_decode_sched_meta* __restrict__ sched_meta;
     const int* __restrict__ num_splits;
     void* __restrict__ o_accum;
     void* __restrict__ lse_accum;
@@ -99,7 +99,7 @@ struct opus_mla_decode_splitkv_fp8_kargs {
     float softmax_scale;
 };
 
-struct opus_mla_decode_splitkv_kargs {
+struct opus_mla_decode_kargs {
     const void* __restrict__ q_ptr;
     const void* __restrict__ kv_ptr;
     void* __restrict__ out_ptr;
@@ -107,7 +107,7 @@ struct opus_mla_decode_splitkv_kargs {
     const int* __restrict__ kv_indptr;
     const int* __restrict__ kv_indices;
 
-    const opus_mla_decode_splitkv_sched_meta* __restrict__ sched_meta;
+    const opus_mla_decode_sched_meta* __restrict__ sched_meta;
     const int* __restrict__ num_splits;
     void* __restrict__ o_accum;
     void* __restrict__ lse_accum;
@@ -131,7 +131,7 @@ template<int Q_TILE_SIZE_ = 16,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct opus_mla_decode_splitkv_a8w8_16mx8_32nx1_traits {
+struct opus_mla_decode_a8w8_16mx8_32nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
@@ -218,7 +218,7 @@ template<int Q_TILE_SIZE_ = 16,
          int NUM_WARPS_ = 4,
          typename D_ATTN_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct opus_mla_decode_splitkv_a16w16_16mx4_64nx1_traits {
+struct opus_mla_decode_a16w16_16mx4_64nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
@@ -283,7 +283,7 @@ template<int Q_TILE_SIZE_ = 32,
          int NUM_WARPS_ = 4,
          typename D_ATTN_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct opus_mla_decode_splitkv_a16w16_32mx1_16nx4_traits {
+struct opus_mla_decode_a16w16_32mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
@@ -348,6 +348,81 @@ struct opus_mla_decode_splitkv_a16w16_32mx1_16nx4_traits {
         return NUM_KV_BUFS * smem_kv_bytes + smem_ml_bytes + smem_p_bytes;
     }
 };
+
+template<int Q_TILE_SIZE_, int KV_TILE_SIZE_, int NUM_WARPS_, int NUM_COMPUTE_WARPS_,
+         typename D_ATTN_, typename D_OUT_>
+struct opus_mla_decode_a16w16_32mxt_32nx1_traits_base {
+    static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int NUM_WARPS = NUM_WARPS_;
+    static constexpr int NUM_COMPUTE_WARPS = NUM_COMPUTE_WARPS_;
+
+    static constexpr int WARP_SIZE = 64;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+
+    static constexpr int D_QK_SIZE = 576;
+    static constexpr int D_VO_SIZE  = 512;
+
+    using D_ATTN = D_ATTN_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    static constexpr int T_M = NUM_COMPUTE_WARPS;
+    static constexpr int T_N = 1;
+    static constexpr int T_K = 1;
+
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 32;
+
+    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM0_E_N = KV_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM0_E_K = D_QK_SIZE / W_K;
+
+    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM1_E_N = D_VO_SIZE / (W_N * T_N);
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
+
+    static constexpr int VEC_Q = 8;
+    static constexpr int VEC_KV = 8;
+    static constexpr int VEC_TR_V = 4;
+    static constexpr int VEC_O = 4;
+
+    static constexpr int dwordx4_size = 16;
+    static constexpr int D_128B_SIZE = 128 / sizeof(D_ATTN);
+    static constexpr int smem_linear_wave = WARP_SIZE * dwordx4_size / sizeof(D_ATTN);
+    static constexpr int smem_n_per_wave = smem_linear_wave / D_128B_SIZE;
+    static constexpr int smem_n_rpt = KV_TILE_SIZE / smem_n_per_wave;
+    static constexpr int smem_d_rpt = D_QK_SIZE / D_128B_SIZE;
+    static constexpr int smem_d_rpt_v = D_VO_SIZE / D_128B_SIZE;
+    static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
+    static constexpr int smem_brick = smem_linear_wave + smem_padding_32B;
+
+    static constexpr int smem_n_sub_tile = smem_n_per_wave * NUM_WARPS;
+    static constexpr int smem_n_sub_tile_rpt = KV_TILE_SIZE / smem_n_sub_tile;
+    static constexpr int kv_async_load_insts = smem_n_sub_tile_rpt * smem_d_rpt;
+
+    static constexpr size_t smem_kv_bytes = (size_t)smem_n_rpt * smem_d_rpt * smem_brick * sizeof(D_ATTN);
+
+    static constexpr int NUM_KV_BUFS = 4;
+    static constexpr int smem_slot_elems = (int)(smem_kv_bytes / sizeof(D_ATTN));
+
+    static constexpr int ML_ELEMS = GEMM0_E_M;
+
+    static constexpr size_t smem_bytes() { return NUM_KV_BUFS * smem_kv_bytes; }
+};
+
+template<int Q_TILE_SIZE_ = 32, int KV_TILE_SIZE_ = 32, int NUM_WARPS_ = 4,
+         typename D_ATTN_ = bf16_t, typename D_OUT_ = bf16_t>
+struct opus_mla_decode_a16w16_32mx4_32nx1_traits
+    : opus_mla_decode_a16w16_32mxt_32nx1_traits_base<
+          Q_TILE_SIZE_, KV_TILE_SIZE_, NUM_WARPS_, NUM_WARPS_, D_ATTN_, D_OUT_> {};
+
+template<int Q_TILE_SIZE_ = 32, int KV_TILE_SIZE_ = 32, int NUM_WARPS_ = 4,
+         typename D_ATTN_ = bf16_t, typename D_OUT_ = bf16_t>
+struct opus_mla_decode_a16w16_32mx3_32nx1_traits
+    : opus_mla_decode_a16w16_32mxt_32nx1_traits_base<
+          Q_TILE_SIZE_, KV_TILE_SIZE_, NUM_WARPS_, NUM_WARPS_ - 1, D_ATTN_, D_OUT_> {};
 
 __host__ __device__ inline int ceil_div(int a, int b) {
     return (a + b - 1) / b;

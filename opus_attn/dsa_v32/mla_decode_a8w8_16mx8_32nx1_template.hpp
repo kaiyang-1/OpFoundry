@@ -8,7 +8,7 @@
 
 using opus::operator""_I;
 
-namespace opus_mla_decode_splitkv_a8w8_16mx8_32nx1 {
+namespace opus_mla_decode_a8w8_16mx8_32nx1 {
 
 template<class T>
 __device__ inline auto make_layout_q_nope(int warp_id, int lane_id) {
@@ -504,7 +504,7 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
 }
 
 template<class Traits, class VQN, class VQR, class VO>
-__device__ void decode_le2_tiles(opus_mla_decode_splitkv_fp8_kargs kargs,
+__device__ void decode_le2_tiles(opus_mla_decode_fp8_kargs kargs,
                                  int page_idx_begin, int valid_kv_len, int tile_begin, int tile_end,
                                  char* smem_kv, char* smem_kv_scale,
                                  VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
@@ -696,7 +696,7 @@ __device__ void decode_le2_tiles(opus_mla_decode_splitkv_fp8_kargs kargs,
 }
 
 template<class Traits, bool OddTail, class VQN, class VQR, class VO>
-__device__ void decode_pipelined(opus_mla_decode_splitkv_fp8_kargs kargs,
+__device__ void decode_pipelined(opus_mla_decode_fp8_kargs kargs,
                                  int page_idx_begin, int valid_kv_len, int tile_begin, int tile_end,
                                  char* smem_kv, char* smem_kv_scale,
                                  VQN& v_q_nope, VQR& v_q_rope, int scale_q, VO& v_o,
@@ -1358,7 +1358,7 @@ __device__ void decode_pipelined(opus_mla_decode_splitkv_fp8_kargs kargs,
 }
 
 template<class Traits>
-__device__ void decode_one_req(opus_mla_decode_splitkv_fp8_kargs kargs, int batch_idx, int h_block_idx,
+__device__ void decode_one_req(opus_mla_decode_fp8_kargs kargs, int batch_idx, int h_block_idx,
                                int page_idx_begin, int valid_kv_len,
                                int tile_begin, int tile_end, int slot,
                                char* smem_kv, char* smem_kv_scale, float temperature_scale) {
@@ -1431,7 +1431,7 @@ __device__ void decode_one_req(opus_mla_decode_splitkv_fp8_kargs kargs, int batc
             const int64_t lse_offset = static_cast<int64_t>(batch_idx) * kargs.stride_lse_b + h_block_start;
             auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_ptr) + lse_offset,
                                    (kargs.H - h_block_start) * sizeof(D_ACC));
-            const D_ACC lse = (l_row > D_ACC(0.0f)) ? (m_row + log2f(l_row)) * D_ACC(MLA_DECODE_SPLITKV_LN_2)
+            const D_ACC lse = (l_row > D_ACC(0.0f)) ? (m_row + log2f(l_row)) * D_ACC(MLA_DECODE_LN_2)
                                                     : opus::numeric_limits<D_ACC>::infinity();
             g_lse.store(lse, warp_id_o * T::Q_TILE_SIZE + lane_id_o);
         }
@@ -1456,16 +1456,16 @@ __device__ void decode_one_req(opus_mla_decode_splitkv_fp8_kargs kargs, int batc
 }
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_decode_splitkv_a8w8_16mx8_32nx1_kernel(opus_mla_decode_splitkv_fp8_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_decode_a8w8_16mx8_32nx1_kernel(opus_mla_decode_fp8_kargs kargs) {
     using namespace opus;
-    using namespace opus_mla_decode_splitkv_a8w8_16mx8_32nx1;
+    using namespace opus_mla_decode_a8w8_16mx8_32nx1;
     using T = opus::remove_cvref_t<Traits>;
 
     const int part = block_id_x();
     const int h_block_idx = block_id_y();
     if (part >= kargs.num_parts) return;
 
-    const opus_mla_decode_splitkv_sched_meta meta = kargs.sched_meta[part];
+    const opus_mla_decode_sched_meta meta = kargs.sched_meta[part];
     if (meta.begin_req_idx >= kargs.B) return;
 
     __shared__ char smem_kv[4 * T::smem_kv_bytes()];

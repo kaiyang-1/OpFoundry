@@ -22,7 +22,7 @@ __global__ void get_mla_metadata_kernel(KArgs kargs) {
         int nt = ceil_div(len, T::KV_TILE_SIZE);
         if (nt < 1) nt = 1;
         nt_shared[b] = nt;
-        local_total += nt + MLA_DECODE_SPLITKV_FIXED_OVERHEAD;
+        local_total += nt + MLA_DECODE_FIXED_OVERHEAD;
     }
 
     int total = local_total;
@@ -33,15 +33,15 @@ __global__ void get_mla_metadata_kernel(KArgs kargs) {
     __builtin_amdgcn_s_barrier();
 
     if (lane == 0) {
-        int payload = (total + num_parts - 1) / num_parts + MLA_DECODE_SPLITKV_FIXED_OVERHEAD;
+        int payload = (total + num_parts - 1) / num_parts + MLA_DECODE_FIXED_OVERHEAD;
         if (payload < 1) payload = 1;
 
-        opus_mla_decode_splitkv_sched_meta* meta = const_cast<opus_mla_decode_splitkv_sched_meta*>(kargs.sched_meta);
+        opus_mla_decode_sched_meta* meta = const_cast<opus_mla_decode_sched_meta*>(kargs.sched_meta);
         nsplit_shared[0] = 0;
 
         int req = 0, tile = 0, split_idx = 0, cum_splits = 0;
         for (int p = 0; p < num_parts; ++p) {
-            opus_mla_decode_splitkv_sched_meta m;
+            opus_mla_decode_sched_meta m;
             if (req >= B) {
                 m.begin_req_idx = B; m.end_req_idx = B;
                 m.begin_tile_idx = 0; m.end_tile_idx = 0; m.begin_split_idx = 0;
@@ -61,7 +61,7 @@ __global__ void get_mla_metadata_kernel(KArgs kargs) {
             while (req < B) {
                 const int nt = nt_shared[req];
                 const int avail = nt - tile;
-                const int cost = avail + MLA_DECODE_SPLITKV_FIXED_OVERHEAD;
+                const int cost = avail + MLA_DECODE_FIXED_OVERHEAD;
 
                 if (remaining >= cost || is_last_part) {
 
@@ -74,7 +74,7 @@ __global__ void get_mla_metadata_kernel(KArgs kargs) {
 
                 } else {
 
-                    const int consume = remaining - MLA_DECODE_SPLITKV_FIXED_OVERHEAD;
+                    const int consume = remaining - MLA_DECODE_FIXED_OVERHEAD;
                     if (consume > 0) {
                         tile += consume;
                         split_idx++;

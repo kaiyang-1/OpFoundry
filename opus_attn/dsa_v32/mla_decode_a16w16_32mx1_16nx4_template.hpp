@@ -7,7 +7,7 @@
 
 using opus::operator""_I;
 
-namespace opus_mla_decode_splitkv_a16w16_32mx1_16nx4 {
+namespace opus_mla_decode_a16w16_32mx1_16nx4 {
 // ------------------------------------------------------------- instruction scheduling masks
 
 constexpr int VALU_MASK       = 0x002;
@@ -770,7 +770,7 @@ __device__ inline void softmax_tile(VS& v_s, VO& v_o, SM& s_m, SP& s_p,
 // ------------------------------------------------------------------------------------ driver
 
 template<class Traits>
-__device__ void attention_tiles(const opus_mla_decode_splitkv_kargs& kargs,
+__device__ void attention_tiles(const opus_mla_decode_kargs& kargs,
                                 int page_idx_begin, int valid_kv_len,
                                 int tile_begin, int tile_end,
                                 char* smem_kv, char* smem_ml, char* smem_p,
@@ -865,7 +865,7 @@ __device__ void attention_tiles(const opus_mla_decode_splitkv_kargs& kargs,
 }
 
 template<class Traits>
-__device__ void decode_one_req(const opus_mla_decode_splitkv_kargs& kargs, int batch_idx, int h_block_idx,
+__device__ void decode_one_req(const opus_mla_decode_kargs& kargs, int batch_idx, int h_block_idx,
                                int page_idx_begin, int valid_kv_len,
                                int tile_begin, int tile_end, int slot,
                                char* smem_kv, char* smem_ml, char* smem_p,
@@ -936,7 +936,7 @@ __device__ void decode_one_req(const opus_mla_decode_splitkv_kargs& kargs, int b
                                    (size_t)(kargs.H - h_block_start) * sizeof(D_ACC));
             static_for<T::ML_ELEMS>([&](auto e) {
                 const D_ACC lse = (l_row[e.value] > D_ACC(0.0f))
-                                ? (m_row[e.value] + log2f(l_row[e.value])) * D_ACC(MLA_DECODE_SPLITKV_LN_2)
+                                ? (m_row[e.value] + log2f(l_row[e.value])) * D_ACC(MLA_DECODE_LN_2)
                                 : numeric_limits<D_ACC>::infinity();
                 g_lse.store(lse, e.value * T::W_M + lane_id_o);
             });
@@ -966,16 +966,16 @@ __device__ void decode_one_req(const opus_mla_decode_splitkv_kargs& kargs, int b
 
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1)
-void opus_mla_decode_splitkv_a16w16_32mx1_16nx4_kernel(opus_mla_decode_splitkv_kargs kargs) {
+void opus_mla_decode_a16w16_32mx1_16nx4_kernel(opus_mla_decode_kargs kargs) {
     using namespace opus;
-    using namespace opus_mla_decode_splitkv_a16w16_32mx1_16nx4;
+    using namespace opus_mla_decode_a16w16_32mx1_16nx4;
     using T = opus::remove_cvref_t<Traits>;
 
     const int part = block_id_x();
     const int h_block_idx = block_id_y();
     if (part >= kargs.num_parts) return;
 
-    const opus_mla_decode_splitkv_sched_meta meta = kargs.sched_meta[part];
+    const opus_mla_decode_sched_meta meta = kargs.sched_meta[part];
     if (meta.begin_req_idx >= kargs.B) return;
 
     __shared__ char smem[T::smem_bytes()];
