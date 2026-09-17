@@ -1,11 +1,54 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 
 using bf16_t = __bf16;
-using fp16_t = __fp16;
 using fp8_t  = _BitInt(8);
 using bf8_t  = unsigned _BitInt(8);
+
+inline fp8_t float_to_fp8_e4m3(float f) {
+    const uint32_t bits = __builtin_bit_cast(uint32_t, f);
+    const uint8_t  sign = static_cast<uint8_t>((bits >> 24) & 0x80u);
+    const uint32_t mag  = bits & 0x7FFFFFFFu;
+
+    if (mag >= 0x7F800000u) return __builtin_bit_cast(fp8_t, static_cast<uint8_t>(sign | 0x7Fu));
+    if (mag >= 0x43E00000u) return __builtin_bit_cast(fp8_t, static_cast<uint8_t>(sign | 0x7Eu));
+
+    const int exp = static_cast<int>(mag >> 23) - 127;
+    uint8_t payload;
+    uint32_t dropped, halfway;
+    if (exp >= -6) {
+        const uint32_t mant = mag & 0x7FFFFFu;
+        payload = static_cast<uint8_t>(((exp + 7) << 3) | (mant >> 20));
+        dropped = mant & 0xFFFFFu;
+        halfway = 0x80000u;
+    } else {
+        const int shift = -exp - 6;
+        if (shift > 11) return __builtin_bit_cast(fp8_t, sign);
+        const uint32_t mant  = (mag & 0x7FFFFFu) | 0x800000u;
+        const uint32_t width = 20 + shift;
+        payload = static_cast<uint8_t>(mant >> width);
+        dropped = mant & ((1u << width) - 1);
+        halfway = 1u << (width - 1);
+    }
+    if (dropped > halfway || (dropped == halfway && (payload & 1))) payload++;
+    return __builtin_bit_cast(fp8_t, static_cast<uint8_t>(sign | payload));
+}
+
+inline float fp8_e4m3_to_float(fp8_t v) {
+    const uint8_t  bits = __builtin_bit_cast(uint8_t, v);
+    const uint32_t sign = static_cast<uint32_t>(bits & 0x80u) << 24;
+    const uint32_t exp  = (bits >> 3) & 0x0Fu;
+    const uint32_t mant = bits & 0x07u;
+
+    if (exp == 0x0Fu && mant == 0x07u) return __builtin_bit_cast(float, sign | 0x7FC00000u);
+    if (exp == 0) {
+        const float m = static_cast<float>(mant) * 0x1p-9f;
+        return (bits & 0x80u) ? -m : m;
+    }
+    return __builtin_bit_cast(float, sign | ((exp + 120) << 23) | (mant << 20));
+}
 
 static constexpr int MLA_DECODE_SPLITKV_NUM_CU = 256;
 static constexpr int MLA_DECODE_SPLITKV_FIXED_OVERHEAD = 5;
