@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 
 using bf16_t = __bf16;
@@ -50,20 +51,27 @@ inline float fp8_e4m3_to_float(fp8_t v) {
     return __builtin_bit_cast(float, sign | ((exp + 120) << 23) | (mant << 20));
 }
 
-static constexpr int MLA_DECODE_NUM_CU = 256;
-static constexpr int MLA_DECODE_FIXED_OVERHEAD = 5;
 static constexpr float MLA_DECODE_LN_2 = 0.69314718055994531f;
 
-struct alignas(16) opus_mla_decode_sched_meta {
-    int begin_req_idx;
-    int end_req_idx;
-    int begin_tile_idx;
-    int end_tile_idx;
-    int begin_split_idx;
-    int _pad[3];
+static constexpr int MLA_DECODE_NUM_CU = 256;
+static constexpr int MLA_DECODE_KV_GRANULARITY = 16;
+static constexpr int MLA_DECODE_FIXED_OVERHEAD = 16;
+static constexpr int MLA_DECODE_PACKED_QO_LEN_PER_WG = 128;
+static constexpr int MLA_DECODE_MAX_SPLIT_PER_BATCH = 32;
+static constexpr float MLA_DECODE_SPLIT_COEF = 1.2f;
+
+struct opus_mla_decode_work_info {
+    int batch_idx;
+    int partial_slot;
+    int qo_start;
+    int qo_end;
+    int kv_start;
+    int kv_end;
+    int kv_offset;
+    int _pad;
 };
 
-struct opus_mla_decode_fp8_kargs {
+struct opus_mla_decode_mxfp8_kargs {
     const void* __restrict__ q_nope_ptr;
     const void* __restrict__ q_scale_ptr;
     const void* __restrict__ q_rope_ptr;
@@ -72,16 +80,15 @@ struct opus_mla_decode_fp8_kargs {
     const void* __restrict__ kv_rope_ptr;
     void* __restrict__ out_ptr;
     void* __restrict__ lse_ptr;
-    const int* __restrict__ kv_indptr;
-    const int* __restrict__ kv_indices;
-
-    const opus_mla_decode_sched_meta* __restrict__ sched_meta;
-    const int* __restrict__ num_splits;
     void* __restrict__ o_accum;
     void* __restrict__ lse_accum;
-    int num_parts;
 
-    int B;
+    const int* __restrict__ q_indptr;
+    const int* __restrict__ kv_indptr;
+    const int* __restrict__ kv_indices;
+    const int* __restrict__ work_indptr;
+    const opus_mla_decode_work_info* __restrict__ work_info_set;
+
     int H;
     int total_tokens;
     int stride_q_nope_b;
@@ -92,7 +99,6 @@ struct opus_mla_decode_fp8_kargs {
     int stride_q_rope_h;
     int stride_o_b;
     int stride_o_h;
-    int stride_lse_b;
     int stride_kv_nope_page;
     int stride_kv_scale_page;
     int stride_kv_rope_page;
@@ -104,26 +110,72 @@ struct opus_mla_decode_kargs {
     const void* __restrict__ kv_ptr;
     void* __restrict__ out_ptr;
     void* __restrict__ lse_ptr;
-    const int* __restrict__ kv_indptr;
-    const int* __restrict__ kv_indices;
-
-    const opus_mla_decode_sched_meta* __restrict__ sched_meta;
-    const int* __restrict__ num_splits;
     void* __restrict__ o_accum;
     void* __restrict__ lse_accum;
-    int num_parts;
 
-    int B;
+    const int* __restrict__ q_indptr;
+    const int* __restrict__ kv_indptr;
+    const int* __restrict__ kv_indices;
+    const int* __restrict__ work_indptr;
+    const opus_mla_decode_work_info* __restrict__ work_info_set;
+
     int H;
     int total_tokens;
     int stride_q_b;
     int stride_q_h;
     int stride_o_b;
     int stride_o_h;
-    int stride_lse_b;
     int stride_kv_page;
     float softmax_scale;
 };
+
+// Harness-only: in production aiter owns both stages, so these are not ABI.
+struct opus_mla_decode_metadata_kargs {
+    const int* __restrict__ qo_indptr;
+    const int* __restrict__ kv_indptr;
+
+    int* __restrict__ work_indptr;
+    opus_mla_decode_work_info* __restrict__ work_info_set;
+    int* __restrict__ reduce_indptr;
+    int* __restrict__ reduce_final_map;
+    int* __restrict__ reduce_partial_map;
+
+    int B;
+    int H;
+    int num_cu;
+    int num_splits;
+    int uni_seqlen_qo;
+    int kv_granularity;
+    int fixed_overhead;
+    int tail_done_threshold;
+    int reduce_indptr_size;
+    int auto_split;
+    int is_causal;
+};
+
+struct opus_mla_decode_reduce_kargs {
+    const void* __restrict__ o_accum;
+    const void* __restrict__ lse_accum;
+    void* __restrict__ out_ptr;
+    void* __restrict__ lse_ptr;
+
+    const int* __restrict__ reduce_indptr;
+    const int* __restrict__ reduce_final_map;
+    const int* __restrict__ reduce_partial_map;
+
+    int H;
+    int stride_o_b;
+    int stride_o_h;
+};
+
+// Frozen: the prebuilt code objects are compiled against these layouts.
+static_assert(sizeof(opus_mla_decode_work_info) == 32);
+static_assert(sizeof(opus_mla_decode_kargs) == 120);
+static_assert(offsetof(opus_mla_decode_kargs, work_info_set) == 80);
+static_assert(offsetof(opus_mla_decode_kargs, softmax_scale) == 116);
+static_assert(sizeof(opus_mla_decode_mxfp8_kargs) == 176);
+static_assert(offsetof(opus_mla_decode_mxfp8_kargs, work_info_set) == 112);
+static_assert(offsetof(opus_mla_decode_mxfp8_kargs, softmax_scale) == 172);
 
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 32,
@@ -131,7 +183,7 @@ template<int Q_TILE_SIZE_ = 16,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
          typename D_OUT_ = bf16_t>
-struct opus_mla_decode_a8w8_16mx8_32nx1_traits {
+struct opus_mla_decode_mxfp8_16mx8_32nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;

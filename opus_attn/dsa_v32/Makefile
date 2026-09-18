@@ -16,7 +16,7 @@ KERNEL_OBJS = $(patsubst %.cc,$(BUILD)/%.o,$(KERNEL_SRCS))
 KERNEL_ASMS = $(patsubst %.cc,$(BUILD)/%.s,$(KERNEL_SRCS))
 HOST_OBJ    = $(BUILD)/host.o
 
-.PHONY: all asm clean verify
+.PHONY: all asm clean
 .DELETE_ON_ERROR:
 
 all: $(OUT)
@@ -38,17 +38,6 @@ $(HOST_OBJ): $(HOST_SRC) $(SHARED_HDRS) | $(BUILD)
 
 $(OUT): $(KERNEL_OBJS) $(HOST_OBJ)
 	$(HIPCC) $^ $(LINK_FLAGS) -o $@
-
-VERIFY_HQ ?= 64 128 192
-
-verify: $(OUT)
-	@for hq in $(VERIFY_HQ); do \
-	    echo "=== fp8 16mx8_32nx1 h_q=$$hq --verify ==="; \
-	    $(OUT) -dtype fp8 -h_q $$hq -b 32 --verify || exit 1; \
-	done
-
-benchmark: $(OUT)
-	@echo "=== h_q=128 (a8w8_16mx8_32nx1) ===" && $(OUT) -h_q 128
 
 clean:
 	rm -rf $(BUILD)

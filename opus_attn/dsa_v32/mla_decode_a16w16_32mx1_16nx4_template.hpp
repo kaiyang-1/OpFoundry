@@ -865,7 +865,7 @@ __device__ void attention_tiles(const opus_mla_decode_kargs& kargs,
 }
 
 template<class Traits>
-__device__ void decode_one_req(const opus_mla_decode_kargs& kargs, int batch_idx, int h_block_idx,
+__device__ void decode_one_work(const opus_mla_decode_kargs& kargs, int qo_start, int h_block_start,
                                int page_idx_begin, int valid_kv_len,
                                int tile_begin, int tile_end, int slot,
                                char* smem_kv, char* smem_ml, char* smem_p,
@@ -880,8 +880,7 @@ __device__ void decode_one_req(const opus_mla_decode_kargs& kargs, int batch_idx
     asm volatile("" : "+v"(lane_id));
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    const int h_block_start = h_block_idx * T::Q_TILE_SIZE;
-    const int64_t q_gmem_offset = static_cast<int64_t>(batch_idx) * kargs.stride_q_b
+    const int64_t q_gmem_offset = static_cast<int64_t>(qo_start) * kargs.stride_q_b
                                 + static_cast<int64_t>(h_block_start) * kargs.stride_q_h;
 
     auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.q_ptr) + q_gmem_offset,
@@ -923,15 +922,15 @@ __device__ void decode_one_req(const opus_mla_decode_kargs& kargs, int batch_idx
     const int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     if (slot < 0) {
-        const int64_t o_gmem_offset = static_cast<int64_t>(batch_idx) * kargs.stride_o_b
+        const int64_t o_gmem_offset = static_cast<int64_t>(qo_start) * kargs.stride_o_b
                                     + static_cast<int64_t>(h_block_start) * kargs.stride_o_h;
         auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset,
                              (size_t)(kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
         auto u_o = make_layout_o_packed<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
         store_o_packed<T>(g_o, v_o, u_o);
 
-        if (warp_id_o == 0 && lane_id_o < T::W_M) {
-            const int64_t lse_offset = static_cast<int64_t>(batch_idx) * kargs.stride_lse_b + h_block_start;
+        if (kargs.lse_ptr != nullptr && warp_id_o == 0 && lane_id_o < T::W_M) {
+            const int64_t lse_offset = static_cast<int64_t>(qo_start) * kargs.H + h_block_start;
             auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_ptr) + lse_offset,
                                    (size_t)(kargs.H - h_block_start) * sizeof(D_ACC));
             static_for<T::ML_ELEMS>([&](auto e) {
@@ -954,7 +953,7 @@ __device__ void decode_one_req(const opus_mla_decode_kargs& kargs, int batch_idx
                                    (size_t)(kargs.H - h_block_start) * sizeof(D_ACC));
             static_for<T::ML_ELEMS>([&](auto e) {
                 const D_ACC lse = (l_row[e.value] > D_ACC(0.0f))
-                                ? (m_row[e.value] + log2f(l_row[e.value]))
+                                ? (m_row[e.value] + log2f(l_row[e.value])) * D_ACC(MLA_DECODE_LN_2)
                                 : numeric_limits<D_ACC>::lowest();
                 g_lse.store(lse, e.value * T::W_M + lane_id_o);
             });
@@ -972,11 +971,7 @@ void opus_mla_decode_a16w16_32mx1_16nx4_kernel(opus_mla_decode_kargs kargs) {
     using T = opus::remove_cvref_t<Traits>;
 
     const int part = block_id_x();
-    const int h_block_idx = block_id_y();
-    if (part >= kargs.num_parts) return;
-
-    const opus_mla_decode_sched_meta meta = kargs.sched_meta[part];
-    if (meta.begin_req_idx >= kargs.B) return;
+    const int h_block_start = block_id_y() * T::Q_TILE_SIZE;
 
     __shared__ char smem[T::smem_bytes()];
     char* smem_kv = smem;
@@ -986,20 +981,18 @@ void opus_mla_decode_a16w16_32mx1_16nx4_kernel(opus_mla_decode_kargs kargs) {
     constexpr float LOG2_E = 1.44269504089f;
     const float temperature_scale = kargs.softmax_scale * LOG2_E;
 
-    for (int req = meta.begin_req_idx; req <= meta.end_req_idx; ++req) {
-        const int page_idx_begin = __builtin_amdgcn_readfirstlane(kargs.kv_indptr[req]);
-        const int valid_kv_len   = __builtin_amdgcn_readfirstlane(kargs.kv_indptr[req + 1]) - page_idx_begin;
-        const int num_tiles      = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+    const int work_begin = __builtin_amdgcn_readfirstlane(kargs.work_indptr[part]);
+    const int work_end   = __builtin_amdgcn_readfirstlane(kargs.work_indptr[part + 1]);
 
-        const int tile_begin = (req == meta.begin_req_idx) ? meta.begin_tile_idx : 0;
-        const int tile_end   = (req == meta.end_req_idx)   ? meta.end_tile_idx   : num_tiles;
+    for (int w = work_begin; w < work_end; ++w) {
+        const opus_mla_decode_work_info info = kargs.work_info_set[w];
+        const int slot         = __builtin_amdgcn_readfirstlane(info.partial_slot);
+        const int qo_start     = __builtin_amdgcn_readfirstlane(info.qo_start);
+        const int kv_start     = __builtin_amdgcn_readfirstlane(info.kv_start);
+        const int valid_kv_len = __builtin_amdgcn_readfirstlane(info.kv_end) - kv_start;
 
-        const int nsplit = kargs.num_splits[req + 1] - kargs.num_splits[req];
-        const bool is_no_split = (nsplit <= 1);
-        const int n_split_idx = (req == meta.begin_req_idx) ? meta.begin_split_idx : 0;
-        const int slot = is_no_split ? -1 : (kargs.num_splits[req] + n_split_idx);
-
-        decode_one_req<T>(kargs, req, h_block_idx, page_idx_begin, valid_kv_len,
-                          tile_begin, tile_end, slot, smem_kv, smem_ml, smem_p, temperature_scale);
+        decode_one_work<T>(kargs, qo_start, h_block_start, kv_start, valid_kv_len,
+                           0, ceil_div(valid_kv_len, T::KV_TILE_SIZE), slot,
+                           smem_kv, smem_ml, smem_p, temperature_scale);
     }
 }

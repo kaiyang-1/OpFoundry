@@ -15,13 +15,8 @@
 #include "defs.h"
 #include "parallel.h"
 
-template<class Traits, class KArgs>
-__global__ void get_mla_metadata_kernel(KArgs kargs);
-template<class Traits, class KArgs, int HEADS_PER_BLOCK = 8>
-__global__ void mla_combine_kernel(KArgs kargs);
-
 template<class Traits>
-__global__ void opus_mla_decode_a8w8_16mx8_32nx1_kernel(opus_mla_decode_fp8_kargs kargs);
+__global__ void opus_mla_decode_mxfp8_16mx8_32nx1_kernel(opus_mla_decode_mxfp8_kargs kargs);
 template<class Traits>
 __global__ void opus_mla_decode_a16w16_16mx4_64nx1_kernel(opus_mla_decode_kargs kargs);
 template<class Traits>
@@ -29,13 +24,17 @@ __global__ void opus_mla_decode_a16w16_32mx1_16nx4_kernel(opus_mla_decode_kargs 
 template<class Traits>
 __global__ void opus_mla_decode_a16w16_32mxt_32nx1_kernel(opus_mla_decode_kargs kargs);
 
-static constexpr int MLA_DECODE_COMBINE_HEADS_PER_BLOCK = 8;
+__global__ void get_mla_metadata_kernel(opus_mla_decode_metadata_kargs kargs);
+template<class Traits, int HEADS_PER_BLOCK = 8>
+__global__ void mla_reduce_kernel(opus_mla_decode_reduce_kargs kargs);
+
+static constexpr int MLA_DECODE_REDUCE_HEADS_PER_BLOCK = 8;
 
 template<int Q, int KV, int NW, class DN, class DR, class DO>
-inline void mla_decode_launch(opus_mla_decode_a8w8_16mx8_32nx1_traits<Q, KV, NW, DN, DR, DO>,
-                                      const opus_mla_decode_fp8_kargs& kargs, dim3 grid, dim3 block) {
-    using Traits = opus_mla_decode_a8w8_16mx8_32nx1_traits<Q, KV, NW, DN, DR, DO>;
-    opus_mla_decode_a8w8_16mx8_32nx1_kernel<Traits><<<grid, block>>>(kargs);
+inline void mla_decode_launch(opus_mla_decode_mxfp8_16mx8_32nx1_traits<Q, KV, NW, DN, DR, DO>,
+                                      const opus_mla_decode_mxfp8_kargs& kargs, dim3 grid, dim3 block) {
+    using Traits = opus_mla_decode_mxfp8_16mx8_32nx1_traits<Q, KV, NW, DN, DR, DO>;
+    opus_mla_decode_mxfp8_16mx8_32nx1_kernel<Traits><<<grid, block>>>(kargs);
 }
 
 template<int Q, int KV, int NW, class DA, class DO>
@@ -66,16 +65,83 @@ inline void mla_decode_launch(opus_mla_decode_a16w16_32mx3_32nx1_traits<Q, KV, N
     opus_mla_decode_a16w16_32mxt_32nx1_kernel<Traits><<<grid, block>>>(kargs);
 }
 
+// Host-side mirror of aiter's metadata buffer sizing (get_mla_metadata_info_v1),
+// plus the device buffers the scheduler fills and the split-KV merge consumes.
+struct mla_decode_plan {
+    int B = 0;
+    int H = 0;
+    int seqlen_qo = 1;
+    int num_qo_tiles = 1;
+    int num_reduce_tiles = 0;
+    int max_works = 0;
+    int max_split_tiles = 0;
+    int num_partial_rows = 0;
+    int num_splits = 0;
+
+    int* qo_indptr = nullptr;
+    int* work_indptr = nullptr;
+    opus_mla_decode_work_info* work_info_set = nullptr;
+    int* reduce_indptr = nullptr;
+    int* reduce_final_map = nullptr;
+    int* reduce_partial_map = nullptr;
+    float* o_accum = nullptr;
+    float* lse_accum = nullptr;
+};
+
+inline int mla_decode_num_qo_tiles(int seqlen_qo, int H) {
+    if (seqlen_qo * H <= MLA_DECODE_PACKED_QO_LEN_PER_WG) return 1;
+    if (H * 2 > MLA_DECODE_PACKED_QO_LEN_PER_WG) return seqlen_qo;
+    return ceil_div(seqlen_qo * H, MLA_DECODE_PACKED_QO_LEN_PER_WG);
+}
+
+inline opus_mla_decode_metadata_kargs mla_decode_metadata_kargs(const mla_decode_plan& plan,
+                                                               const int* kv_indptr) {
+    opus_mla_decode_metadata_kargs kargs{};
+    kargs.qo_indptr = plan.qo_indptr;
+    kargs.kv_indptr = kv_indptr;
+    kargs.work_indptr = plan.work_indptr;
+    kargs.work_info_set = plan.work_info_set;
+    kargs.reduce_indptr = plan.reduce_indptr;
+    kargs.reduce_final_map = plan.reduce_final_map;
+    kargs.reduce_partial_map = plan.reduce_partial_map;
+    kargs.B = plan.B;
+    kargs.H = plan.H;
+    kargs.num_cu = MLA_DECODE_NUM_CU;
+    kargs.num_splits = plan.num_splits;
+    kargs.uni_seqlen_qo = plan.seqlen_qo;
+    kargs.kv_granularity = MLA_DECODE_KV_GRANULARITY;
+    kargs.fixed_overhead = MLA_DECODE_FIXED_OVERHEAD;
+    kargs.tail_done_threshold = plan.seqlen_qo;
+    kargs.reduce_indptr_size = plan.num_reduce_tiles + 1;
+    kargs.auto_split = 0;
+    kargs.is_causal = 1;
+    return kargs;
+}
+
 template<class Traits, class KArgs>
-inline void mla_decode_launch_pipeline(Traits, const KArgs& kargs,
+inline void mla_decode_launch_pipeline(Traits, const KArgs& kargs, const mla_decode_plan& plan,
                                                dim3 grid_main, dim3 block_main, bool run_metadata = true) {
     if (run_metadata)
-        get_mla_metadata_kernel<Traits><<<dim3(1), dim3(Traits::WARP_SIZE), (2 * kargs.B + 1) * (int)sizeof(int)>>>(kargs);
+        get_mla_metadata_kernel<<<dim3(1), dim3(Traits::WARP_SIZE)>>>(
+            mla_decode_metadata_kargs(plan, kargs.kv_indptr));
+
     mla_decode_launch(Traits{}, kargs, grid_main, block_main);
-    const int n_head_blocks = ceil_div(kargs.H, MLA_DECODE_COMBINE_HEADS_PER_BLOCK);
-    dim3 grid_combine(kargs.B, n_head_blocks, 1);
-    dim3 block_combine(MLA_DECODE_COMBINE_HEADS_PER_BLOCK * Traits::WARP_SIZE);
-    mla_combine_kernel<Traits><<<grid_combine, block_combine>>>(kargs);
+
+    opus_mla_decode_reduce_kargs rargs{};
+    rargs.o_accum = plan.o_accum;
+    rargs.lse_accum = plan.lse_accum;
+    rargs.out_ptr = kargs.out_ptr;
+    rargs.lse_ptr = kargs.lse_ptr;
+    rargs.reduce_indptr = plan.reduce_indptr;
+    rargs.reduce_final_map = plan.reduce_final_map;
+    rargs.reduce_partial_map = plan.reduce_partial_map;
+    rargs.H = plan.H;
+    rargs.stride_o_b = kargs.stride_o_b;
+    rargs.stride_o_h = kargs.stride_o_h;
+
+    dim3 grid_reduce(plan.num_reduce_tiles, ceil_div(plan.H, MLA_DECODE_REDUCE_HEADS_PER_BLOCK), 1);
+    dim3 block_reduce(MLA_DECODE_REDUCE_HEADS_PER_BLOCK * Traits::WARP_SIZE);
+    mla_reduce_kernel<Traits><<<grid_reduce, block_reduce>>>(rargs);
 }
 
 #define CHECK_HIP(call)                                                                                   \
@@ -88,6 +154,46 @@ inline void mla_decode_launch_pipeline(Traits, const KArgs& kargs,
     } while(0)
 
 #define CHECK_HIP_KERNEL_LAUNCH() CHECK_HIP(hipGetLastError())
+
+inline mla_decode_plan mla_decode_plan_create(int B, int H, int seqlen_qo, int D_VO) {
+    mla_decode_plan plan;
+    plan.B = B;
+    plan.H = H;
+    plan.seqlen_qo = seqlen_qo;
+    plan.num_qo_tiles = mla_decode_num_qo_tiles(seqlen_qo, H);
+    plan.num_reduce_tiles = B * plan.num_qo_tiles;
+    plan.num_splits = std::min(MLA_DECODE_NUM_CU, MLA_DECODE_MAX_SPLIT_PER_BATCH * B);
+    plan.max_works = (B + MLA_DECODE_NUM_CU - 1) * plan.num_qo_tiles;
+    plan.max_split_tiles =
+        std::max(std::min(B + MLA_DECODE_NUM_CU - 1, (MLA_DECODE_NUM_CU - 1) * 2) * plan.num_qo_tiles,
+                 plan.num_reduce_tiles + plan.num_splits);
+    plan.num_partial_rows = plan.max_split_tiles * seqlen_qo;
+
+    std::vector<int> host_qo_indptr(B + 1);
+    for (int b = 0; b <= B; ++b) host_qo_indptr[b] = b * seqlen_qo;
+
+    CHECK_HIP(hipMalloc(&plan.qo_indptr, host_qo_indptr.size() * sizeof(int)));
+    CHECK_HIP(hipMemcpy(plan.qo_indptr, host_qo_indptr.data(), host_qo_indptr.size() * sizeof(int), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMalloc(&plan.work_indptr, (MLA_DECODE_NUM_CU + 1) * sizeof(int)));
+    CHECK_HIP(hipMalloc(&plan.work_info_set, (size_t)plan.max_works * sizeof(opus_mla_decode_work_info)));
+    CHECK_HIP(hipMalloc(&plan.reduce_indptr, (plan.num_reduce_tiles + 1) * sizeof(int)));
+    CHECK_HIP(hipMalloc(&plan.reduce_final_map, (size_t)plan.num_reduce_tiles * 2 * sizeof(int)));
+    CHECK_HIP(hipMalloc(&plan.reduce_partial_map, (size_t)plan.max_split_tiles * sizeof(int)));
+    CHECK_HIP(hipMalloc(&plan.o_accum, (size_t)plan.num_partial_rows * H * D_VO * sizeof(float)));
+    CHECK_HIP(hipMalloc(&plan.lse_accum, (size_t)plan.num_partial_rows * H * sizeof(float)));
+    return plan;
+}
+
+inline void mla_decode_plan_destroy(const mla_decode_plan& plan) {
+    CHECK_HIP(hipFree(plan.qo_indptr));
+    CHECK_HIP(hipFree(plan.work_indptr));
+    CHECK_HIP(hipFree(plan.work_info_set));
+    CHECK_HIP(hipFree(plan.reduce_indptr));
+    CHECK_HIP(hipFree(plan.reduce_final_map));
+    CHECK_HIP(hipFree(plan.reduce_partial_map));
+    CHECK_HIP(hipFree(plan.o_accum));
+    CHECK_HIP(hipFree(plan.lse_accum));
+}
 
 template<typename T>
 void rand_vector(T* ptr, size_t size, float min_val = 0.0f, float max_val = 1.0f) {
@@ -211,15 +317,16 @@ void init_dense_kv_indices(std::vector<int>& kv_indptr,
 }
 
 template<class Traits, class KArgs>
-void benchmark_mla_decode_kernel(const KArgs& kargs, dim3 grid, dim3 block,
-                                         int indices_prefix_sum, int warmup = 100, int iterations = 50) {
-
-    get_mla_metadata_kernel<Traits><<<dim3(1), dim3(Traits::WARP_SIZE), (2 * kargs.B + 1) * (int)sizeof(int)>>>(kargs);
+void benchmark_mla_decode_kernel(const KArgs& kargs, const mla_decode_plan& plan, dim3 grid, dim3 block,
+                                         int total_q, int indices_prefix_sum,
+                                         int warmup = 100, int iterations = 50) {
+    get_mla_metadata_kernel<<<dim3(1), dim3(Traits::WARP_SIZE)>>>(
+        mla_decode_metadata_kargs(plan, kargs.kv_indptr));
     CHECK_HIP_KERNEL_LAUNCH();
     CHECK_HIP(hipDeviceSynchronize());
 
     for (int i = 0; i < warmup; ++i) {
-        mla_decode_launch_pipeline(Traits{}, kargs, grid, block, false);
+        mla_decode_launch_pipeline(Traits{}, kargs, plan, grid, block, false);
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipDeviceSynchronize());
@@ -230,7 +337,7 @@ void benchmark_mla_decode_kernel(const KArgs& kargs, dim3 grid, dim3 block,
 
     CHECK_HIP(hipEventRecord(start));
     for (int i = 0; i < iterations; ++i) {
-        mla_decode_launch_pipeline(Traits{}, kargs, grid, block, false);
+        mla_decode_launch_pipeline(Traits{}, kargs, plan, grid, block, false);
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipEventRecord(stop));
@@ -259,12 +366,12 @@ void benchmark_mla_decode_kernel(const KArgs& kargs, dim3 grid, dim3 block,
         else
             return Traits::D_QK_SIZE * sizeof(typename Traits::D_ATTN);
     }();
-    const size_t q_bytes  = (size_t)kargs.B * kargs.H * row_bytes;
-    const size_t o_bytes  = (size_t)kargs.B * kargs.H * D_V * sizeof(D_OUT);
+    const size_t q_bytes  = (size_t)total_q * kargs.H * row_bytes;
+    const size_t o_bytes  = (size_t)total_q * kargs.H * D_V * sizeof(D_OUT);
     const size_t kv_bytes = (size_t)indices_prefix_sum * row_bytes;
     const double tbps = double(q_bytes + o_bytes + kv_bytes) / (avg_time * 1e-3) / 1e12;
 
-    printf("MLA decode split-KV performance: avg_time=%.3f ms, %.2f TFlops, %.2f TB/s\n",
+    printf("MLA decode performance: avg_time=%.3f ms, %.2f TFlops, %.2f TB/s\n",
            avg_time, tflops, tbps);
 }
 
@@ -409,7 +516,7 @@ void mla_decode_attention_ref_fp8(
     const typename PATraits::D_NOPE* KV_nope, const uint8_t* KV_scale, const typename PATraits::D_ROPE* KV_rope,
     typename PATraits::D_OUT* O, float* LSE,
     const int* kv_indptr, const int* kv_indices,
-    int B, int H)
+    int B, int H, int seqlen_qo)
 {
     using O_t = typename PATraits::D_OUT;
     constexpr int D_HEAD = PATraits::D_VO_SIZE;
@@ -417,14 +524,16 @@ void mla_decode_attention_ref_fp8(
     constexpr int NOPE   = PATraits::D_NOPE_SIZE;
     constexpr int SCALE  = PATraits::D_SCALE_SIZE;
     constexpr int ROPE   = PATraits::D_ROPE_SIZE;
+    const int total_q    = B * seqlen_qo;
     const int o_stride_n = H * D_HEAD;
     const int o_stride_h = D_HEAD;
 
-    mla_decode::parallel_for((size_t)H * B, [&](size_t idx) {
-        const int h = static_cast<int>(idx / B);
-        const int i = static_cast<int>(idx % B);
-        const int kv_begin = kv_indptr[i];
-        const int num_rows = kv_indptr[i + 1] - kv_begin;
+    mla_decode::parallel_for((size_t)H * total_q, [&](size_t idx) {
+        const int h = static_cast<int>(idx / total_q);
+        const int i = static_cast<int>(idx % total_q);
+        const int b = i / seqlen_qo;
+        const int kv_begin = kv_indptr[b];
+        const int num_rows = kv_indptr[b + 1] - (seqlen_qo - 1 - i % seqlen_qo) - kv_begin;
 
         O_t* o_row = O + (size_t)i * o_stride_n + h * o_stride_h;
         float* lse_row = LSE + (size_t)i * H + h;
@@ -455,18 +564,20 @@ void mla_decode_attention_ref_bf16(
     const typename PATraits::D_ATTN* Q, const typename PATraits::D_ATTN* KV,
     typename PATraits::D_OUT* O, float* LSE,
     const int* kv_indptr, const int* kv_indices,
-    int B, int H)
+    int B, int H, int seqlen_qo)
 {
     using O_t = typename PATraits::D_OUT;
     constexpr int D_HEAD = PATraits::D_VO_SIZE;
     constexpr int D_QK   = PATraits::D_QK_SIZE;
+    const int total_q    = B * seqlen_qo;
     const int o_stride_n = H * D_HEAD;
 
-    mla_decode::parallel_for((size_t)H * B, [&](size_t idx) {
-        const int h = static_cast<int>(idx / B);
-        const int i = static_cast<int>(idx % B);
-        const int kv_begin = kv_indptr[i];
-        const int num_rows = kv_indptr[i + 1] - kv_begin;
+    mla_decode::parallel_for((size_t)H * total_q, [&](size_t idx) {
+        const int h = static_cast<int>(idx / total_q);
+        const int i = static_cast<int>(idx % total_q);
+        const int b = i / seqlen_qo;
+        const int kv_begin = kv_indptr[b];
+        const int num_rows = kv_indptr[b + 1] - (seqlen_qo - 1 - i % seqlen_qo) - kv_begin;
 
         O_t* o_row = O + (size_t)i * o_stride_n + h * D_HEAD;
         float* lse_row = LSE + (size_t)i * H + h;
@@ -491,25 +602,26 @@ void mla_decode_attention_ref_bf16(
 }
 
 template<class PATraits>
-int run_mla_decode_case_fp8(int H, int B, int total_tokens, bool verify, bool dense_kv) {
+int run_mla_decode_case_fp8(int H, int B, int s, int s_q, bool verify, bool dense_kv) {
     using OType = typename PATraits::D_OUT;
-    printf("MLA decode split-KV attention: H_Q=%d, B=%d, D_QK=%d, D_V=%d, NoPE=fp8, RoPE=bf16, total_tokens=%d\n",
-           H, B, PATraits::D_QK_SIZE, PATraits::D_VO_SIZE, total_tokens);
+    printf("MLA decode attention: H_Q=%d, B=%d, S_Q=%d, D_QK=%d, D_V=%d, NoPE=fp8, RoPE=bf16, S=%d\n",
+           H, B, s_q, PATraits::D_QK_SIZE, PATraits::D_VO_SIZE, s);
 
     constexpr int D_HEAD = PATraits::D_VO_SIZE;
-    const size_t o_size = (size_t)B * H * D_HEAD;
+    const int total_q = B * s_q;
+    const size_t o_size = (size_t)total_q * H * D_HEAD;
 
     auto host_o_ref = std::make_unique<OType[]>(o_size);
     auto host_o_gpu = std::make_unique<OType[]>(o_size);
-    const size_t lse_size = (size_t)B * H;
+    const size_t lse_size = (size_t)total_q * H;
     auto host_lse_ref = std::make_unique<float[]>(lse_size);
     auto host_lse_gpu = std::make_unique<float[]>(lse_size);
 
     std::vector<int> host_kv_indptr, host_kv_indices;
     if (dense_kv) {
-        init_dense_kv_indices(host_kv_indptr, host_kv_indices, B, total_tokens);
+        init_dense_kv_indices(host_kv_indptr, host_kv_indices, B, s);
     } else {
-        init_sparse_kv_indices(host_kv_indptr, host_kv_indices, B, total_tokens, PATraits::KV_TILE_SIZE, 5678);
+        init_sparse_kv_indices(host_kv_indptr, host_kv_indices, B, s, PATraits::KV_TILE_SIZE, 5678);
     }
     const size_t total_kv_indices = host_kv_indices.size();
     assert(total_kv_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
@@ -528,36 +640,29 @@ int run_mla_decode_case_fp8(int H, int B, int total_tokens, bool verify, bool de
         CHECK_HIP(hipMemcpy(dev_kv_indices, host_kv_indices.data(), host_kv_indices.size() * sizeof(int), hipMemcpyHostToDevice));
 
     const int num_h_blocks = ceil_div(H, PATraits::Q_TILE_SIZE * PATraits::T_M);
-    const int num_parts = std::max(1, MLA_DECODE_NUM_CU / num_h_blocks);
-    dim3 grid(num_parts, num_h_blocks, 1);
-    dim3 block(PATraits::BLOCK_SIZE);
-    printf("MLA decode split-KV launch config: main grid=(%d,%d,%d) block=%d, num_parts=%d\n",
-           grid.x, grid.y, grid.z, block.x, num_parts);
+    const auto plan = mla_decode_plan_create(B, H, s_q, PATraits::D_VO_SIZE);
 
-    const int total_splits = B + num_parts;
-    opus_mla_decode_sched_meta* dev_sched_meta; int* dev_num_splits;
-    float *dev_o_accum, *dev_lse_accum;
-    CHECK_HIP(hipMalloc(&dev_sched_meta, num_parts * sizeof(opus_mla_decode_sched_meta)));
-    CHECK_HIP(hipMalloc(&dev_num_splits, (B + 1) * sizeof(int)));
-    CHECK_HIP(hipMalloc(&dev_o_accum, (size_t)total_splits * H * PATraits::D_VO_SIZE * sizeof(float)));
-    CHECK_HIP(hipMalloc(&dev_lse_accum, (size_t)total_splits * H * sizeof(float)));
+    dim3 grid(MLA_DECODE_NUM_CU, num_h_blocks, 1);
+    dim3 block(PATraits::BLOCK_SIZE);
+    printf("MLA decode launch config: main grid=(%d,%d,%d) block=%d, qo_tiles=%d, max_works=%d, partial_rows=%d\n",
+           grid.x, grid.y, grid.z, block.x, plan.num_qo_tiles, plan.max_works, plan.num_partial_rows);
 
     int rc = 0;
     auto verify_and_bench = [&](const auto& kargs) {
-        mla_decode_launch_pipeline(PATraits{}, kargs, grid, block, true);
+        mla_decode_launch_pipeline(PATraits{}, kargs, plan, grid, block);
         CHECK_HIP_KERNEL_LAUNCH();
         if (verify) {
             printf("\nValidating GPU results against CPU reference...\n");
             CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, o_size * sizeof(OType), hipMemcpyDeviceToHost));
             CHECK_HIP(hipMemcpy(host_lse_gpu.get(), dev_lse, lse_size * sizeof(float), hipMemcpyDeviceToHost));
-            bool all_valid = validate_mla_decode_results<OType>(host_o_ref.get(), host_o_gpu.get(), B, H, D_HEAD);
-            all_valid &= validate_mla_decode_lse(host_lse_ref.get(), host_lse_gpu.get(), B, H);
+            bool all_valid = validate_mla_decode_results<OType>(host_o_ref.get(), host_o_gpu.get(), total_q, H, D_HEAD);
+            all_valid &= validate_mla_decode_lse(host_lse_ref.get(), host_lse_gpu.get(), total_q, H);
             printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
             if (!all_valid) rc = 1;
         }
         if (!rc) {
             printf("\n");
-            benchmark_mla_decode_kernel<PATraits>(kargs, grid, block, total_kv_count);
+            benchmark_mla_decode_kernel<PATraits>(kargs, plan, grid, block, total_q, total_kv_count);
             printf("\n");
         }
     };
@@ -567,9 +672,9 @@ int run_mla_decode_case_fp8(int H, int B, int total_tokens, bool verify, bool de
     constexpr int NOPE = PATraits::D_NOPE_SIZE;
     constexpr int SCALE = PATraits::D_SCALE_SIZE;
     constexpr int ROPE = PATraits::D_ROPE_SIZE;
-    const size_t q_nope_size = (size_t)B * H * NOPE, q_rope_size = (size_t)B * H * ROPE;
-    const size_t kv_nope_size = (size_t)total_tokens * NOPE, kv_rope_size = (size_t)total_tokens * ROPE;
-    const size_t q_scale_size = (size_t)B * H * SCALE, kv_scale_size = (size_t)total_tokens * SCALE;
+    const size_t q_nope_size = (size_t)total_q * H * NOPE, q_rope_size = (size_t)total_q * H * ROPE;
+    const size_t kv_nope_size = (size_t)s * NOPE, kv_rope_size = (size_t)s * ROPE;
+    const size_t q_scale_size = (size_t)total_q * H * SCALE, kv_scale_size = (size_t)s * SCALE;
 
     auto host_q_nope = std::make_unique<D_NOPE[]>(q_nope_size);
     auto host_q_scale = std::make_unique<uint8_t[]>(q_scale_size);
@@ -577,8 +682,8 @@ int run_mla_decode_case_fp8(int H, int B, int total_tokens, bool verify, bool de
     auto host_kv_nope = std::make_unique<D_NOPE[]>(kv_nope_size);
     auto host_kv_scale = std::make_unique<uint8_t[]>(kv_scale_size);
     auto host_kv_rope = std::make_unique<D_ROPE[]>(kv_rope_size);
-    init_fp8_mla_split<PATraits>(host_q_nope.get(), host_q_scale.get(), host_q_rope.get(), (size_t)B * H);
-    init_fp8_mla_split<PATraits>(host_kv_nope.get(), host_kv_scale.get(), host_kv_rope.get(), (size_t)total_tokens);
+    init_fp8_mla_split<PATraits>(host_q_nope.get(), host_q_scale.get(), host_q_rope.get(), (size_t)total_q * H);
+    init_fp8_mla_split<PATraits>(host_kv_nope.get(), host_kv_scale.get(), host_kv_rope.get(), (size_t)s);
 
     D_NOPE *dev_q_nope, *dev_kv_nope;
     D_ROPE *dev_q_rope, *dev_kv_rope;
@@ -600,9 +705,9 @@ int run_mla_decode_case_fp8(int H, int B, int total_tokens, bool verify, bool de
         mla_decode_attention_ref_fp8<PATraits>(host_q_nope.get(), host_q_scale.get(), host_q_rope.get(),
                                                        host_kv_nope.get(), host_kv_scale.get(), host_kv_rope.get(),
                                                        host_o_ref.get(), host_lse_ref.get(),
-                                                       host_kv_indptr.data(), host_kv_indices.data(), B, H);
+                                                       host_kv_indptr.data(), host_kv_indices.data(), B, H, s_q);
 
-    opus_mla_decode_fp8_kargs kargs{};
+    opus_mla_decode_mxfp8_kargs kargs{};
     kargs.q_nope_ptr = dev_q_nope;
     kargs.q_scale_ptr = dev_q_scale;
     kargs.q_rope_ptr = dev_q_rope;
@@ -613,14 +718,13 @@ int run_mla_decode_case_fp8(int H, int B, int total_tokens, bool verify, bool de
     kargs.lse_ptr = dev_lse;
     kargs.kv_indptr = dev_kv_indptr;
     kargs.kv_indices = dev_kv_indices;
-    kargs.sched_meta = dev_sched_meta;
-    kargs.num_splits = dev_num_splits;
-    kargs.o_accum = dev_o_accum;
-    kargs.lse_accum = dev_lse_accum;
-    kargs.num_parts = num_parts;
-    kargs.B = B;
+    kargs.o_accum = plan.o_accum;
+    kargs.lse_accum = plan.lse_accum;
+    kargs.q_indptr = plan.qo_indptr;
+    kargs.work_indptr = plan.work_indptr;
+    kargs.work_info_set = plan.work_info_set;
     kargs.H = H;
-    kargs.total_tokens = total_tokens;
+    kargs.total_tokens = s;
     kargs.stride_q_nope_b = H * NOPE;
     kargs.stride_q_nope_h = NOPE;
     kargs.stride_q_scale_b = H * SCALE;
@@ -629,7 +733,6 @@ int run_mla_decode_case_fp8(int H, int B, int total_tokens, bool verify, bool de
     kargs.stride_q_rope_h = ROPE;
     kargs.stride_o_b = H * D_HEAD;
     kargs.stride_o_h = D_HEAD;
-    kargs.stride_lse_b = H;
     kargs.stride_kv_nope_page = NOPE;
     kargs.stride_kv_scale_page = SCALE;
     kargs.stride_kv_rope_page = ROPE;
@@ -640,10 +743,7 @@ int run_mla_decode_case_fp8(int H, int B, int total_tokens, bool verify, bool de
     CHECK_HIP(hipFree(dev_q_nope));   CHECK_HIP(hipFree(dev_q_rope));   CHECK_HIP(hipFree(dev_q_scale));
     CHECK_HIP(hipFree(dev_kv_nope));  CHECK_HIP(hipFree(dev_kv_rope));  CHECK_HIP(hipFree(dev_kv_scale));
 
-    CHECK_HIP(hipFree(dev_sched_meta));
-    CHECK_HIP(hipFree(dev_num_splits));
-    CHECK_HIP(hipFree(dev_o_accum));
-    CHECK_HIP(hipFree(dev_lse_accum));
+    mla_decode_plan_destroy(plan);
 
     CHECK_HIP(hipFree(dev_o));
     CHECK_HIP(hipFree(dev_lse));
@@ -654,25 +754,26 @@ int run_mla_decode_case_fp8(int H, int B, int total_tokens, bool verify, bool de
 }
 
 template<class PATraits>
-int run_mla_decode_case_bf16(int H, int B, int total_tokens, bool verify, bool dense_kv) {
+int run_mla_decode_case_bf16(int H, int B, int s, int s_q, bool verify, bool dense_kv) {
     using OType = typename PATraits::D_OUT;
-    printf("MLA decode split-KV attention: H_Q=%d, B=%d, D_QK=%d, D_V=%d, dtype=bf16, total_tokens=%d\n",
-           H, B, PATraits::D_QK_SIZE, PATraits::D_VO_SIZE, total_tokens);
+    printf("MLA decode attention: H_Q=%d, B=%d, S_Q=%d, D_QK=%d, D_V=%d, dtype=bf16, S=%d\n",
+           H, B, s_q, PATraits::D_QK_SIZE, PATraits::D_VO_SIZE, s);
 
     constexpr int D_HEAD = PATraits::D_VO_SIZE;
-    const size_t o_size = (size_t)B * H * D_HEAD;
+    const int total_q = B * s_q;
+    const size_t o_size = (size_t)total_q * H * D_HEAD;
 
     auto host_o_ref = std::make_unique<OType[]>(o_size);
     auto host_o_gpu = std::make_unique<OType[]>(o_size);
-    const size_t lse_size = (size_t)B * H;
+    const size_t lse_size = (size_t)total_q * H;
     auto host_lse_ref = std::make_unique<float[]>(lse_size);
     auto host_lse_gpu = std::make_unique<float[]>(lse_size);
 
     std::vector<int> host_kv_indptr, host_kv_indices;
     if (dense_kv) {
-        init_dense_kv_indices(host_kv_indptr, host_kv_indices, B, total_tokens);
+        init_dense_kv_indices(host_kv_indptr, host_kv_indices, B, s);
     } else {
-        init_sparse_kv_indices(host_kv_indptr, host_kv_indices, B, total_tokens, PATraits::KV_TILE_SIZE, 5678);
+        init_sparse_kv_indices(host_kv_indptr, host_kv_indices, B, s, PATraits::KV_TILE_SIZE, 5678);
     }
     const size_t total_kv_indices = host_kv_indices.size();
     assert(total_kv_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
@@ -691,43 +792,36 @@ int run_mla_decode_case_bf16(int H, int B, int total_tokens, bool verify, bool d
         CHECK_HIP(hipMemcpy(dev_kv_indices, host_kv_indices.data(), host_kv_indices.size() * sizeof(int), hipMemcpyHostToDevice));
 
     const int num_h_blocks = ceil_div(H, PATraits::Q_TILE_SIZE * PATraits::T_M);
-    const int num_parts = std::max(1, MLA_DECODE_NUM_CU / num_h_blocks);
-    dim3 grid(num_parts, num_h_blocks, 1);
-    dim3 block(PATraits::BLOCK_SIZE);
-    printf("MLA decode split-KV launch config: main grid=(%d,%d,%d) block=%d, num_parts=%d\n",
-           grid.x, grid.y, grid.z, block.x, num_parts);
+    const auto plan = mla_decode_plan_create(B, H, s_q, PATraits::D_VO_SIZE);
 
-    const int total_splits = B + num_parts;
-    opus_mla_decode_sched_meta* dev_sched_meta; int* dev_num_splits;
-    float *dev_o_accum, *dev_lse_accum;
-    CHECK_HIP(hipMalloc(&dev_sched_meta, num_parts * sizeof(opus_mla_decode_sched_meta)));
-    CHECK_HIP(hipMalloc(&dev_num_splits, (B + 1) * sizeof(int)));
-    CHECK_HIP(hipMalloc(&dev_o_accum, (size_t)total_splits * H * PATraits::D_VO_SIZE * sizeof(float)));
-    CHECK_HIP(hipMalloc(&dev_lse_accum, (size_t)total_splits * H * sizeof(float)));
+    dim3 grid(MLA_DECODE_NUM_CU, num_h_blocks, 1);
+    dim3 block(PATraits::BLOCK_SIZE);
+    printf("MLA decode launch config: main grid=(%d,%d,%d) block=%d, qo_tiles=%d, max_works=%d, partial_rows=%d\n",
+           grid.x, grid.y, grid.z, block.x, plan.num_qo_tiles, plan.max_works, plan.num_partial_rows);
 
     int rc = 0;
     auto verify_and_bench = [&](const auto& kargs) {
-        mla_decode_launch_pipeline(PATraits{}, kargs, grid, block, true);
+        mla_decode_launch_pipeline(PATraits{}, kargs, plan, grid, block);
         CHECK_HIP_KERNEL_LAUNCH();
         if (verify) {
             printf("\nValidating GPU results against CPU reference...\n");
             CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, o_size * sizeof(OType), hipMemcpyDeviceToHost));
             CHECK_HIP(hipMemcpy(host_lse_gpu.get(), dev_lse, lse_size * sizeof(float), hipMemcpyDeviceToHost));
-            bool all_valid = validate_mla_decode_results<OType>(host_o_ref.get(), host_o_gpu.get(), B, H, D_HEAD);
-            all_valid &= validate_mla_decode_lse(host_lse_ref.get(), host_lse_gpu.get(), B, H);
+            bool all_valid = validate_mla_decode_results<OType>(host_o_ref.get(), host_o_gpu.get(), total_q, H, D_HEAD);
+            all_valid &= validate_mla_decode_lse(host_lse_ref.get(), host_lse_gpu.get(), total_q, H);
             printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
             if (!all_valid) rc = 1;
         }
         if (!rc) {
             printf("\n");
-            benchmark_mla_decode_kernel<PATraits>(kargs, grid, block, total_kv_count);
+            benchmark_mla_decode_kernel<PATraits>(kargs, plan, grid, block, total_q, total_kv_count);
             printf("\n");
         }
     };
 
     using D_ATTN = typename PATraits::D_ATTN;
     constexpr int D_QK = PATraits::D_QK_SIZE;
-    const size_t q_size = (size_t)B * H * D_QK, kv_size = (size_t)total_tokens * D_QK;
+    const size_t q_size = (size_t)total_q * H * D_QK, kv_size = (size_t)s * D_QK;
 
     auto host_q  = std::make_unique<D_ATTN[]>(q_size);
     auto host_kv = std::make_unique<D_ATTN[]>(kv_size);
@@ -743,7 +837,7 @@ int run_mla_decode_case_bf16(int H, int B, int total_tokens, bool verify, bool d
     if (verify)
         mla_decode_attention_ref_bf16<PATraits>(host_q.get(), host_kv.get(),
                                                         host_o_ref.get(), host_lse_ref.get(),
-                                                        host_kv_indptr.data(), host_kv_indices.data(), B, H);
+                                                        host_kv_indptr.data(), host_kv_indices.data(), B, H, s_q);
 
     opus_mla_decode_kargs kargs{};
     kargs.q_ptr = dev_q;
@@ -752,19 +846,17 @@ int run_mla_decode_case_bf16(int H, int B, int total_tokens, bool verify, bool d
     kargs.lse_ptr = dev_lse;
     kargs.kv_indptr = dev_kv_indptr;
     kargs.kv_indices = dev_kv_indices;
-    kargs.sched_meta = dev_sched_meta;
-    kargs.num_splits = dev_num_splits;
-    kargs.o_accum = dev_o_accum;
-    kargs.lse_accum = dev_lse_accum;
-    kargs.num_parts = num_parts;
-    kargs.B = B;
+    kargs.o_accum = plan.o_accum;
+    kargs.lse_accum = plan.lse_accum;
+    kargs.q_indptr = plan.qo_indptr;
+    kargs.work_indptr = plan.work_indptr;
+    kargs.work_info_set = plan.work_info_set;
     kargs.H = H;
-    kargs.total_tokens = total_tokens;
+    kargs.total_tokens = s;
     kargs.stride_q_b = H * D_QK;
     kargs.stride_q_h = D_QK;
     kargs.stride_o_b = H * D_HEAD;
     kargs.stride_o_h = D_HEAD;
-    kargs.stride_lse_b = H;
     kargs.stride_kv_page = D_QK;
     kargs.softmax_scale = 1.0f / std::sqrt(static_cast<float>(PATraits::D_QK_SIZE));
 
@@ -773,10 +865,7 @@ int run_mla_decode_case_bf16(int H, int B, int total_tokens, bool verify, bool d
     CHECK_HIP(hipFree(dev_q));
     CHECK_HIP(hipFree(dev_kv));
 
-    CHECK_HIP(hipFree(dev_sched_meta));
-    CHECK_HIP(hipFree(dev_num_splits));
-    CHECK_HIP(hipFree(dev_o_accum));
-    CHECK_HIP(hipFree(dev_lse_accum));
+    mla_decode_plan_destroy(plan);
 
     CHECK_HIP(hipFree(dev_o));
     CHECK_HIP(hipFree(dev_lse));
@@ -789,7 +878,8 @@ int run_mla_decode_case_bf16(int H, int B, int total_tokens, bool verify, bool d
 int main(int argc, char** argv) {
     int H = 128;
     int B = 128;
-    int total_tokens = 1024;
+    int s = 1024;
+    int s_q = 1;
 
     bool verify = false;
     bool dense_kv = false;
@@ -826,35 +916,36 @@ int main(int argc, char** argv) {
         if (try_parse_str(dtype, "-dtype")) continue;
         if (try_parse(H, "-h_q")) continue;
         if (try_parse(B, "-b")) continue;
-        if (try_parse(total_tokens, "-total_tokens")) continue;
+        if (try_parse(s, "-s")) continue;
+        if (try_parse(s_q, "-s_q")) continue;
     }
 
-    if (H <= 0 || B <= 0 || total_tokens <= 0) {
-        std::cerr << "Invalid parameters. H_Q,B,total_tokens must be positive.\n";
+    if (H <= 0 || B <= 0 || s <= 0 || s_q <= 0) {
+        std::cerr << "Invalid parameters. H_Q,B,S,S_Q must be positive.\n";
         return 1;
     }
 
     if (std::strcmp(dtype, "fp8") == 0)
         return run_mla_decode_case_fp8<
-            opus_mla_decode_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(
-            H, B, total_tokens, verify, dense_kv);
+            opus_mla_decode_mxfp8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(
+            H, B, s, s_q, verify, dense_kv);
 
     if (std::strcmp(dtype, "bf16") == 0) {
         if (H <= 32)
             return run_mla_decode_case_bf16<
                 opus_mla_decode_a16w16_32mx1_16nx4_traits<32, 64, 4, bf16_t, bf16_t>>(
-                H, B, total_tokens, verify, dense_kv);
+                H, B, s, s_q, verify, dense_kv);
         if (H % 128 == 0)
             return run_mla_decode_case_bf16<
                 opus_mla_decode_a16w16_32mx4_32nx1_traits<32, 32, 4, bf16_t, bf16_t>>(
-                H, B, total_tokens, verify, dense_kv);
+                H, B, s, s_q, verify, dense_kv);
         if (H % 96 == 0)
             return run_mla_decode_case_bf16<
                 opus_mla_decode_a16w16_32mx3_32nx1_traits<32, 32, 4, bf16_t, bf16_t>>(
-                H, B, total_tokens, verify, dense_kv);
+                H, B, s, s_q, verify, dense_kv);
         return run_mla_decode_case_bf16<
             opus_mla_decode_a16w16_16mx4_64nx1_traits<16, 64, 4, bf16_t, bf16_t>>(
-            H, B, total_tokens, verify, dense_kv);
+            H, B, s, s_q, verify, dense_kv);
     }
 
     std::cerr << "unknown -dtype '" << dtype << "'; available: fp8, bf16\n";
