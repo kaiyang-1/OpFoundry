@@ -5,12 +5,6 @@
 
 namespace opus_mla_decode_metadata {
 
-__device__ inline int num_qo_tiles_of(int seqlen_qo, int H, bool qo_splits) {
-    if (!qo_splits) return 1;
-    if (H * 2 > MLA_DECODE_PACKED_QO_LEN_PER_WG) return seqlen_qo;
-    return ceil_div(seqlen_qo * H, MLA_DECODE_PACKED_QO_LEN_PER_WG);
-}
-
 __device__ inline int effective_splits(const opus_mla_decode_metadata_kargs& kargs, int sum_blocks) {
     if (!kargs.auto_split) return kargs.num_splits;
     const float work = float(opus::max(1, sum_blocks)) * float(opus::max(1, kargs.num_splits));
@@ -29,13 +23,12 @@ __global__ void get_mla_metadata_kernel(opus_mla_decode_metadata_kargs kargs) {
     const int gran = kargs.kv_granularity;
     const int overhead = kargs.fixed_overhead;
     const int lane = opus::thread_id_x();
-    const bool qo_splits = (kargs.uni_seqlen_qo * H > MLA_DECODE_PACKED_QO_LEN_PER_WG);
 
     int sum_blocks = 0;
     for (int b = lane; b < B; b += WARP) {
         const int seqlen_qo = kargs.qo_indptr[b + 1] - kargs.qo_indptr[b];
         const int seqlen_kv = kargs.kv_indptr[b + 1] - kargs.kv_indptr[b];
-        sum_blocks += (ceil_div(seqlen_kv, gran) + overhead) * num_qo_tiles_of(seqlen_qo, H, qo_splits);
+        sum_blocks += (ceil_div(seqlen_kv, gran) + overhead) * mla_decode_num_qo_tiles(seqlen_qo, H);
     }
     #pragma unroll
     for (int offset = WARP / 2; offset >= 1; offset /= 2)
@@ -62,7 +55,7 @@ __global__ void get_mla_metadata_kernel(opus_mla_decode_metadata_kargs kargs) {
             while (curr_batch < B) {
                 const int qo_begin = kargs.qo_indptr[curr_batch];
                 const int qo_limit = kargs.qo_indptr[curr_batch + 1];
-                const int num_qo_tiles = num_qo_tiles_of(qo_limit - qo_begin, H, qo_splits);
+                const int num_qo_tiles = mla_decode_num_qo_tiles(qo_limit - qo_begin, H);
                 const int qo_tile_size = ceil_div(qo_limit - qo_begin, num_qo_tiles);
 
                 const int num_kv_blocks = ceil_div(curr_kv_end - curr_kv_begin, gran);
@@ -110,7 +103,7 @@ __global__ void get_mla_metadata_kernel(opus_mla_decode_metadata_kargs kargs) {
                     remain_payload -= remain_kv_blocks + overhead;
 
                     curr_qo_tile_idx = (curr_qo_tile_idx == num_qo_tiles - 1) ? 0 : curr_qo_tile_idx + 1;
-                    if (!qo_splits || curr_qo_tile_idx == 0) {
+                    if (curr_qo_tile_idx == 0) {
                         ++curr_batch;
                         if (curr_batch < B) {
                             curr_kv_begin = curr_kv_end;

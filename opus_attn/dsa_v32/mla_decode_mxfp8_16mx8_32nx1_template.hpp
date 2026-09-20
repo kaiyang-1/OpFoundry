@@ -1359,9 +1359,9 @@ __device__ void decode_pipelined(opus_mla_decode_mxfp8_kargs kargs,
 
 template<class Traits>
 __device__ void decode_one_work(opus_mla_decode_mxfp8_kargs kargs, int qo_start, int h_block_idx,
-                               int page_idx_begin, int valid_kv_len,
-                               int tile_begin, int tile_end, int slot,
-                               char* smem_kv, char* smem_kv_scale, float temperature_scale) {
+                                int page_idx_begin, int valid_kv_len,
+                                int tile_begin, int tile_end, int slot,
+                                char* smem_kv, char* smem_kv_scale, float temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_NOPE = typename T::D_NOPE;

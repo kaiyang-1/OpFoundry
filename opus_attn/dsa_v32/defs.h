@@ -52,6 +52,7 @@ inline float fp8_e4m3_to_float(fp8_t v) {
 }
 
 static constexpr float MLA_DECODE_LN_2 = 0.69314718055994531f;
+static constexpr float MLA_DECODE_LOG2_E = 1.4426950408889634f;
 
 static constexpr int MLA_DECODE_NUM_CU = 256;
 static constexpr int MLA_DECODE_KV_GRANULARITY = 16;
@@ -476,6 +477,13 @@ struct opus_mla_decode_a16w16_32mx3_32nx1_traits
     : opus_mla_decode_a16w16_32mxt_32nx1_traits_base<
           Q_TILE_SIZE_, KV_TILE_SIZE_, NUM_WARPS_, NUM_WARPS_ - 1, D_ATTN_, D_OUT_> {};
 
-__host__ __device__ inline int ceil_div(int a, int b) {
+template<typename T>
+__host__ __device__ inline T ceil_div(T a, T b) {
     return (a + b - 1) / b;
+}
+
+__host__ __device__ inline int mla_decode_num_qo_tiles(int seqlen_qo, int H) {
+    if (seqlen_qo * H <= MLA_DECODE_PACKED_QO_LEN_PER_WG) return 1;
+    if (H * 2 > MLA_DECODE_PACKED_QO_LEN_PER_WG) return seqlen_qo;
+    return ceil_div(seqlen_qo * H, MLA_DECODE_PACKED_QO_LEN_PER_WG);
 }

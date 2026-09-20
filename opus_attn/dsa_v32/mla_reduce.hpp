@@ -3,6 +3,13 @@
 #include <opus/opus.hpp>
 #include "defs.h"
 
+template<class D_ACC>
+__device__ inline D_ACC mla_rescale(D_ACC lse, D_ACC ref) {
+    return (lse > opus::numeric_limits<D_ACC>::lowest())
+             ? __builtin_exp2f((lse - ref) * D_ACC(MLA_DECODE_LOG2_E))
+             : D_ACC(0.0f);
+}
+
 template<class T>
 __device__ inline void mla_write_lse(const opus_mla_decode_reduce_kargs& kargs, int row, int head,
                                      int lane, typename T::D_ACC m, typename T::D_ACC denom) {
@@ -10,7 +17,7 @@ __device__ inline void mla_write_lse(const opus_mla_decode_reduce_kargs& kargs, 
     if (lane != 0 || kargs.lse_ptr == nullptr) return;
     D_ACC* lse = reinterpret_cast<D_ACC*>(kargs.lse_ptr);
     lse[(size_t)row * kargs.H + head] = (denom > D_ACC(0.0f))
-        ? (m + logf(denom))
+        ? (m + __builtin_log2f(denom) * MLA_DECODE_LN_2)
         : opus::numeric_limits<D_ACC>::infinity();
 }
 
@@ -30,7 +37,7 @@ __device__ void mla_reduce_online(const opus_mla_decode_reduce_kargs& kargs, int
     const D_ACC* o_accum   = reinterpret_cast<const D_ACC*>(kargs.o_accum);
 
     auto load_split = [&](int i, D_ACCx4* dst) {
-        const D_ACC* p = o_accum + (size_t)(partial_row(i) * H + head) * D + lane * VEC;
+        const D_ACC* p = o_accum + ((size_t)partial_row(i) * H + head) * D + lane * VEC;
         #pragma unroll
         for (int v = 0; v < NVEC; ++v)
             dst[v] = *reinterpret_cast<const D_ACCx4*>(p + v * WARP * VEC);
@@ -54,9 +61,8 @@ __device__ void mla_reduce_online(const opus_mla_decode_reduce_kargs& kargs, int
             lse_nxt = load_lse(i + 1);
         }
         const D_ACC new_m   = opus::max(m, lse_cur);
-        const D_ACC old_scl = __builtin_expf(m - new_m);
-        const D_ACC cur_scl = (lse_cur > opus::numeric_limits<D_ACC>::lowest())
-                                ? __builtin_expf(lse_cur - new_m) : D_ACC(0.0f);
+        const D_ACC old_scl = __builtin_exp2f((m - new_m) * D_ACC(MLA_DECODE_LOG2_E));
+        const D_ACC cur_scl = mla_rescale(lse_cur, new_m);
         #pragma unroll
         for (int v = 0; v < NVEC; ++v) acc[v] = old_scl * acc[v] + cur_scl * cur[v];
         denom = denom * old_scl + cur_scl;
@@ -93,8 +99,6 @@ __device__ void mla_reduce_two_pass(const opus_mla_decode_reduce_kargs& kargs, i
     constexpr int D    = T::D_VO_SIZE;
     constexpr int VEC  = 4;
     constexpr int NVEC = D / (WARP * VEC);
-    constexpr int MAX_SPLITS = MLA_DECODE_NUM_CU;
-    constexpr int NCHUNK = (MAX_SPLITS + WARP - 1) / WARP;
 
     const int H = kargs.H;
     const D_ACC* lse_accum = reinterpret_cast<const D_ACC*>(kargs.lse_accum);
@@ -110,17 +114,9 @@ __device__ void mla_reduce_two_pass(const opus_mla_decode_reduce_kargs& kargs, i
         local_max = opus::max(local_max, opus::shfl(local_max, lane ^ off));
     const D_ACC m = local_max;
 
-    D_ACC scale[NCHUNK];
     D_ACC local_sum = 0.0f;
-    #pragma unroll
-    for (int c = 0; c < NCHUNK; ++c) {
-        const int s = lane + c * WARP;
-        const D_ACC lse_s = (s < ns) ? load_lse(s) : opus::numeric_limits<D_ACC>::lowest();
-        const D_ACC e = (lse_s > opus::numeric_limits<D_ACC>::lowest())
-                          ? __builtin_expf(lse_s - m) : D_ACC(0.0f);
-        scale[c] = e;
-        local_sum += e;
-    }
+    for (int s = lane; s < ns; s += WARP)
+        local_sum += mla_rescale(load_lse(s), m);
     #pragma unroll
     for (int off = WARP / 2; off >= 1; off >>= 1)
         local_sum += opus::shfl(local_sum, lane ^ off);
@@ -134,25 +130,18 @@ __device__ void mla_reduce_two_pass(const opus_mla_decode_reduce_kargs& kargs, i
     for (int v = 0; v < NVEC; ++v) acc[v] = D_ACCx4{0.0f, 0.0f, 0.0f, 0.0f};
 
     auto load_split = [&](int i, D_ACCx4* dst) {
-        const D_ACC* p = o_accum + (size_t)(partial_row(i) * H + head) * D + lane * VEC;
+        const D_ACC* p = o_accum + ((size_t)partial_row(i) * H + head) * D + lane * VEC;
         #pragma unroll
         for (int v = 0; v < NVEC; ++v)
             dst[v] = *reinterpret_cast<const D_ACCx4*>(p + v * WARP * VEC);
     };
 
-    #pragma unroll
-    for (int c = 0; c < NCHUNK; ++c) {
-        const int base = c * WARP;
-        if (base >= ns) break;
-        for (int j = 0; j < WARP; ++j) {
-            const int i = base + j;
-            if (i >= ns) break;
-            D_ACCx4 cur[NVEC];
-            load_split(i, cur);
-            const D_ACC w = opus::shfl(scale[c], j);
-            #pragma unroll
-            for (int v = 0; v < NVEC; ++v) acc[v] += w * cur[v];
-        }
+    for (int i = 0; i < ns; ++i) {
+        D_ACCx4 cur[NVEC];
+        load_split(i, cur);
+        const D_ACC w = mla_rescale(load_lse(i), m);
+        #pragma unroll
+        for (int v = 0; v < NVEC; ++v) acc[v] += w * cur[v];
     }
 
     D_OUT* out = reinterpret_cast<D_OUT*>(kargs.out_ptr)

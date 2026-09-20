@@ -866,10 +866,10 @@ __device__ void attention_tiles(const opus_mla_decode_kargs& kargs,
 
 template<class Traits>
 __device__ void decode_one_work(const opus_mla_decode_kargs& kargs, int qo_start, int h_block_start,
-                               int page_idx_begin, int valid_kv_len,
-                               int tile_begin, int tile_end, int slot,
-                               char* smem_kv, char* smem_ml, char* smem_p,
-                               typename Traits::D_ACC temperature_scale) {
+                                int page_idx_begin, int valid_kv_len,
+                                int tile_begin, int tile_end, int slot,
+                                char* smem_kv, char* smem_ml, char* smem_p,
+                                typename Traits::D_ACC temperature_scale) {
     using namespace opus;
     using T = remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
