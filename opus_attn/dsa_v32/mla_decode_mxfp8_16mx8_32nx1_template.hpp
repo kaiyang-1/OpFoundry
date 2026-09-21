@@ -524,6 +524,7 @@ __device__ void decode_le2_tiles(opus_mla_decode_mxfp8_kargs kargs,
     const auto* p_k_rope  = reinterpret_cast<const D_ROPE*>(kargs.kv_rope_ptr);
     const auto* p_kv_scale = reinterpret_cast<const D_NOPE*>(kargs.kv_scale_ptr);
     auto g_kv_indices = make_gmem(kargs.kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
+    auto g_kv_scale = make_gmem(p_kv_scale, kargs.total_tokens * kargs.stride_kv_scale_page * sizeof(D_NOPE));
 
     auto s_k_nope = make_smem(reinterpret_cast<D_NOPE*>(smem_kv));
     auto s_k_rope = make_smem(reinterpret_cast<D_ROPE*>(smem_kv + T::smem_k_nope_bytes));
@@ -586,7 +587,7 @@ __device__ void decode_le2_tiles(opus_mla_decode_mxfp8_kargs kargs,
     auto load_kv_page = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
     auto kv_nope_ptr  = [&](int t) { return p_k_nope  + static_cast<int64_t>(t) * kargs.stride_kv_nope_page; };
     auto kv_rope_ptr  = [&](int t) { return p_k_rope  + static_cast<int64_t>(t) * kargs.stride_kv_rope_page; };
-    auto kv_scale_ptr = [&](int t) { return p_kv_scale + static_cast<int64_t>(t) * kargs.stride_kv_scale_page; };
+    auto kv_scale_os  = [&](int t) { return t * kargs.stride_kv_scale_page; };
 
     auto compute_qk_nope = [&](auto& s, auto& q, auto& k, auto& scale_q, auto& v_k_mxscl) {
         clear(s);
@@ -642,7 +643,7 @@ __device__ void decode_le2_tiles(opus_mla_decode_mxfp8_kargs kargs,
         if (warp_id < 4) {
             global_load<T::VEC_KV_ROPE>(kv_rope_ptr(kv_page), s_k_rope.ptr, u_gk_rope, u_sk_rope);
         } else {
-            global_load<4>(kv_scale_ptr(kv_page), s_k_mxscl.ptr, u_gk_mxscl, u_sk_mxscl);
+            async_load<4>(g_kv_scale, s_k_mxscl.ptr, u_gk_mxscl + kv_scale_os(kv_page), u_sk_mxscl);
         }
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
@@ -717,6 +718,7 @@ __device__ void decode_pipelined(opus_mla_decode_mxfp8_kargs kargs,
     const auto* p_k_rope  = reinterpret_cast<const D_ROPE*>(kargs.kv_rope_ptr);
     const auto* p_kv_scale = reinterpret_cast<const D_NOPE*>(kargs.kv_scale_ptr);
     auto g_kv_indices = make_gmem(kargs.kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
+    auto g_kv_scale = make_gmem(p_kv_scale, kargs.total_tokens * kargs.stride_kv_scale_page * sizeof(D_NOPE));
 
     auto s_k_nope  = make_smem(reinterpret_cast<D_NOPE*>(smem_kv));
     auto s_k_rope  = make_smem(reinterpret_cast<D_ROPE*>(smem_kv + T::smem_k_nope_bytes));
@@ -796,7 +798,7 @@ __device__ void decode_pipelined(opus_mla_decode_mxfp8_kargs kargs,
     auto load_kv_page = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
     auto kv_nope_ptr  = [&](int t) { return p_k_nope  + static_cast<int64_t>(t) * kargs.stride_kv_nope_page; };
     auto kv_rope_ptr  = [&](int t) { return p_k_rope  + static_cast<int64_t>(t) * kargs.stride_kv_rope_page; };
-    auto kv_scale_ptr = [&](int t) { return p_kv_scale + static_cast<int64_t>(t) * kargs.stride_kv_scale_page; };
+    auto kv_scale_os  = [&](int t) { return t * kargs.stride_kv_scale_page; };
 
     auto async_load_kv = [&](auto slot_n, int token_idx) {
         constexpr int sl = decltype(slot_n)::value;
@@ -804,7 +806,7 @@ __device__ void decode_pipelined(opus_mla_decode_mxfp8_kargs kargs,
         if (warp_id < 4) {
             global_load<T::VEC_KV_ROPE>(kv_rope_ptr(token_idx), s_k_rope.ptr, u_gk_rope, u_sk_rope + number<sl * (T::smem_kv_bytes() / sizeof(D_ROPE))>{});
         } else {
-            global_load<4>(kv_scale_ptr(token_idx), s_k_mxscl.ptr, u_gk_mxscl, u_sk_mxscl + number<sl * (T::smem_mxscl_bytes / sizeof(D_NOPE))>{});
+            async_load<4>(g_kv_scale, s_k_mxscl.ptr, u_gk_mxscl + kv_scale_os(token_idx), u_sk_mxscl + number<sl * (T::smem_mxscl_bytes / sizeof(D_NOPE))>{});
         }
     };
 
