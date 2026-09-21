@@ -14,9 +14,9 @@ struct opus_mla_v4_prefill_kargs {
     const void* __restrict__ attn_sink_ptr;  // [H], softmax denominator sink
     void* __restrict__ out_ptr;              // [N, H, D]
     const int* __restrict__ kv_indptr_prefix;  // [N+1]
-    const int* __restrict__ kv_indices_prefix; // [indices_prefix_sum_prefix]
+    const int* __restrict__ kv_indices_prefix; // [nnz_prefix]
     const int* __restrict__ kv_indptr_extend;  // [N+1]
-    const int* __restrict__ kv_indices_extend; // [indices_prefix_sum_extend]
+    const int* __restrict__ kv_indices_extend; // [nnz_extend]
     int N;
     int H;
     int D;

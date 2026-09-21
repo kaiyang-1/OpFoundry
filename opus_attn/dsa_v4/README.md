@@ -17,7 +17,7 @@ Each architecture ships its own kernel set: gfx950 uses wave64 MFMA with two wav
 - gfx950 kernels: MFMA, double-buffered K/V shared-memory tiles, FP32 accumulation.
 - gfx1250 kernels: WMMA, TDM gather straight into LDS, multi-buffered K/V tiles, and an optional 2-workgroup cluster that multicasts the shared K/V tile.
 - MXFP8 variant: head dimension split into NoPE (448 fp8 elements with E8M0 block scales every 32) and RoPE (64 bf16). NoPE QK^T uses scaled `f8f6f4` 16x16x128 MFMA/WMMA; RoPE QK^T and PV use bf16 16x16x32.
-- Standalone host harness with random sparse/dense index generation and CPU reference validation for both BF16 and MXFP8 paths.
+- Standalone host harness: seeded page-table and tensor generation, plus CPU reference validation for both BF16 and MXFP8 paths.
 
 ## Files
 
@@ -94,7 +94,7 @@ The kernel assumes row-major contiguous layout with `D` as the fastest-changing 
 
 ### MXFP8 split layout
 
-The MXFP8 variants (`opus_mla_v4_prefill_fp8_kargs`) replace each BF16 Q/K/V row with two streams. The NoPE stream packs, per padded row of `D_NOPE_PADDED = 512` fp8 slots: `[ NoPE fp8 (448) | E8M0 block scales (448/32 = 14) | fp8 zero-pad ]`; the RoPE stream holds `D_ROPE = 64` bf16 elements. The two streams reconstruct the same `D = 512` head (`448 + 64`). Output `O` stays `[N, H_Q, 512]` bf16.
+The MXFP8 variants (`opus_mla_v4_prefill_fp8_kargs`) replace each BF16 Q/K/V row with two streams. The NoPE stream packs, per padded row of `D_NOPE_PADDED = 512` fp8 slots: `[ NoPE fp8 (448) | E8M0 block scales (448/32 = 14) | 50 unused bytes ]`; the RoPE stream holds `D_ROPE = 64` bf16 elements. The kernel masks the pad off itself, so it may hold anything. The two streams reconstruct the same `D = 512` head (`448 + 64`). Output `O` stays `[N, H_Q, 512]` bf16.
 
 | Tensor | Shape | Notes |
 | --- | --- | --- |
@@ -159,13 +159,9 @@ Only the gfx1250 kernels are compiled with `-mllvm -amdgpu-expert-scheduling-mod
 Run with the DeepSeek-V4 MLA shape:
 
 ```bash
-# BF16
-./build/gfx950/mla_v4_prefill.exe -h_q 128 -n 256 -total_pages 1024 -total_tokens 2048 --verify
-# MXFP8 (split NoPE fp8 / RoPE bf16)
-./build/gfx950/mla_v4_prefill.exe -dtype fp8 -h_q 16 -n 256 -total_pages 1024 -total_tokens 2048 --verify
+./build/gfx1250/mla_v4_prefill.exe
+./build/gfx1250/mla_v4_prefill.exe -dtype fp8 -h_q 128 -n 256 --verify
 ```
-
-`make verify` sweeps every dispatch branch of the current `ARCH`, running `--verify` over `VERIFY_DTYPES = bf16 fp8` × `VERIFY_HQ = 16 32 64 128`; both are overridable on the command line.
 
 Useful options:
 
@@ -173,13 +169,15 @@ Useful options:
 | --- | --- | --- |
 | `-dtype` | `bf16` | Input precision: `bf16` or `fp8`. `fp8` selects the MXFP8 split variant. |
 | `-h_q` | `128` | Number of query heads. Supports arbitrary positive values; also selects the wave layout on both architectures, and the cluster size on gfx1250. |
-| `-n` | `1024` | Number of query tokens in the standalone harness. |
-| `-total_pages` | `N` | Number of prefix rows in `UnifiedKV`. |
-| `-total_tokens` | `N` | Number of extend rows in `KV`. |
-| `--dense` | off | Generate dense CSR rows instead of random sparse rows. |
+| `-n` | `4096` | Number of query tokens in the prefill chunk. |
+| `-topk` | `1024` | Rows each query token selects from each range. Clamped to that range; `0` selects all of it, giving a dense page table. |
+| `-total_pages` | `max(N, topk, 65536)` | Prefix cache size, and the main control over how much of the KV gather cache can serve. Nothing derives it from the other options, hence the floor. |
+| `-total_tokens` | `N` | Extend rows in `KV`, tied to `N` because the extend range is the chunk's own K/V. Larger only adds rows the causal ramp cannot reach; smaller caps the ramp early. |
 | `--verify` | off | Compare GPU output against the CPU reference implementation. |
 
-The harness initializes random BF16 attention tensors and random per-head sink scores, generates prefix and extend CSR index ranges, launches the kernel, optionally checks the result against the CPU reference in `mla_v4_host.cc` (`mla_v4_attention_ref()` for bf16, `mla_v4_attention_ref_fp8()` for the MXFP8 split path), and then reports benchmark timing (TFLOPs and effective TB/s). The reference runs on `std::thread` workers rather than OpenMP; set `MLA_V4_NUM_THREADS` to override the worker count.
+Prefix rows are visible to every token, so each one selects `min(topk, total_pages)`. Extend rows are the chunk's own K/V, so token `i` draws from `[0, i]` and gets `min(topk, i + 1)` — a ramp that walks every row length below the budget, and with it every KV-tile remainder the kernel masks. The budget applies per range, so a deep token gets up to `2 * topk` rows. Setting either range to `0` empties it, as in a sequence's first chunk.
+
+Every element and index derives from a fixed seed and its own index, so a shape reproduces bit-exactly across runs, machines and worker counts. Selected pages stay scattered, since sorting would hand the gather a near-sequential read that no real page table provides. The CPU reference runs on `std::thread` workers rather than OpenMP; set `MLA_V4_NUM_THREADS` to override the worker count.
 
 ## Integration Notes
 

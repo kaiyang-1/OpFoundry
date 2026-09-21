@@ -1,4 +1,3 @@
-// Host-only: benchmark harness, CPU reference, main()
 #include <hip/hip_fp8.h>
 #include <opus/hip_minimal.hpp>
 #include <algorithm>
@@ -27,7 +26,6 @@ __global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_
 template<class Traits>
 __global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
 
-// Launch wrappers — overloaded on the trait type so each selects its own kernel.
 template<int Q, int KV, int D, int NW, class DT, class DO>
 inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>,
                                   const opus_mla_v4_prefill_kargs& kargs, dim3 grid, dim3 block) {
@@ -151,142 +149,168 @@ inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<Q,
 
 #define CHECK_HIP_KERNEL_LAUNCH() CHECK_HIP(hipGetLastError())
 
-// Fill a contiguous vector with random values
+template<class T>
+struct dev_buf {
+    T* ptr = nullptr;
+
+    explicit dev_buf(size_t count) {
+        CHECK_HIP(hipMalloc(&ptr, std::max<size_t>(count, 1) * sizeof(T)));
+    }
+    dev_buf(const dev_buf&) = delete;
+    dev_buf& operator=(const dev_buf&) = delete;
+    ~dev_buf() { if (ptr) (void)hipFree(ptr); }
+
+    void upload(const T* src, size_t count) {
+        if (count) CHECK_HIP(hipMemcpy(ptr, src, count * sizeof(T), hipMemcpyHostToDevice));
+    }
+    void download(T* dst, size_t count) const {
+        if (count) CHECK_HIP(hipMemcpy(dst, ptr, count * sizeof(T), hipMemcpyDeviceToHost));
+    }
+    void zero(size_t count) {
+        if (count) CHECK_HIP(hipMemset(ptr, 0, count * sizeof(T)));
+    }
+    operator T*() const { return ptr; }
+};
+
+// Fixed grain, so a chunk spans the same elements at any MLA_V4_NUM_THREADS. Hashed
+// rather than seed+index, which would make Q rows bit-identical to KV rows.
+static constexpr size_t MLA_V4_INIT_GRAIN = 65536;
+static constexpr uint64_t MLA_V4_SEED = 2026;
+
+inline std::mt19937 mla_v4_rng(uint64_t seed, uint64_t index) {
+    uint64_t x = seed + 0x9E3779B97F4A7C15ull * (index + 1);
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return std::mt19937(static_cast<uint32_t>(x ^ (x >> 31)));
+}
+
 template<typename T>
-void rand_vector(T* ptr, size_t size, float min_val = 0.0f, float max_val = 1.0f) {
-    mla_v4::parallel_chunks(size, mla_v4::default_grain(size), [&](size_t begin, size_t end, unsigned) {
-        std::random_device rd;
-        std::mt19937 gen(rd() + static_cast<uint32_t>(begin));
-        std::uniform_real_distribution<float> dis(min_val, max_val);
+void rand_vector(T* ptr, size_t size, uint64_t seed) {
+    mla_v4::parallel_for((size + MLA_V4_INIT_GRAIN - 1) / MLA_V4_INIT_GRAIN, [&](size_t c) {
+        const size_t begin = c * MLA_V4_INIT_GRAIN;
+        const size_t end = std::min(begin + MLA_V4_INIT_GRAIN, size);
+        std::mt19937 gen = mla_v4_rng(seed, c);
+        std::normal_distribution<float> dis(0.0f, 1.0f);
         for (size_t i = begin; i < end; i++) {
             ptr[i] = static_cast<T>(dis(gen));
         }
     });
 }
 
-// Initialize the split DSA fp8 streams. The NoPE stream packs, per row of
-// D_NOPE_PADDED_SIZE fp8 slots: [ NoPE fp8 (D_NOPE_SIZE) | E8M0 block scales
-// (D_NOPE_SIZE/32) | fp8 zero-pad ]. The RoPE stream holds D_ROPE_SIZE bf16.
 template<class Traits>
 void init_fp8_dsa_split(typename Traits::D_NOPE* nope_ptr,
-                        typename Traits::D_ROPE* rope_ptr, size_t rows) {
+                        typename Traits::D_ROPE* rope_ptr, size_t rows, uint64_t seed) {
     using D_ROPE = typename Traits::D_ROPE;
-    constexpr int NOPE_PADDED = Traits::D_NOPE_PADDED_SIZE;  // fp8 slots/row (512)
-    constexpr int NOPE        = Traits::D_NOPE_SIZE;         // NoPE fp8 elements (448)
-    constexpr int SCALE       = NOPE / 32;                     // E8M0 scales (14)
-    constexpr int ROPE        = Traits::D_ROPE_SIZE;         // RoPE bf16 elements (64)
+    constexpr int NOPE_PADDED = Traits::D_NOPE_PADDED_SIZE;
+    constexpr int NOPE        = Traits::D_NOPE_SIZE;
+    constexpr int SCALE       = NOPE / 32;
+    constexpr int BLOCK       = NOPE / SCALE;
+    constexpr int ROPE        = Traits::D_ROPE_SIZE;
     static_assert(NOPE + SCALE <= NOPE_PADDED, "NoPE + scales exceed padded row");
 
-    mla_v4::parallel_chunks(rows, mla_v4::default_grain(rows), [&](size_t begin, size_t end, unsigned) {
-        std::random_device rd;
-        std::mt19937 gen(rd() + static_cast<uint32_t>(begin));
-        std::uniform_real_distribution<float> dis(-2.0f, 2.0f);
-        std::uniform_real_distribution<float> scale_dis(-4.0f, 4.0f);
+    mla_v4::parallel_for((rows + MLA_V4_INIT_GRAIN - 1) / MLA_V4_INIT_GRAIN, [&](size_t c) {
+        const size_t begin = c * MLA_V4_INIT_GRAIN;
+        const size_t end = std::min(begin + MLA_V4_INIT_GRAIN, rows);
+        std::mt19937 gen = mla_v4_rng(seed, c);
+        std::normal_distribution<float> dis(0.0f, 1.0f);
+        std::uniform_int_distribution<int> scale_exp_dis(0, 3);
         for (size_t r = begin; r < end; r++) {
             unsigned char* nbase = reinterpret_cast<unsigned char*>(nope_ptr) + r * NOPE_PADDED;
             auto* nope = reinterpret_cast<__hip_fp8_e4m3*>(nbase);
-            for (int i = 0; i < NOPE; i++) nope[i] = static_cast<__hip_fp8_e4m3>(dis(gen));
             unsigned char* scale = nbase + NOPE;
-            for (int i = 0; i < SCALE; i++) {
-                float s = std::exp2(scale_dis(gen));
-                uint32_t bits; std::memcpy(&bits, &s, sizeof(bits));
-                scale[i] = static_cast<unsigned char>((bits >> 23) & 0xFF);
+            for (int b = 0; b < SCALE; b++) {
+                const int e = scale_exp_dis(gen);
+                scale[b] = static_cast<unsigned char>(e + 127);
+                const float inv_scale = std::ldexp(1.0f, -e);
+                for (int i = 0; i < BLOCK; i++)
+                    nope[b * BLOCK + i] = static_cast<__hip_fp8_e4m3>(dis(gen) * inv_scale);
             }
-            for (int i = NOPE + SCALE; i < NOPE_PADDED; i++) nbase[i] = 0;
+            // 0xFF is NaN as both e4m3 and E8M0: the kernel masks the pad off itself.
+            for (int i = NOPE + SCALE; i < NOPE_PADDED; i++) nbase[i] = 0xFF;
             D_ROPE* rope = rope_ptr + r * ROPE;
             for (int i = 0; i < ROPE; i++) rope[i] = static_cast<D_ROPE>(dis(gen));
         }
     });
 }
 
-void init_sparse_kv_indices(std::vector<int>& kv_indptr,
-                            std::vector<int>& kv_indices,
-                            int N,
-                            int total_pages,
-                            int kv_tile_size,
-                            uint32_t seed = 1234) {
+// Leave the pages scattered: sorting gives the gather a near-sequential read that no
+// real page table provides.
+void init_kv_page_table(std::vector<int>& kv_indptr,
+                        std::vector<int>& kv_indices,
+                        int N,
+                        int pool_rows,
+                        int topk,
+                        bool causal,
+                        uint64_t seed) {
     assert(N >= 0);
-    assert(total_pages > 0);
-    assert(kv_tile_size > 0);
+    assert(pool_rows >= 0);
+
+    const int budget = (topk <= 0 || topk > pool_rows) ? pool_rows : topk;
+    auto candidates = [&](int q) { return causal ? std::min(q + 1, pool_rows) : pool_rows; };
 
     kv_indptr.assign(N + 1, 0);
-    kv_indices.clear();
-
-    std::mt19937 gen(seed);
-    std::vector<int> pages(total_pages);
-    std::iota(pages.begin(), pages.end(), 0);
-
-    auto clamp_len = [&](int len) {
-        return std::max(0, std::min(len, total_pages));
-    };
-
-    const std::vector<int> boundary_lengths = {
-        0,
-        1,
-        kv_tile_size - 1,
-        kv_tile_size,
-        kv_tile_size + 1,
-        2 * kv_tile_size,
-        2 * kv_tile_size + 1,
-        total_pages
-    };
-    std::uniform_int_distribution<int> random_len(0, total_pages);
-
     for (int q = 0; q < N; ++q) {
-        int nnz = 0;
-        if (q < static_cast<int>(boundary_lengths.size())) {
-            nnz = clamp_len(boundary_lengths[q]);
-        } else {
-            nnz = random_len(gen);
-        }
-
-        std::shuffle(pages.begin(), pages.end(), gen);
-        const size_t seg_begin = kv_indices.size();
-        kv_indices.insert(kv_indices.end(), pages.begin(), pages.begin() + nnz);
-        std::sort(kv_indices.begin() + seg_begin, kv_indices.end());
-        assert(kv_indices.size() <= static_cast<size_t>(std::numeric_limits<int>::max()));
-        kv_indptr[q + 1] = static_cast<int>(kv_indices.size());
+        const int nnz = std::min(budget, candidates(q));
+        const size_t end = static_cast<size_t>(kv_indptr[q]) + static_cast<size_t>(nnz);
+        assert(end <= static_cast<size_t>(std::numeric_limits<int>::max()));
+        kv_indptr[q + 1] = static_cast<int>(end);
     }
 
-    assert(kv_indptr.front() == 0);
-    assert(kv_indptr.back() == static_cast<int>(kv_indices.size()));
-    for (int q = 0; q < N; ++q) {
-        assert(kv_indptr[q] <= kv_indptr[q + 1]);
-        for (int p = kv_indptr[q]; p < kv_indptr[q + 1]; ++p) {
-            assert(kv_indices[p] >= 0 && kv_indices[p] < total_pages);
-            if (p > kv_indptr[q])
-                assert(kv_indices[p] >= kv_indices[p - 1]);
+    kv_indices.resize(static_cast<size_t>(kv_indptr[N]));
+    const size_t grain = std::max<size_t>(1, ceil_div(N, static_cast<int>(mla_v4::num_threads())));
+    mla_v4::parallel_chunks(static_cast<size_t>(N), grain, [&](size_t begin, size_t end, unsigned) {
+        std::vector<int> perm(static_cast<size_t>(pool_rows));
+        std::iota(perm.begin(), perm.end(), 0);
+        for (size_t q = begin; q < end; ++q) {
+            int* row = kv_indices.data() + kv_indptr[q];
+            const int nnz = kv_indptr[q + 1] - kv_indptr[q];
+            const int range = candidates(static_cast<int>(q));
+            std::mt19937 gen = mla_v4_rng(seed, static_cast<uint64_t>(q) + (1ull << 32));
+            for (int i = 0; i < nnz; ++i) {
+                const int j = i + static_cast<int>(gen() % static_cast<uint32_t>(range - i));
+                std::swap(perm[i], perm[j]);
+                row[i] = perm[i];
+            }
+            // Undo the swaps: the next row must draw from a clean identity permutation.
+            for (int i = 0; i < nnz; ++i) perm[i] = i;
+            for (int i = 0; i < nnz; ++i) perm[row[i]] = row[i];
         }
+    });
+}
+
+inline std::vector<uint8_t> mla_v4_poison_mask(int pool_rows, const std::vector<int>& kv_indices) {
+    std::vector<uint8_t> poison(static_cast<size_t>(pool_rows), 1);
+    for (int idx : kv_indices) poison[static_cast<size_t>(idx)] = 0;
+    return poison;
+}
+
+template<class Traits>
+void poison_kv_rows(typename Traits::D_ATTN* kv, int pool_rows,
+                    const std::vector<int>& kv_indices) {
+    constexpr int ROW = Traits::D_TILE_SIZE;
+    const auto nan = static_cast<typename Traits::D_ATTN>(std::numeric_limits<float>::quiet_NaN());
+    const auto poison = mla_v4_poison_mask(pool_rows, kv_indices);
+    for (size_t r = 0; r < poison.size(); ++r)
+        if (poison[r]) std::fill_n(kv + r * ROW, ROW, nan);
+}
+
+template<class Traits>
+void poison_kv_rows_fp8(typename Traits::D_NOPE* nope_ptr, typename Traits::D_ROPE* rope_ptr,
+                        int pool_rows, const std::vector<int>& kv_indices) {
+    constexpr int NOPE_PADDED = Traits::D_NOPE_PADDED_SIZE;
+    constexpr int ROPE = Traits::D_ROPE_SIZE;
+    const auto nan = static_cast<typename Traits::D_ROPE>(std::numeric_limits<float>::quiet_NaN());
+    const auto poison = mla_v4_poison_mask(pool_rows, kv_indices);
+    for (size_t r = 0; r < poison.size(); ++r) {
+        if (!poison[r]) continue;
+        std::memset(reinterpret_cast<unsigned char*>(nope_ptr) + r * NOPE_PADDED, 0xFF, NOPE_PADDED);
+        std::fill_n(rope_ptr + r * ROPE, ROPE, nan);
     }
 }
 
-void init_dense_kv_indices(std::vector<int>& kv_indptr,
-                           std::vector<int>& kv_indices,
-                           int N,
-                           int total_pages) {
-    assert(N >= 0);
-    assert(total_pages > 0);
-    const size_t total_indices = static_cast<size_t>(N) * total_pages;
-    assert(total_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
-
-    kv_indptr.resize(N + 1);
-    kv_indices.resize(total_indices);
-
-    for (int q = 0; q <= N; ++q) {
-        kv_indptr[q] = static_cast<int>(static_cast<size_t>(q) * total_pages);
-    }
-    for (int q = 0; q < N; ++q) {
-        const size_t row_begin = static_cast<size_t>(q) * total_pages;
-        for (int page = 0; page < total_pages; ++page) {
-            kv_indices[row_begin + page] = page;
-        }
-    }
-}
-
-// Benchmark MLA-v4 kernel performance with warm-up and timing
 template<class Traits, class KArgs>
 void benchmark_mla_v4_kernel(const KArgs& kargs, dim3 grid, dim3 block,
-                             int indices_prefix_sum, int warmup = 100, int iterations = 50) {
+                             int total_kv_rows, int warmup = 100, int iterations = 50) {
     for (int i = 0; i < warmup; ++i) {
         mla_v4_prefill_launch(Traits{}, kargs, grid, block);
         CHECK_HIP_KERNEL_LAUNCH();
@@ -315,13 +339,11 @@ void benchmark_mla_v4_kernel(const KArgs& kargs, dim3 grid, dim3 block,
 
     using D_ATTN = typename Traits::D_ATTN;
     using D_OUT  = typename Traits::D_OUT;
-    constexpr int D_HEAD = Traits::D_HEAD_SIZE;  // logical head dim (NoPE + RoPE), e.g. 512
+    constexpr int D_HEAD = Traits::D_HEAD_SIZE;
 
-    // FLOPs: per (query, kv, head) -> QK^T (2*D_HEAD) + PV (2*D_HEAD).
-    const double flops = 4.0 * kargs.H * indices_prefix_sum * D_HEAD;
+    const double flops = 4.0 * kargs.H * total_kv_rows * D_HEAD;
     const double tflops = flops / (avg_time * 1e-3) / 1e12;
 
-    // Bandwidth: Q read (packed row) + O write (bf16) + KV read (packed row), each its own dtype.
     size_t row_bytes;
     if constexpr (std::is_same_v<KArgs, opus_mla_v4_prefill_fp8_kargs>) {
         row_bytes = (size_t)Traits::D_NOPE_PADDED_SIZE * sizeof(typename Traits::D_NOPE)
@@ -331,21 +353,20 @@ void benchmark_mla_v4_kernel(const KArgs& kargs, dim3 grid, dim3 block,
     }
     const size_t q_bytes  = (size_t)kargs.N * kargs.H * row_bytes;
     const size_t o_bytes  = (size_t)kargs.N * kargs.H * D_HEAD * sizeof(D_OUT);
-    const size_t kv_bytes = (size_t)indices_prefix_sum * row_bytes;
+    const size_t kv_bytes = (size_t)total_kv_rows * row_bytes;
     const double tbps = double(q_bytes + o_bytes + kv_bytes) / (avg_time * 1e-3) / 1e12;
 
     printf("MLA-v4 Prefill Kernel Performance: avg_time=%.3f ms, %.2f TFlops, %.2f TB/s\n",
            avg_time, tflops, tbps);
 }
 
-// Validate GPU results against CPU reference.
 template<typename DType>
-bool validate_pa_results(const DType* ref, const DType* gpu,
-                          int N, int H, int D,
-                          float rtol = 1e-2f, float atol = 1e-2f,
-                          float tol_err_ratio = 0.05f) {
+bool validate_mla_v4_results(const DType* ref, const DType* gpu,
+                             int N, int H, int D,
+                             float rtol = 1e-2f, float atol = 1e-2f,
+                             float tol_err_ratio = 0.05f) {
     const size_t total_elements = (size_t)N * H * D;
-    constexpr size_t printNum = 10;
+    constexpr size_t print_limit = 10;
 
     size_t total_errors = 0, printed = 0;
     bool any_nan = false;
@@ -364,12 +385,14 @@ bool validate_pa_results(const DType* ref, const DType* gpu,
                 sq_diff_sum += double(delta) * double(delta);
                 ref_sq_sum  += double(ref_val) * double(ref_val);
 
-                const bool nan_inf = std::isnan(gpu_val) || std::isinf(gpu_val);
+                // Ref too: a NaN delta compares false and would pass silently.
+                const bool nan_inf = std::isnan(gpu_val) || std::isinf(gpu_val)
+                                  || std::isnan(ref_val) || std::isinf(ref_val);
                 any_nan |= nan_inf;
                 if (nan_inf || delta > atol + rtol * std::abs(ref_val)) {
                     total_errors++;
                     max_abs_delta = std::max(max_abs_delta, delta);
-                    if (printed++ < printNum)
+                    if (printed++ < print_limit)
                         printf("  mismatch [n=%d,h=%d,d=%d] ref=%.6f gpu=%.6f delta=%.6f\n",
                                n, h, d, ref_val, gpu_val, delta);
                 }
@@ -378,7 +401,7 @@ bool validate_pa_results(const DType* ref, const DType* gpu,
     }
 
     const double err_ratio    = double(total_errors) / double(total_elements);
-    const double nrms         = std::sqrt(sq_diff_sum / std::max(ref_sq_sum, 1e-12));  // ||gpu-ref|| / ||ref||
+    const double nrms         = std::sqrt(sq_diff_sum / std::max(ref_sq_sum, 1e-12));
     const bool   catastrophic = any_nan || max_abs_delta > 0.5f * ref_absmax;
     const bool   all_valid    = !catastrophic && err_ratio <= tol_err_ratio;
 
@@ -396,14 +419,12 @@ bool validate_pa_results(const DType* ref, const DType* gpu,
     return all_valid;
 }
 
-// Reconstruct one bf16 stored row into a dense float[D_HEAD_SIZE].
 template<class Traits>
 inline void decode_dsa_row_bf16(const typename Traits::D_ATTN* row, float* out) {
     constexpr int D_HEAD = Traits::D_HEAD_SIZE;
     for (int d = 0; d < D_HEAD; d++) out[d] = static_cast<float>(row[d]);
 }
 
-// Reconstruct one split fp8 row (NoPE+scales fp8 stream, RoPE bf16 stream) into dense float.
 template<class Traits>
 inline void decode_dsa_row_fp8(const typename Traits::D_NOPE* nrow,
                                const typename Traits::D_ROPE* rrow, float* out) {
@@ -411,21 +432,13 @@ inline void decode_dsa_row_fp8(const typename Traits::D_NOPE* nrow,
     constexpr int ROPE = Traits::D_ROPE_SIZE;
     const auto* base = reinterpret_cast<const unsigned char*>(nrow);
     const auto* nope = reinterpret_cast<const __hip_fp8_e4m3*>(base);
-    const unsigned char* scale = base + NOPE;  // raw E8M0 bytes
+    const unsigned char* scale = base + NOPE;
     for (int d = 0; d < NOPE; d++)
         out[d] = static_cast<float>(nope[d]) * std::ldexp(1.0f, int(scale[d / 32]) - 127);
     for (int j = 0; j < ROPE; j++)
         out[NOPE + j] = static_cast<float>(rrow[j]);
 }
 
-// ─── CPU reference ──────────────────────────
-//
-// Sparse scaled-dot-product attention over two CSR ranges:
-//   prefix rows index UnifiedKV[total_pages, D]
-//   extend rows index KV[total_tokens, D]
-//   O[i,h,:] = softmax(Q[i,h,:] @ concat(prefix, extend)^T * softmax_scale) @ concat(prefix, extend)
-//
-// Softmax + PV for one (query, head) over already-dequantized dense rows.
 template<class Traits>
 inline void mla_v4_attention_compute(const float* q_dense, const float* kv_dense, int num_rows,
                                      float sink, typename Traits::D_OUT* o_row) {
@@ -445,7 +458,7 @@ inline void mla_v4_attention_compute(const float* q_dense, const float* kv_dense
     for (int p = 0; p < num_rows; p++) { scores[p] = std::exp(scores[p] - max_score); sum_exp += scores[p]; }
     sum_exp += std::exp(sink - max_score);
     for (int p = 0; p < num_rows; p++)
-        scores[p] = static_cast<float>(static_cast<bf16_t>(scores[p] / sum_exp));  // P rounded to bf16
+        scores[p] = static_cast<float>(static_cast<bf16_t>(scores[p] / sum_exp));
     for (int d = 0; d < D_HEAD; d++) {
         float acc = 0.0f;
         for (int p = 0; p < num_rows; p++) acc += scores[p] * kv_dense[(size_t)p * D_HEAD + d];
@@ -455,11 +468,11 @@ inline void mla_v4_attention_compute(const float* q_dense, const float* kv_dense
 
 template<class Traits>
 void mla_v4_attention_ref(
-    const typename Traits::D_ATTN* Q,         // [N, H, ROW]  (ROW = D_TILE_SIZE storage stride)
-    const typename Traits::D_ATTN* UnifiedKV, // [total_pages, ROW]
-    const typename Traits::D_ATTN* KV,        // [total_tokens, ROW]
-    const float*  AttnSink,                     // [H]
-    typename Traits::D_OUT* O,                // [N, H, D_HEAD]
+    const typename Traits::D_ATTN* Q,
+    const typename Traits::D_ATTN* UnifiedKV,
+    const typename Traits::D_ATTN* KV,
+    const float* AttnSink,
+    typename Traits::D_OUT* O,
     const int* kv_indptr_prefix,
     const int* kv_indices_prefix,
     const int* kv_indptr_extend,
@@ -505,7 +518,6 @@ void mla_v4_attention_ref(
     });
 }
 
-// fp8 reference operating on the split NoPE (fp8) and RoPE (bf16) streams.
 template<class Traits>
 void mla_v4_attention_ref_fp8(
     const typename Traits::D_NOPE* Q_nope, const typename Traits::D_ROPE* Q_rope,
@@ -559,17 +571,15 @@ void mla_v4_attention_ref_fp8(
     });
 }
 
-// ─── main ───────────────────────────────────────────────────────────────────
-
 template<class Traits>
 int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
-                            bool verify, bool dense_kv) {
-    using DType = typename Traits::D_ATTN;   // input storage dtype (fp8 packed, or bf16)
-    using OType = typename Traits::D_OUT;     // output dtype (default bf16)
+                            int topk, bool verify) {
+    using DType = typename Traits::D_ATTN;
+    using OType = typename Traits::D_OUT;
     constexpr bool is_fp8 = std::is_same_v<DType, fp8_t> || std::is_same_v<DType, bf8_t>;
     const char* precision = is_fp8 ? "NoPE=fp8, RoPE=bf16" : "NoPE=bf16, RoPE=bf16";
-    printf("MLA-v4 Prefill Attention: H_Q=%d, N=%d, D=%d, %s, total_pages=%d, total_tokens=%d\n",
-           H, N, Traits::D_HEAD_SIZE, precision, total_pages, total_tokens);
+    printf("MLA-v4 Prefill Attention: H_Q=%d, N=%d, D=%d, %s, total_pages=%d, total_tokens=%d, topk=%d\n",
+           H, N, Traits::D_HEAD_SIZE, precision, total_pages, total_tokens, topk);
 
     constexpr int D_HEAD = Traits::D_HEAD_SIZE;
     const size_t o_size = (size_t)N * H * D_HEAD;
@@ -577,46 +587,39 @@ int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
     auto host_attn_sink = std::make_unique<float[]>(H);
     auto host_o_ref = std::make_unique<OType[]>(o_size);
     auto host_o_gpu = std::make_unique<OType[]>(o_size);
-    rand_vector(host_attn_sink.get(), H, -2.f, 2.f);
+    const uint64_t seed_sink = MLA_V4_SEED + 1, seed_q = MLA_V4_SEED + 2, seed_ukv = MLA_V4_SEED + 3,
+                   seed_kv = MLA_V4_SEED + 4, seed_idx_prefix = MLA_V4_SEED + 5,
+                   seed_idx_extend = MLA_V4_SEED + 6;
+    rand_vector(host_attn_sink.get(), H, seed_sink);
 
     std::vector<int> host_kv_indptr_prefix, host_kv_indices_prefix;
     std::vector<int> host_kv_indptr_extend, host_kv_indices_extend;
-    if (dense_kv) {
-        init_dense_kv_indices(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages);
-        init_dense_kv_indices(host_kv_indptr_extend, host_kv_indices_extend, N, total_tokens);
-    } else {
-        init_sparse_kv_indices(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages, Traits::KV_TILE_SIZE, 1234);
-        init_sparse_kv_indices(host_kv_indptr_extend, host_kv_indices_extend, N, total_tokens, Traits::KV_TILE_SIZE, 5678);
-    }
+    init_kv_page_table(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages, topk,
+                       /*causal=*/false, seed_idx_prefix);
+    init_kv_page_table(host_kv_indptr_extend, host_kv_indices_extend, N, total_tokens, topk,
+                       /*causal=*/true, seed_idx_extend);
     const size_t total_kv_indices = host_kv_indices_prefix.size() + host_kv_indices_extend.size();
     assert(total_kv_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
-    const int indices_prefix_sum = static_cast<int>(total_kv_indices);
+    const int total_kv_rows = static_cast<int>(total_kv_indices);
 
-    float *dev_attn_sink;
-    OType *dev_o;
-    int *dev_kv_indptr_prefix, *dev_kv_indices_prefix, *dev_kv_indptr_extend, *dev_kv_indices_extend;
-    const size_t kv_indices_prefix_alloc_size = std::max<size_t>(host_kv_indices_prefix.size(), 1);
-    const size_t kv_indices_extend_alloc_size = std::max<size_t>(host_kv_indices_extend.size(), 1);
-    CHECK_HIP(hipMalloc(&dev_attn_sink, H * sizeof(float)));
-    CHECK_HIP(hipMalloc(&dev_o, o_size * sizeof(OType)));
-    CHECK_HIP(hipMemset(dev_o, 0, o_size * sizeof(OType)));
-    CHECK_HIP(hipMalloc(&dev_kv_indptr_prefix, host_kv_indptr_prefix.size() * sizeof(int)));
-    CHECK_HIP(hipMalloc(&dev_kv_indices_prefix, kv_indices_prefix_alloc_size * sizeof(int)));
-    CHECK_HIP(hipMalloc(&dev_kv_indptr_extend, host_kv_indptr_extend.size() * sizeof(int)));
-    CHECK_HIP(hipMalloc(&dev_kv_indices_extend, kv_indices_extend_alloc_size * sizeof(int)));
-    CHECK_HIP(hipMemcpy(dev_attn_sink, host_attn_sink.get(), H * sizeof(float), hipMemcpyHostToDevice));
-    CHECK_HIP(hipMemcpy(dev_kv_indptr_prefix, host_kv_indptr_prefix.data(), host_kv_indptr_prefix.size() * sizeof(int), hipMemcpyHostToDevice));
-    CHECK_HIP(hipMemcpy(dev_kv_indptr_extend, host_kv_indptr_extend.data(), host_kv_indptr_extend.size() * sizeof(int), hipMemcpyHostToDevice));
-    if (!host_kv_indices_prefix.empty())
-        CHECK_HIP(hipMemcpy(dev_kv_indices_prefix, host_kv_indices_prefix.data(), host_kv_indices_prefix.size() * sizeof(int), hipMemcpyHostToDevice));
-    if (!host_kv_indices_extend.empty())
-        CHECK_HIP(hipMemcpy(dev_kv_indices_extend, host_kv_indices_extend.data(), host_kv_indices_extend.size() * sizeof(int), hipMemcpyHostToDevice));
+    dev_buf<float> dev_attn_sink(H);
+    dev_buf<OType> dev_o(o_size);
+    dev_buf<int> dev_kv_indptr_prefix(host_kv_indptr_prefix.size());
+    dev_buf<int> dev_kv_indices_prefix(host_kv_indices_prefix.size());
+    dev_buf<int> dev_kv_indptr_extend(host_kv_indptr_extend.size());
+    dev_buf<int> dev_kv_indices_extend(host_kv_indices_extend.size());
+    dev_o.zero(o_size);
+    dev_attn_sink.upload(host_attn_sink.get(), H);
+    dev_kv_indptr_prefix.upload(host_kv_indptr_prefix.data(), host_kv_indptr_prefix.size());
+    dev_kv_indices_prefix.upload(host_kv_indices_prefix.data(), host_kv_indices_prefix.size());
+    dev_kv_indptr_extend.upload(host_kv_indptr_extend.data(), host_kv_indptr_extend.size());
+    dev_kv_indices_extend.upload(host_kv_indices_extend.data(), host_kv_indices_extend.size());
 
     const int num_h_blocks = ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M);
     dim3 grid(N, num_h_blocks, 1);
     dim3 block(Traits::BLOCK_SIZE);
-    printf("MLA-v4 kernel launch config: grid=(%d,%d,%d), block=%d (NUM_WARPS=%d), smem=%zu bytes (K/V tiles)\n",
-           grid.x, grid.y, grid.z, (int)block.x, Traits::NUM_WARPS, Traits::smem_size_bytes());
+    printf("MLA-v4 kernel launch config: grid=(%d,%d,%d), block=%d, smem=%zu bytes\n",
+           grid.x, grid.y, grid.z, (int)block.x, Traits::smem_size_bytes());
 
     int rc = 0;
     auto verify_and_bench = [&](const auto& kargs) {
@@ -624,14 +627,14 @@ int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
         CHECK_HIP_KERNEL_LAUNCH();
         if (verify) {
             printf("\nValidating GPU results against CPU reference...\n");
-            CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, o_size * sizeof(OType), hipMemcpyDeviceToHost));
-            bool all_valid = validate_pa_results<OType>(host_o_ref.get(), host_o_gpu.get(), N, H, D_HEAD);
+            dev_o.download(host_o_gpu.get(), o_size);
+            bool all_valid = validate_mla_v4_results<OType>(host_o_ref.get(), host_o_gpu.get(), N, H, D_HEAD);
             printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
             if (!all_valid) rc = 1;
         }
         if (!rc) {
             printf("\n");
-            benchmark_mla_v4_kernel<Traits>(kargs, grid, block, indices_prefix_sum);
+            benchmark_mla_v4_kernel<Traits>(kargs, grid, block, total_kv_rows);
             printf("\n");
         }
     };
@@ -651,24 +654,26 @@ int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
         auto host_ukv_rope = std::make_unique<D_ROPE[]>(ukv_rope_size);
         auto host_kv_nope = std::make_unique<D_NOPE[]>(kv_nope_size);
         auto host_kv_rope = std::make_unique<D_ROPE[]>(kv_rope_size);
-        init_fp8_dsa_split<Traits>(host_q_nope.get(), host_q_rope.get(), (size_t)N * H);
-        init_fp8_dsa_split<Traits>(host_ukv_nope.get(), host_ukv_rope.get(), (size_t)total_pages);
-        init_fp8_dsa_split<Traits>(host_kv_nope.get(), host_kv_rope.get(), (size_t)total_tokens);
+        init_fp8_dsa_split<Traits>(host_q_nope.get(), host_q_rope.get(), (size_t)N * H, seed_q);
+        init_fp8_dsa_split<Traits>(host_ukv_nope.get(), host_ukv_rope.get(), (size_t)total_pages, seed_ukv);
+        init_fp8_dsa_split<Traits>(host_kv_nope.get(), host_kv_rope.get(), (size_t)total_tokens, seed_kv);
+        poison_kv_rows_fp8<Traits>(host_ukv_nope.get(), host_ukv_rope.get(), total_pages,
+                                   host_kv_indices_prefix);
+        poison_kv_rows_fp8<Traits>(host_kv_nope.get(), host_kv_rope.get(), total_tokens,
+                                   host_kv_indices_extend);
 
-        D_NOPE *dev_q_nope, *dev_ukv_nope, *dev_kv_nope;
-        D_ROPE *dev_q_rope, *dev_ukv_rope, *dev_kv_rope;
-        CHECK_HIP(hipMalloc(&dev_q_nope, q_nope_size * sizeof(D_NOPE)));
-        CHECK_HIP(hipMalloc(&dev_q_rope, q_rope_size * sizeof(D_ROPE)));
-        CHECK_HIP(hipMalloc(&dev_ukv_nope, ukv_nope_size * sizeof(D_NOPE)));
-        CHECK_HIP(hipMalloc(&dev_ukv_rope, ukv_rope_size * sizeof(D_ROPE)));
-        CHECK_HIP(hipMalloc(&dev_kv_nope, kv_nope_size * sizeof(D_NOPE)));
-        CHECK_HIP(hipMalloc(&dev_kv_rope, kv_rope_size * sizeof(D_ROPE)));
-        CHECK_HIP(hipMemcpy(dev_q_nope, host_q_nope.get(), q_nope_size * sizeof(D_NOPE), hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(dev_q_rope, host_q_rope.get(), q_rope_size * sizeof(D_ROPE), hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(dev_ukv_nope, host_ukv_nope.get(), ukv_nope_size * sizeof(D_NOPE), hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(dev_ukv_rope, host_ukv_rope.get(), ukv_rope_size * sizeof(D_ROPE), hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(dev_kv_nope, host_kv_nope.get(), kv_nope_size * sizeof(D_NOPE), hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(dev_kv_rope, host_kv_rope.get(), kv_rope_size * sizeof(D_ROPE), hipMemcpyHostToDevice));
+        dev_buf<D_NOPE> dev_q_nope(q_nope_size);
+        dev_buf<D_ROPE> dev_q_rope(q_rope_size);
+        dev_buf<D_NOPE> dev_ukv_nope(ukv_nope_size);
+        dev_buf<D_ROPE> dev_ukv_rope(ukv_rope_size);
+        dev_buf<D_NOPE> dev_kv_nope(kv_nope_size);
+        dev_buf<D_ROPE> dev_kv_rope(kv_rope_size);
+        dev_q_nope.upload(host_q_nope.get(), q_nope_size);
+        dev_q_rope.upload(host_q_rope.get(), q_rope_size);
+        dev_ukv_nope.upload(host_ukv_nope.get(), ukv_nope_size);
+        dev_ukv_rope.upload(host_ukv_rope.get(), ukv_rope_size);
+        dev_kv_nope.upload(host_kv_nope.get(), kv_nope_size);
+        dev_kv_rope.upload(host_kv_rope.get(), kv_rope_size);
 
         if (verify)
             mla_v4_attention_ref_fp8<Traits>(host_q_nope.get(), host_q_rope.get(), host_ukv_nope.get(), host_ukv_rope.get(),
@@ -704,10 +709,6 @@ int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
         kargs.softmax_scale = 1.0f / std::sqrt(static_cast<float>(D_HEAD));
 
         verify_and_bench(kargs);
-
-        CHECK_HIP(hipFree(dev_q_nope));   CHECK_HIP(hipFree(dev_q_rope));
-        CHECK_HIP(hipFree(dev_ukv_nope)); CHECK_HIP(hipFree(dev_ukv_rope));
-        CHECK_HIP(hipFree(dev_kv_nope));  CHECK_HIP(hipFree(dev_kv_rope));
     } else {
         constexpr int D = Traits::D_TILE_SIZE;
         const size_t q_size = (size_t)N * H * D;
@@ -717,17 +718,18 @@ int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
         auto host_q = std::make_unique<DType[]>(q_size);
         auto host_unified_kv = std::make_unique<DType[]>(unified_kv_size);
         auto host_kv = std::make_unique<DType[]>(kv_size);
-        rand_vector(host_q.get(), q_size, -2.f, 2.f);
-        rand_vector(host_unified_kv.get(), unified_kv_size, -2.f, 2.f);
-        rand_vector(host_kv.get(), kv_size, -2.f, 2.f);
+        rand_vector(host_q.get(), q_size, seed_q);
+        rand_vector(host_unified_kv.get(), unified_kv_size, seed_ukv);
+        rand_vector(host_kv.get(), kv_size, seed_kv);
+        poison_kv_rows<Traits>(host_unified_kv.get(), total_pages, host_kv_indices_prefix);
+        poison_kv_rows<Traits>(host_kv.get(), total_tokens, host_kv_indices_extend);
 
-        DType *dev_q, *dev_unified_kv, *dev_kv;
-        CHECK_HIP(hipMalloc(&dev_q, q_size * sizeof(DType)));
-        CHECK_HIP(hipMalloc(&dev_unified_kv, unified_kv_size * sizeof(DType)));
-        CHECK_HIP(hipMalloc(&dev_kv, kv_size * sizeof(DType)));
-        CHECK_HIP(hipMemcpy(dev_q, host_q.get(), q_size * sizeof(DType), hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(dev_unified_kv, host_unified_kv.get(), unified_kv_size * sizeof(DType), hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(dev_kv, host_kv.get(), kv_size * sizeof(DType), hipMemcpyHostToDevice));
+        dev_buf<DType> dev_q(q_size);
+        dev_buf<DType> dev_unified_kv(unified_kv_size);
+        dev_buf<DType> dev_kv(kv_size);
+        dev_q.upload(host_q.get(), q_size);
+        dev_unified_kv.upload(host_unified_kv.get(), unified_kv_size);
+        dev_kv.upload(host_kv.get(), kv_size);
 
         if (verify)
             mla_v4_attention_ref<Traits>(host_q.get(), host_unified_kv.get(), host_kv.get(), host_attn_sink.get(), host_o_ref.get(),
@@ -755,37 +757,28 @@ int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
         kargs.softmax_scale = 1.0f / std::sqrt(static_cast<float>(D_HEAD));
 
         verify_and_bench(kargs);
-
-        CHECK_HIP(hipFree(dev_q));
-        CHECK_HIP(hipFree(dev_unified_kv));
-        CHECK_HIP(hipFree(dev_kv));
     }
-
-    CHECK_HIP(hipFree(dev_attn_sink));
-    CHECK_HIP(hipFree(dev_o));
-    CHECK_HIP(hipFree(dev_kv_indptr_prefix));
-    CHECK_HIP(hipFree(dev_kv_indices_prefix));
-    CHECK_HIP(hipFree(dev_kv_indptr_extend));
-    CHECK_HIP(hipFree(dev_kv_indices_extend));
 
     return rc;
 }
 
-int main(int argc, char** argv) {
-    int H = 128;   // query heads
-    int N = 1024;  // sequence length
-    int total_pages = -1; // rows in unified_kv; default N after parsing
-    int total_tokens = -1; // rows in the per-fwd extend KV tensor; default N
+// 64 MiB of bf16 KV, far past the 4 MiB L2, so the gather is not cache-served.
+static constexpr int MLA_V4_DEFAULT_TOTAL_PAGES = 65536;
 
-    // Parse command line arguments.
+int main(int argc, char** argv) {
+    int H = 128;
+    int N = 4096;
+    int topk = 1024;
+    int total_pages = -1;
+    int total_tokens = -1;
+
     bool verify = false;
-    bool dense_kv = false;
     bool use_fp8 = false;
     auto parse_val = [](const char* arg, const char* flag) -> const char* {
         size_t len = std::strlen(flag);
         if (std::strncmp(arg, flag, len) == 0) {
-            if (arg[len] == '=') return arg + len + 1;       // -flag=value
-            if (arg[len] == '\0') return reinterpret_cast<const char*>(1); // -flag value (next arg)
+            if (arg[len] == '=') return arg + len + 1;
+            if (arg[len] == '\0') return reinterpret_cast<const char*>(1);
         }
         return nullptr;
     };
@@ -793,7 +786,6 @@ int main(int argc, char** argv) {
         const char* arg = argv[i];
         const char* val;
         if (std::strcmp(arg, "--verify") == 0) { verify = true; continue; }
-        if (std::strcmp(arg, "--dense") == 0) { dense_kv = true; continue; }
         if ((val = parse_val(arg, "-dtype"))) {
             const char* dtype_str = (val == reinterpret_cast<const char*>(1))
                                         ? (i + 1 < argc ? argv[++i] : "")
@@ -816,53 +808,58 @@ int main(int argc, char** argv) {
         };
         if (try_parse(H, "-h_q")) continue;
         if (try_parse(N, "-n")) continue;
+        if (try_parse(topk, "-topk")) continue;
         if (try_parse(total_pages, "-total_pages")) continue;
         if (try_parse(total_tokens, "-total_tokens")) continue;
-    }
-    if (total_pages < 0) {
-        total_pages = N;
-    }
-    if (total_tokens < 0) {
-        total_tokens = N;
-    }
-
-    if (H <= 0 || N <= 0 || total_pages <= 0 || total_tokens <= 0) {
-        std::cerr << "Invalid parameters. H_Q,N,total_pages,total_tokens must be positive.\n";
+        std::cerr << "unknown argument '" << arg << "'\n";
         return 1;
     }
+    if (total_pages < 0)
+        total_pages = topk > 0 ? std::max({N, topk, MLA_V4_DEFAULT_TOTAL_PAGES}) : N;
+    if (total_tokens < 0) total_tokens = N;
+    if (topk <= 0) topk = std::max(total_pages, total_tokens);
+
+    if (H <= 0 || N <= 0 || total_pages < 0 || total_tokens < 0) {
+        std::cerr << "Invalid parameters. H_Q,N must be positive and "
+                     "total_pages,total_tokens non-negative.\n";
+        return 1;
+    }
+
+#define RUN_CASE(...)                                                          \
+    run_mla_v4_prefill_case<__VA_ARGS__>(H, N, total_pages, total_tokens, topk, verify)
 
 #if defined(MLA_V4_ARCH_GFX950)
     if (use_fp8) {
         return H <= 32
-            ? run_mla_v4_prefill_case<opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
-            : run_mla_v4_prefill_case<opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+            ? RUN_CASE(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>)
+            : RUN_CASE(opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>);
     }
     return H <= 32
-        ? run_mla_v4_prefill_case<opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv)
-        : run_mla_v4_prefill_case<opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        ? RUN_CASE(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>)
+        : RUN_CASE(opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t, bf16_t>);
 #elif defined(MLA_V4_ARCH_GFX1250)
     const int cluster_y = mla_v4_pick_cluster_y(ceil_div(H, 64));
     if (use_fp8) {
         if (H <= 16) {
-            return run_mla_v4_prefill_case<opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+            return RUN_CASE(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>);
         }
         if (H <= 32) {
-            return run_mla_v4_prefill_case<opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<32, 64, 4, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+            return RUN_CASE(opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<32, 64, 4, fp8_t, bf16_t, bf16_t>);
         }
         switch (cluster_y) {
-            case 2: return run_mla_v4_prefill_case<opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, 2, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
-            default: return run_mla_v4_prefill_case<opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, 1, fp8_t, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+            case 2: return RUN_CASE(opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, 2, fp8_t, bf16_t, bf16_t>);
+            default: return RUN_CASE(opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, 1, fp8_t, bf16_t, bf16_t>);
         }
     }
     if (H <= 16) {
-        return run_mla_v4_prefill_case<opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        return RUN_CASE(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>);
     }
     if (H <= 32) {
-        return run_mla_v4_prefill_case<opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits<32, 64, 512, 4, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        return RUN_CASE(opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits<32, 64, 512, 4, bf16_t, bf16_t>);
     }
     switch (cluster_y) {
-        case 2: return run_mla_v4_prefill_case<opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, 2, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
-        default: return run_mla_v4_prefill_case<opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, 1, bf16_t, bf16_t>>(H, N, total_pages, total_tokens, verify, dense_kv);
+        case 2: return RUN_CASE(opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, 2, bf16_t, bf16_t>);
+        default: return RUN_CASE(opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, 1, bf16_t, bf16_t>);
     }
 #endif
 }
