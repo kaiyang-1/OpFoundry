@@ -2,18 +2,25 @@ OPUS_INCLUDE_DIR ?= /path/to/aiter/csrc/include
 HIPCC           ?= /opt/rocm/bin/hipcc
 ARCH            ?= gfx950
 
-COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -pthread -O3 -Wall --offload-arch=$(ARCH)
+ifeq ($(wildcard $(ARCH)/traits.h),)
+$(error unknown ARCH '$(ARCH)'; available: $(patsubst %/traits.h,%,$(wildcard */traits.h)))
+endif
+
+ARCH_MACRO := MLA_DECODE_ARCH_$(shell echo $(ARCH) | tr '[:lower:]' '[:upper:]')
+
+COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -pthread -O3 -Wall -D$(ARCH_MACRO) --offload-arch=$(ARCH)
 KERNEL_FLAGS = -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage
 LINK_FLAGS   = --offload-arch=$(ARCH) -pthread --rtlib=compiler-rt --unwindlib=libgcc
 
-BUILD = build
+BUILD = build/$(ARCH)
 OUT   = $(BUILD)/mla_decode.exe
 
-KERNEL_SRCS = $(wildcard *_kernel.cc)
-HOST_SRC    = host.cc
-SHARED_HDRS = defs.h global_load.hpp parallel.h
-KERNEL_OBJS = $(patsubst %.cc,$(BUILD)/%.o,$(KERNEL_SRCS))
-KERNEL_ASMS = $(patsubst %.cc,$(BUILD)/%.s,$(KERNEL_SRCS))
+KERNEL_SRCS = $(wildcard common/*_kernel.cc) $(wildcard $(ARCH)/*_kernel.cc)
+HOST_SRC    = common/host.cc
+COMMON_HDRS = common/defs.h common/parallel.h common/get_mla_metadata.hpp common/mla_reduce.hpp
+SHARED_HDRS = $(filter-out %_template.hpp,$(wildcard $(ARCH)/*.h) $(wildcard $(ARCH)/*.hpp)) $(COMMON_HDRS)
+KERNEL_OBJS = $(patsubst %.cc,$(BUILD)/%.o,$(notdir $(KERNEL_SRCS)))
+KERNEL_ASMS = $(patsubst %.cc,$(BUILD)/%.s,$(notdir $(KERNEL_SRCS)))
 HOST_OBJ    = $(BUILD)/host.o
 
 .PHONY: all asm clean
@@ -25,10 +32,16 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 .SECONDEXPANSION:
-$(BUILD)/%_kernel.o: %_kernel.cc $$(wildcard %_template.hpp) $$(wildcard %.hpp) $(SHARED_HDRS) | $(BUILD)
+$(BUILD)/%_kernel.o: $(ARCH)/%_kernel.cc $$(wildcard $(ARCH)/%_template.hpp) $(SHARED_HDRS) | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) -c -o $@
 
-$(BUILD)/%_kernel.s: %_kernel.cc $$(wildcard %_template.hpp) $$(wildcard %.hpp) $(SHARED_HDRS) | $(BUILD)
+$(BUILD)/%_kernel.o: common/%_kernel.cc $$(wildcard common/%.hpp) $(SHARED_HDRS) | $(BUILD)
+	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) -c -o $@
+
+$(BUILD)/%_kernel.s: $(ARCH)/%_kernel.cc $$(wildcard $(ARCH)/%_template.hpp) $(SHARED_HDRS) | $(BUILD)
+	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) --offload-device-only -S -o $@
+
+$(BUILD)/%_kernel.s: common/%_kernel.cc $$(wildcard common/%.hpp) $(SHARED_HDRS) | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) --offload-device-only -S -o $@
 
 asm: $(KERNEL_ASMS)
@@ -40,4 +53,4 @@ $(OUT): $(KERNEL_OBJS) $(HOST_OBJ)
 	$(HIPCC) $^ $(LINK_FLAGS) -o $@
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf build

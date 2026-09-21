@@ -16,7 +16,7 @@ __device__ inline int effective_splits(const opus_mla_decode_metadata_kargs& kar
 
 __global__ void get_mla_metadata_kernel(opus_mla_decode_metadata_kargs kargs) {
     using namespace opus_mla_decode_metadata;
-    constexpr int WARP = 64;
+    constexpr int WARP = opus::get_warp_size();
 
     const int B = kargs.B;
     const int H = kargs.H;

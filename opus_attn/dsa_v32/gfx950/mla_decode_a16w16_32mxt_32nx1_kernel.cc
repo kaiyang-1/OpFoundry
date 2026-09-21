@@ -1,5 +1,5 @@
 #include <opus/hip_minimal.hpp>
-#include "defs.h"
+#include "common/defs.h"
 
 using mla_32mx4_traits_t = opus_mla_decode_a16w16_32mx4_32nx1_traits<32, 32, 4, bf16_t, bf16_t>;
 using mla_32mx3_traits_t = opus_mla_decode_a16w16_32mx3_32nx1_traits<32, 32, 4, bf16_t, bf16_t>;

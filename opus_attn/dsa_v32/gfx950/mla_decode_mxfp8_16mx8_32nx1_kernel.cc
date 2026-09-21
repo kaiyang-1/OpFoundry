@@ -1,5 +1,5 @@
 #include <opus/hip_minimal.hpp>
-#include "defs.h"
+#include "common/defs.h"
 
 using mla_decode_traits_t = opus_mla_decode_mxfp8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>;
 

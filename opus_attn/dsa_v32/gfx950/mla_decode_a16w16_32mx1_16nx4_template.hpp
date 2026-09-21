@@ -1,7 +1,7 @@
 #pragma once
 
 #include <opus/opus.hpp>
-#include "defs.h"
+#include "common/defs.h"
 #include "global_load.hpp"
 #include <bit>
 
