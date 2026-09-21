@@ -175,6 +175,7 @@ struct dev_buf {
 // Fixed grain, so a chunk spans the same elements at any MLA_V4_NUM_THREADS. Hashed
 // rather than seed+index, which would make Q rows bit-identical to KV rows.
 static constexpr size_t MLA_V4_INIT_GRAIN = 65536;
+static constexpr uint64_t MLA_V4_SEED = 2026;
 
 inline std::mt19937 mla_v4_rng(uint64_t seed, uint64_t index) {
     uint64_t x = seed + 0x9E3779B97F4A7C15ull * (index + 1);
@@ -572,14 +573,13 @@ void mla_v4_attention_ref_fp8(
 
 template<class Traits>
 int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
-                            int topk, bool verify, uint64_t seed) {
+                            int topk, bool verify) {
     using DType = typename Traits::D_ATTN;
     using OType = typename Traits::D_OUT;
     constexpr bool is_fp8 = std::is_same_v<DType, fp8_t> || std::is_same_v<DType, bf8_t>;
     const char* precision = is_fp8 ? "NoPE=fp8, RoPE=bf16" : "NoPE=bf16, RoPE=bf16";
-    printf("MLA-v4 Prefill Attention: H_Q=%d, N=%d, D=%d, %s, total_pages=%d, total_tokens=%d, topk=%d, seed=%llu\n",
-           H, N, Traits::D_HEAD_SIZE, precision, total_pages, total_tokens, topk,
-           (unsigned long long)seed);
+    printf("MLA-v4 Prefill Attention: H_Q=%d, N=%d, D=%d, %s, total_pages=%d, total_tokens=%d, topk=%d\n",
+           H, N, Traits::D_HEAD_SIZE, precision, total_pages, total_tokens, topk);
 
     constexpr int D_HEAD = Traits::D_HEAD_SIZE;
     const size_t o_size = (size_t)N * H * D_HEAD;
@@ -587,8 +587,9 @@ int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
     auto host_attn_sink = std::make_unique<float[]>(H);
     auto host_o_ref = std::make_unique<OType[]>(o_size);
     auto host_o_gpu = std::make_unique<OType[]>(o_size);
-    const uint64_t seed_sink = seed + 1, seed_q = seed + 2, seed_ukv = seed + 3, seed_kv = seed + 4,
-                   seed_idx_prefix = seed + 5, seed_idx_extend = seed + 6;
+    const uint64_t seed_sink = MLA_V4_SEED + 1, seed_q = MLA_V4_SEED + 2, seed_ukv = MLA_V4_SEED + 3,
+                   seed_kv = MLA_V4_SEED + 4, seed_idx_prefix = MLA_V4_SEED + 5,
+                   seed_idx_extend = MLA_V4_SEED + 6;
     rand_vector(host_attn_sink.get(), H, seed_sink);
 
     std::vector<int> host_kv_indptr_prefix, host_kv_indices_prefix;
@@ -600,9 +601,6 @@ int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
     const size_t total_kv_indices = host_kv_indices_prefix.size() + host_kv_indices_extend.size();
     assert(total_kv_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
     const int total_kv_rows = static_cast<int>(total_kv_indices);
-    printf("MLA-v4 KV page table: prefix=%zu rows over %d pages, extend=%zu causal rows over %d tokens, %.1f rows/query\n",
-           host_kv_indices_prefix.size(), total_pages, host_kv_indices_extend.size(), total_tokens,
-           double(total_kv_rows) / std::max(N, 1));
 
     dev_buf<float> dev_attn_sink(H);
     dev_buf<OType> dev_o(o_size);
@@ -620,8 +618,8 @@ int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
     const int num_h_blocks = ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M);
     dim3 grid(N, num_h_blocks, 1);
     dim3 block(Traits::BLOCK_SIZE);
-    printf("MLA-v4 kernel launch config: grid=(%d,%d,%d), block=%d (NUM_WARPS=%d), smem=%zu bytes (K/V tiles)\n",
-           grid.x, grid.y, grid.z, (int)block.x, Traits::NUM_WARPS, Traits::smem_size_bytes());
+    printf("MLA-v4 kernel launch config: grid=(%d,%d,%d), block=%d, smem=%zu bytes\n",
+           grid.x, grid.y, grid.z, (int)block.x, Traits::smem_size_bytes());
 
     int rc = 0;
     auto verify_and_bench = [&](const auto& kargs) {
@@ -773,7 +771,6 @@ int main(int argc, char** argv) {
     int topk = 1024;
     int total_pages = -1;
     int total_tokens = -1;
-    uint64_t seed = 2026;
 
     bool verify = false;
     bool use_fp8 = false;
@@ -814,13 +811,6 @@ int main(int argc, char** argv) {
         if (try_parse(topk, "-topk")) continue;
         if (try_parse(total_pages, "-total_pages")) continue;
         if (try_parse(total_tokens, "-total_tokens")) continue;
-        if ((val = parse_val(arg, "-seed"))) {
-            const char* seed_str = (val == reinterpret_cast<const char*>(1))
-                                       ? (i + 1 < argc ? argv[++i] : "")
-                                       : val;
-            seed = std::strtoull(seed_str, nullptr, 10);
-            continue;
-        }
         std::cerr << "unknown argument '" << arg << "'\n";
         return 1;
     }
@@ -836,8 +826,7 @@ int main(int argc, char** argv) {
     }
 
 #define RUN_CASE(...)                                                          \
-    run_mla_v4_prefill_case<__VA_ARGS__>(H, N, total_pages, total_tokens,      \
-                                         topk, verify, seed)
+    run_mla_v4_prefill_case<__VA_ARGS__>(H, N, total_pages, total_tokens, topk, verify)
 
 #if defined(MLA_V4_ARCH_GFX950)
     if (use_fp8) {

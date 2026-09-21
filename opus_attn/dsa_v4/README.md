@@ -173,12 +173,11 @@ Useful options:
 | `-topk` | `1024` | Rows each query token selects from each range. Clamped to that range; `0` selects all of it, giving a dense page table. |
 | `-total_pages` | `max(N, topk, 65536)` | Prefix cache size, and the main control over how much of the KV gather cache can serve. Nothing derives it from the other options, hence the floor. |
 | `-total_tokens` | `N` | Extend rows in `KV`, tied to `N` because the extend range is the chunk's own K/V. Larger only adds rows the causal ramp cannot reach; smaller caps the ramp early. |
-| `-seed` | `2026` | Seeds every tensor and both page tables. |
 | `--verify` | off | Compare GPU output against the CPU reference implementation. |
 
 Prefix rows are visible to every token, so each one selects `min(topk, total_pages)`. Extend rows are the chunk's own K/V, so token `i` draws from `[0, i]` and gets `min(topk, i + 1)` — a ramp that walks every row length below the budget, and with it every KV-tile remainder the kernel masks. The budget applies per range, so a deep token gets up to `2 * topk` rows. Setting either range to `0` empties it, as in a sequence's first chunk.
 
-Every element and index derives from `(seed, element)` alone, so a run reproduces bit-exactly across machines and worker counts, and a failing `--verify` replays with the same `-seed`. Selected pages stay scattered, since sorting would hand the gather a near-sequential read that no real page table provides. The CPU reference runs on `std::thread` workers rather than OpenMP; set `MLA_V4_NUM_THREADS` to override the worker count.
+Every element and index derives from a fixed seed and its own index, so a shape reproduces bit-exactly across runs, machines and worker counts. Selected pages stay scattered, since sorting would hand the gather a near-sequential read that no real page table provides. The CPU reference runs on `std::thread` workers rather than OpenMP; set `MLA_V4_NUM_THREADS` to override the worker count.
 
 ## Integration Notes
 
