@@ -13,9 +13,10 @@ SCHED_FLAGS_gfx1250 = -mllvm -amdgpu-expert-scheduling-mode \
                       -mllvm -amdgpu-sched-strategy=coexec \
                       -mllvm -amdgpu-anti-hints-for-va-vdst
 
-COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -pthread -O3 -Wall -D$(ARCH_MACRO) --offload-arch=$(ARCH)
-KERNEL_FLAGS = -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage --no-offload-new-driver $(SCHED_FLAGS_$(ARCH))
-LINK_FLAGS   = --offload-arch=$(ARCH) -pthread
+COMMON_FLAGS     = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -pthread -O3 -Wall -D$(ARCH_MACRO) --offload-arch=$(ARCH)
+KERNEL_FLAGS     = -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage $(SCHED_FLAGS_$(ARCH))
+KERNEL_OBJ_FLAGS = -fno-offload-lto
+LINK_FLAGS       = --offload-arch=$(ARCH) -pthread
 
 BUILD = build/$(ARCH)
 OUT   = $(BUILD)/mla_v4_prefill.exe
@@ -38,7 +39,7 @@ $(BUILD):
 
 # Kernel objects. -D__HIPCC_RTC__ skips implicit __clang_hip_runtime_wrapper.h on host pass.
 $(BUILD)/%_kernel.o: $(ARCH)/%_kernel.cc $(ARCH)/%_template.hpp $(SHARED_HDRS) | $(BUILD)
-	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) -c -o $@
+	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) $(KERNEL_OBJ_FLAGS) -c -o $@
 
 # Device assembly.
 $(BUILD)/%_kernel.s: $(ARCH)/%_kernel.cc $(ARCH)/%_template.hpp $(SHARED_HDRS) | $(BUILD)
