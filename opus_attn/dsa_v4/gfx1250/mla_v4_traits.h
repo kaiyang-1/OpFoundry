@@ -151,7 +151,7 @@ struct opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits {
     static constexpr int WAVE_LDS_BYTES = ROWS_PER_WAVE * KV_ROW_LDS_BYTES;
     static constexpr int KV_BUF_BYTES   = KV_TILE_SIZE * KV_ROW_LDS_BYTES;      // slot stride
     static constexpr int KV_BUF_ELEMS   = KV_BUF_BYTES / (int)sizeof(D_ATTN);
-    static constexpr int NUM_KV_BUFS    = 4;                                    // a slot is K one round and V the next, and reuse trails it by two barriers
+    static constexpr int NUM_KV_BUFS    = 4;
     static constexpr int GATHER_AHEAD   = 2;
     static constexpr int KV_LDS_BYTES   = NUM_KV_BUFS * KV_BUF_BYTES;
 
