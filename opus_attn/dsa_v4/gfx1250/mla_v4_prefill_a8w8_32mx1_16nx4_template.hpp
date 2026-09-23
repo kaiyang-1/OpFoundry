@@ -320,11 +320,6 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(
         buf_delta = -buf_delta;
     };
 
-    int v_wr_delta = T::V_BUF_BYTES, v_rd_delta = T::V_BUF_BYTES;
-    auto advance_v_wr = [&]() { s_v_wr.ptr += v_wr_delta; v_wr_delta = -v_wr_delta; };
-    auto advance_v_rd = [&]() { s_v_rd.ptr += v_rd_delta; v_rd_delta = -v_rd_delta; };
-    static_assert(T::NUM_V_BUFS == 2, "the pipelined round alternates between exactly two V slots");
-
     const u32x4_t kv_indices_rsrc = make_buffer_rsrc_raw(kv_indices + page_idx_begin, (u32_t)(valid_kv_len * sizeof(int)));
 
     using k_nope_window = tdm<D_NOPE, seq<T::D_NOPE_PADDED_SIZE, T::INDICES_PER_TDM>,
@@ -415,7 +410,7 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(
     typename decltype(mma0_nope)::vtype_b v_k_nope;
     typename decltype(mma0_rope)::vtype_b v_k_rope;
     vector_t<D_NOPE, T::GEMM0_E_N * T::W_N * (T::D_NOPE_PADDED_SIZE / T::MXSCL_BLOCK_SIZE) / T::WARP_SIZE> v_k_mxscl;
-    vector_t<D_ACC, T::GEMM0_E_M * s_len_per_m> v_s, v_s_next;
+    vector_t<D_ACC, T::GEMM0_E_M * s_len_per_m> v_s;
     typename decltype(mma1)::vtype_b v_v;
     typename decltype(mma1)::vtype_a v_p;
 
@@ -435,21 +430,22 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(
         gather_slot ^= 1u;
     };
 
+    auto v_nope_wr_offsets = layout_to_offsets<T::VEC_NOPE>(u_wv_nope);
+
     auto publish_v_rows = [&]() {
-        vector_t<D_ROPE, T::V_NOPE_BLOCKS * T::VEC_NOPE> v_v_nope;
         auto* src = reinterpret_cast<const vector_t<u32_t, 2>*>(&v_k_nope);
-        auto* dst = reinterpret_cast<vector_t<D_ROPE, 8>*>(&v_v_nope);
         static_for<T::V_NOPE_BLOCKS>([&](auto b) {
             constexpr int dw   = b.value / 8;
             constexpr int half = (b.value / 4) % 2;
             constexpr int byte = b.value % 4;
             constexpr int sel  = ((byte & 1) << 2) | (byte & 2) | half;
-            dst[2 * b.value + 0] = __builtin_amdgcn_cvt_scale_pk8_bf16_fp8(src[2 * b.value + 0], scale_k[dw], sel);
-            dst[2 * b.value + 1] = __builtin_amdgcn_cvt_scale_pk8_bf16_fp8(src[2 * b.value + 1], scale_k[dw], sel);
+            vector_t<D_ROPE, T::VEC_NOPE> v_v_nope;
+            auto* dst = reinterpret_cast<vector_t<D_ROPE, 8>*>(&v_v_nope);
+            dst[0] = __builtin_amdgcn_cvt_scale_pk8_bf16_fp8(src[2 * b.value + 0], scale_k[dw], sel);
+            dst[1] = __builtin_amdgcn_cvt_scale_pk8_bf16_fp8(src[2 * b.value + 1], scale_k[dw], sel);
+            store<T::VEC_NOPE>(s_v_wr, v_v_nope, v_nope_wr_offsets[b.value]);
         });
-        store<T::VEC_NOPE>(s_v_wr, v_v_nope, u_wv_nope);
         store<T::VEC_ROPE>(s_v_wr, v_k_rope, u_wv_rope + number<T::D_NOPE_SIZE>{});
-        advance_v_wr();
     };
 
     auto load_k = [&]() {
@@ -477,18 +473,21 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(
     };
 
     issue_tile(0);
-    issue_tile(1);
-    s_wait_tensorcnt(number<T::TDM_OPS_PER_TILE>{});
-    load_k();
-    publish_v_rows();
-    compute_qk(v_s);
-    attn_mask_oob_score<T>(v_s, valid_kv_len, 0, wave_kv_base, lane_id);
-    ml_publish<T>(s_m, attn_row_max_blocks<T>(v_s), warp_id, lane_id);
-    s_wait_dscnt(0_I);
-    __builtin_amdgcn_s_barrier_signal(-1);
-    __builtin_amdgcn_s_barrier_wait(-1);
 
-    auto round = [&](int tile, auto mask_next) __attribute__((always_inline)) {
+    auto round = [&](int tile, auto mask_tile) __attribute__((always_inline)) {
+        s_wait_tensorcnt(0_I);
+        load_k();
+        compute_qk(v_s);
+        if constexpr (decltype(mask_tile)::value) {
+            attn_mask_oob_score<T>(v_s, valid_kv_len, tile, wave_kv_base, lane_id);
+        }
+        publish_v_rows();
+        ml_publish<T>(s_m, attn_row_max_blocks<T>(v_s), warp_id, lane_id);
+        s_wait_dscnt(0_I);
+        __builtin_amdgcn_s_barrier_signal(-1);
+        issue_tile(tile + 1);
+        __builtin_amdgcn_s_barrier_wait(-1);
+
         auto tile_max = ml_reduce<T>(s_m, lane_id, [](D_ACC x, D_ACC y) { return max(x, y); });
         bool below = true;
         static_for<T::GEMM0_E_M>([&](auto i) {
@@ -517,50 +516,29 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(
             l_part[i.value] += attn_row_sum<T, i.value * s_len_per_m, s_len_per_m>(v_s);
         });
         store_p<T>(s_p, v_s, warp_id, lane_id);
-
         v_v = tr_load<T::VEC_ROPE>(s_v_rd, u_rv);
-        advance_v_rd();
         s_wait_dscnt(number<T::v_ds_load_insts>{});
         __builtin_amdgcn_s_barrier_signal(-1);
-
-        s_wait_tensorcnt(number<T::TDM_OPS_PER_TILE>{});
-        load_k();
-        publish_v_rows();
-        compute_qk(v_s_next);
-        if constexpr (decltype(mask_next)::value) {
-            attn_mask_oob_score<T>(v_s_next, valid_kv_len, tile + 1, wave_kv_base, lane_id);
-        }
-        __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier_wait(-1);
 
         gather_p<T>(s_p, v_p, lane_id);
-        v_s = v_s_next;
-        ml_publish<T>(s_m, attn_row_max_blocks<T>(v_s), warp_id, lane_id);
         s_wait_dscnt(0_I);
-        __builtin_amdgcn_s_barrier_signal(-1);
-
         v_o = mma1(v_p, v_v, v_o);
-        __builtin_amdgcn_sched_barrier(0);
+        __builtin_amdgcn_s_barrier_signal(-1);
         __builtin_amdgcn_s_barrier_wait(-1);
     };
 
     int tile = 0;
-    for (; tile + 2 < num_kv_tiles; ++tile) {
-        issue_tile(tile + 2);
-        round(tile, false_type{});
-    }
+    for (; tile + 1 < num_kv_tiles; ++tile) round(tile, false_type{});
 
     #pragma clang loop unroll(disable)
-    for (; tile < num_kv_tiles; ++tile) {
-        issue_tile(tile + 2);
-        round(tile, true_type{});
-    }
+    for (; tile < num_kv_tiles; ++tile) round(tile, true_type{});
 }
 
 }
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs) {
     using namespace opus;
     using namespace opus_mla_v4_prefill_a8w8_32mx1_16nx4;
     using T = opus::remove_cvref_t<Traits>;

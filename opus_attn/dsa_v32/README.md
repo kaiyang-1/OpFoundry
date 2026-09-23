@@ -62,7 +62,7 @@ Prerequisites:
 
 - A gfx950 GPU and ROCm 7+.
 - OPUS headers from `aiter`, exposed through `OPUS_INCLUDE_DIR`.
-- A compiler built from the [`amdgpu-pin-op-dst`](https://github.com/yuyzhang512/llvm-project/commits/amdgpu-pin-op-dst/) branch of LLVM, pointed at through `HIP_CLANG_PATH`. The kernels are tuned against that toolchain; a stock ROCm `hipcc` is not expected to reproduce the same schedule.
+- A compiler built from the [`amdgpu-pin-op-dst`](https://github.com/yuyzhang512/llvm-project/tree/amdgpu-pin-op-dst) branch of LLVM, pointed at through `HIP_CLANG_PATH`. The kernels are tuned against that toolchain; a stock ROCm `hipcc` is not expected to reproduce the same schedule.
 
 ```bash
 cd opus_attn/dsa_v32
