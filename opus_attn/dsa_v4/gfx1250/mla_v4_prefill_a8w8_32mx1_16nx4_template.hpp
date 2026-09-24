@@ -430,7 +430,8 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(
         gather_slot ^= 1u;
     };
 
-    auto v_nope_wr_offsets = layout_to_offsets<T::VEC_NOPE>(u_wv_nope);
+    auto s_v_nope_wr = make_smem(reinterpret_cast<D_ROPE*>(smem_buf + T::V_LDS_OFF + wave_kv_base * T::V_ROW_LDS_BYTES)
+                                 + u_wv_nope(0_I, 0_I));
 
     auto publish_v_rows = [&]() {
         auto* src = reinterpret_cast<const vector_t<u32_t, 2>*>(&v_k_nope);
@@ -443,7 +444,7 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(
             auto* dst = reinterpret_cast<vector_t<D_ROPE, 8>*>(&v_v_nope);
             dst[0] = __builtin_amdgcn_cvt_scale_pk8_bf16_fp8(src[2 * b.value + 0], scale_k[dw], sel);
             dst[1] = __builtin_amdgcn_cvt_scale_pk8_bf16_fp8(src[2 * b.value + 1], scale_k[dw], sel);
-            store<T::VEC_NOPE>(s_v_wr, v_v_nope, v_nope_wr_offsets[b.value]);
+            store<T::VEC_NOPE>(s_v_nope_wr, v_v_nope, layout_imm_offsets_v<decltype(u_wv_nope), T::VEC_NOPE>[b.value]);
         });
         store<T::VEC_ROPE>(s_v_wr, v_k_rope, u_wv_rope + number<T::D_NOPE_SIZE>{});
     };
