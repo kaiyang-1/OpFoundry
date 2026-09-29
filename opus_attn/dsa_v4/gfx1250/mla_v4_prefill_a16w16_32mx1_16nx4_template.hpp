@@ -284,7 +284,6 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(
     auto s_m = make_smem(reinterpret_cast<D_ACC*>(smem_buf + T::M_LDS_OFF));
     auto s_p = make_smem(reinterpret_cast<D_ATTN*>(smem_buf + T::P_LDS_OFF));
 
-    // s_k runs one slot ahead of s_v: round t reads K of tile t+1 and V of tile t.
     int k_off = 0, v_off = 0;
 
     const u32x4_t kv_indices_rsrc = make_buffer_rsrc_raw(kv_indices + page_idx_begin, (u32_t)(valid_kv_len * sizeof(int)));
@@ -357,9 +356,9 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(
     typename decltype(mma0)::vtype_b v_k;
     typename decltype(mma1)::vtype_b v_v;
     typename decltype(mma1)::vtype_a v_p;
-    typename decltype(mma0)::vtype_c v_s, v_s_next;
+    typename decltype(mma0)::vtype_c v_s;
 
-    // Prologue: the entry state round 0 expects -- ring, scores, published row max
+    // Prologue: the entry state round 0 expects -- ring, scores, published row max, V
     static_for<T::GATHER_AHEAD>([&](auto) { issue_next_gather(); });
     s_wait_tensorcnt(number<T::TDM_LOADS_PER_WAVE>{});
     v_k = load<T::VEC_KV>(s_k, u_rk);
@@ -371,8 +370,13 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(
     s_wait_dscnt(0_I);
     __builtin_amdgcn_s_barrier_signal(-1);
     __builtin_amdgcn_s_barrier_wait(-1);
+    v_v = tr_load<T::VEC_KV>(s_v, u_rv);
+    advance_kv_slot<T>(s_v, v_off);
 
     auto round = [&](int tile, auto mask_next) __attribute__((always_inline)) {
+        s_wait_tensorcnt(0_I);
+        issue_next_gather();
+
         // (c) softmax(t)
         auto tile_max = ml_reduce<T>(s_m, lane_id, [](D_ACC x, D_ACC y) { return max(x, y); });
         bool below = true;
@@ -410,44 +414,35 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(
         __builtin_amdgcn_s_barrier_signal(-1);
 
         // (d) QK(t+1); without the sched_barrier most of it sinks past the wait
-        clear(v_s_next);
-        v_s_next = mma0(v_q, v_k, v_s_next);
+        clear(v_s);
+        v_s = mma0(v_q, v_k, v_s);
         if constexpr (decltype(mask_next)::value) {
-            attn_mask_oob_score<T>(v_s_next, valid_kv_len, tile + 1, wave_kv_base, lane_id);
+            attn_mask_oob_score<T>(v_s, valid_kv_len, tile + 1, wave_kv_base, lane_id);
         }
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier_wait(-1);
 
         // (e) gather P(t)
         gather_p<T>(s_p, v_p, lane_id);
-        v_s = v_s_next;
 
-        // (a) publish max(t+1), read V(t)
+        // (a) publish max(t+1)
         ml_publish<T>(s_m, attn_row_max_blocks<T>(v_s), warp_id, lane_id);
-        v_v = tr_load<T::VEC_KV>(s_v, u_rv);
-        advance_kv_slot<T>(s_v, v_off);
-        s_wait_dscnt(number<T::v_ds_load_insts>{});
+        s_wait_dscnt(0_I);
         __builtin_amdgcn_s_barrier_signal(-1);
 
-        // (b) PV(t)
+        // (b) PV(t), read V(t+1)
         v_o = mma1(v_p, v_v, v_o);
+        v_v = tr_load<T::VEC_KV>(s_v, u_rv);
+        advance_kv_slot<T>(s_v, v_off);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier_wait(-1);
     };
 
     int tile = 0;
-    for (; tile + 1 < num_kv_tiles - 1; ++tile) {
-        s_wait_tensorcnt(0_I);
-        issue_next_gather();
-        round(tile, false_type{});
-    }
+    for (; tile + 1 < num_kv_tiles - 1; ++tile) round(tile, false_type{});
 
     #pragma clang loop unroll(disable)
-    for (; tile < num_kv_tiles; ++tile) {
-        s_wait_tensorcnt(0_I);
-        issue_next_gather();
-        round(tile, true_type{});
-    }
+    for (; tile < num_kv_tiles; ++tile) round(tile, true_type{});
 }
 
 } // namespace opus_mla_v4_prefill_a16w16_32mx1_16nx4
