@@ -171,7 +171,34 @@ __device__ inline auto make_layout_rv(int warp_id, int lane_id) {
     return opus::make_layout(
         rv_block_shape,
         opus::unfold_x_stride(rv_block_dim, rv_block_shape, opus::tuple{opus::number<grp_n * lane_lo * T::VEC_TR_V>{}, opus::number<T::SMEM_KV_ROW>{}, 1_I}),
-        opus::unfold_p_coord(rv_block_dim, opus::tuple{warp_id, grp_id / grp_n, lane_in_grp / lane_lo, grp_id % grp_n, lane_in_grp % lane_lo}));
+        opus::unfold_p_coord(rv_block_dim, opus::tuple{warp_id, grp_id / grp_n, lane_in_grp / lane_lo, grp_id % grp_n,
+                                                      (lane_in_grp % lane_lo) ^ (2 * ((grp_id / grp_n) & 1))}));
+}
+
+// Rows 4..7 (mod 8) of the staged KV tile swap the 16 B halves of every 32 B column chunk; make_layout_rv
+// applies the same XOR, so both the row-per-lane writes here and the tr reads stay conflict-free.
+template<class T, class S, class VN, class VR, class UN, class UR>
+__device__ inline void store_kv_swizzled(S& s_kv, const VN& v_nope, const VR& v_rope,
+                                         const UN& u_sk_nope, const UR& u_sk_rope, int lane_id) {
+    using namespace opus;
+    constexpr int HALF = T::VEC_KV_NOPE / 2;
+    const int swz = ((lane_id % T::W_N) >> 2) & 1;
+
+    auto nope_offs = layout_to_offsets<T::VEC_KV_NOPE>(u_sk_nope);
+    static_for<sizeof(nope_offs) / sizeof(nope_offs[0])>([&](auto i) {
+        constexpr int b = i.value * T::VEC_KV_NOPE;
+        store<HALF>(s_kv, slice(v_nope, number<b>{}, number<b + HALF>{}), nope_offs[i.value] + HALF * swz);
+        store<HALF>(s_kv, slice(v_nope, number<b + HALF>{}, number<b + 2 * HALF>{}), nope_offs[i.value] + HALF - HALF * swz);
+    });
+
+    // A rope chunk is a single 16 B half, so the swizzle just moves it to its partner half.
+    const int rope_shift = swz * (((lane_id / T::W_N) & 1) ? -HALF : HALF);
+    auto rope_offs = layout_to_offsets<T::VEC_KV_ROPE>(u_sk_rope);
+    static_for<sizeof(rope_offs) / sizeof(rope_offs[0])>([&](auto i) {
+        constexpr int b = i.value * T::VEC_KV_ROPE;
+        store<T::VEC_KV_ROPE>(s_kv, slice(v_rope, number<b>{}, number<b + T::VEC_KV_ROPE>{}),
+                              rope_offs[i.value] + T::D_NOPE_SIZE + rope_shift);
+    });
 }
 
 template<class T>
@@ -475,8 +502,7 @@ __device__ void mla_v4_prefill_accum_pipelined(
         v_s = mma0_rope(v_q_rope, v_k_rope, v_s);
 
         // ──── Stage bf16 KV into smem ────
-        store<T::VEC_KV_NOPE>(s_kv, v_k_nope_bf16, u_sk_nope);
-        store<T::VEC_KV_ROPE>(s_kv, v_k_rope, u_sk_rope + T::D_NOPE_SIZE);
+        store_kv_swizzled<T>(s_kv, v_k_nope_bf16, v_k_rope, u_sk_nope, u_sk_rope, lane_id);
 
         // ──── Cross-warp online softmax ────
         attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, warp_id, lane_id);

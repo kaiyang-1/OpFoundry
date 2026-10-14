@@ -206,7 +206,7 @@ struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits {
     static constexpr int VEC_O    = 4;
 
     // Per-token row stride for the bf16 KV tile staged in LDS.
-    static constexpr int SMEM_KV_PAD = 8;
+    static constexpr int SMEM_KV_PAD = 16;
     static constexpr int SMEM_KV_ROW = D_HEAD_SIZE + SMEM_KV_PAD;
 
     // Shared memory: kernel uses three static buffers (KV tile, m/l, P). RESERVED sizing.
