@@ -10,35 +10,16 @@ using opus::operator""_I;
 namespace opus_mla_v41_prefill_a8w8_16mx4_64nx1 {
 // ------------------------------------------------------------------------------ shape factors
 
-template<class T> constexpr int LANE_GRPS   = T::WARP_SIZE / T::W_N;
-template<class T> constexpr int GRP_PER_BLK = T::D_SCALE_BLOCK / T::VEC_KV;
-template<class T> constexpr int K_PIECES    = T::W_N * T::W_K_QK / T::WARP_SIZE / T::VEC_KV;
-template<class T> constexpr int N_TILES_SUB = T::GEMM0_E_N / T::smem_n_sub_tile_rpt;
-template<class T> constexpr int V_N_TILES   = T::D_128B_V_SIZE / T::W_N;
-template<class T> constexpr int VEC_O2      = 2 * T::VEC_O;
-
-// ----------------------------------------------------------------- register budget and pipeline
-
-constexpr int Q_AGPR_BASE = 0;
-template<class T> constexpr int QK_OP_AGPRS    = K_PIECES<T> * T::VEC_KV * sizeof(typename T::D_ATTN) / 4;
-template<class T> constexpr int K_AGPR_BASE    = Q_AGPR_BASE + T::GEMM0_E_K * QK_OP_AGPRS<T>;
-template<class T> constexpr int K_AGPR_PER_BUF = N_TILES_SUB<T> * QK_OP_AGPRS<T>;
-
-constexpr int O_VGPR_BASE = 0;
-constexpr int S_VGPR_BASE = 128;
-
-constexpr int K_DEPTH = 4;
-constexpr int V_DEPTH = 2;
-
+template<class T> constexpr int LANE_GRPS     = T::WARP_SIZE / T::W_N;
+template<class T> constexpr int GRP_PER_BLK   = T::D_SCALE_BLOCK / T::VEC_KV;
+template<class T> constexpr int K_PIECES      = T::W_N * T::W_K_QK / T::WARP_SIZE / T::VEC_KV;
+template<class T> constexpr int N_TILES_SUB   = T::GEMM0_E_N / T::smem_n_sub_tile_rpt;
+template<class T> constexpr int V_N_TILES     = T::D_128B_V_SIZE / T::W_N;
+template<class T> constexpr int V_TR_PER_TILE = T::W_N * T::W_K_PV / T::WARP_SIZE / T::VEC_TR_V;
+template<class T> constexpr int VEC_O2        = 2 * T::VEC_O;
 template<class T> constexpr int ACC_PER_TILE  = T::W_M * T::W_N / T::WARP_SIZE;
 template<class T> constexpr int S_ELEMS       = T::GEMM0_E_N * ACC_PER_TILE<T>;
 template<class T> constexpr int O_ELEMS       = T::Q_TILE_SIZE * T::D_HEAD_SIZE / T::WARP_SIZE;
-template<class T> constexpr int QK_STEPS      = T::smem_n_sub_tile_rpt * T::GEMM0_E_K;
-template<class T> constexpr int DV_STEPS      = T::D_HEAD_SIZE / T::D_128B_V_SIZE;
-template<class T> constexpr int PV_STEPS      = T::GEMM1_E_K * DV_STEPS<T>;
-template<class T> constexpr int V_TR_PER_TILE = T::W_N * T::W_K_PV / T::WARP_SIZE / T::VEC_TR_V;
-template<class T> constexpr int DEQ_PER_STEP  = T::deq_insts / QK_STEPS<T>;
-template<class T> constexpr int DEQ_RING      = 2 * DEQ_PER_STEP<T>;
 
 template<class T> using v_k_t = opus::vector_t<typename T::D_ATTN, K_PIECES<T> * T::VEC_KV>;
 template<class T> using v_q_t = opus::array<v_k_t<T>, T::GEMM0_E_K>;
@@ -46,6 +27,31 @@ template<class T> using v_v_t = opus::vector_t<typename T::D_PV, T::W_N * T::W_K
 template<class T> using v_s_t = opus::vector_t<typename T::D_ACC, S_ELEMS<T>>;
 template<class T> using v_p_t = opus::vector_t<typename T::D_PV, S_ELEMS<T>>;
 template<class T> using v_o_t = opus::vector_t<typename T::D_ACC, O_ELEMS<T>>;
+
+// ----------------------------------------------------------------------------------- pipeline
+
+constexpr int K_DEPTH       = 4;
+constexpr int V_DEPTH       = 2;
+constexpr int PV_TAIL_STEPS = V_DEPTH;
+
+template<class T> constexpr int QK_STEPS     = T::smem_n_sub_tile_rpt * T::GEMM0_E_K;
+template<class T> constexpr int DV_STEPS     = T::D_HEAD_SIZE / T::D_128B_V_SIZE;
+template<class T> constexpr int PV_STEPS     = T::GEMM1_E_K * DV_STEPS<T>;
+template<class T> constexpr int DEQ_PER_STEP = T::deq_insts / QK_STEPS<T>;
+template<class T> constexpr int DEQ_RING     = 2 * DEQ_PER_STEP<T>;
+
+// ---------------------------------------------------------------------------- register budget
+
+constexpr int Q_AGPR_BASE = 0;
+template<class T> constexpr int QK_OP_AGPRS    = sizeof(v_k_t<T>) / 4;
+template<class T> constexpr int K_AGPR_BASE    = Q_AGPR_BASE + T::GEMM0_E_K * QK_OP_AGPRS<T>;
+template<class T> constexpr int K_AGPR_PER_BUF = N_TILES_SUB<T> * QK_OP_AGPRS<T>;
+template<class T> constexpr int V_AGPRS        = sizeof(v_v_t<T>) / 4;
+template<class T> constexpr int V_AGPR_BASE    = K_AGPR_BASE<T> + K_DEPTH * K_AGPR_PER_BUF<T>;
+template<class T> constexpr int V_SLOTS        = V_DEPTH * V_N_TILES<T> + 1;
+
+constexpr int O_VGPR_BASE = 0;
+template<class T> constexpr int S_VGPR_BASE = O_VGPR_BASE + O_ELEMS<T>;
 
 template<int REG, class V>
 __device__ inline V pin_vgpr(V v) {
@@ -421,13 +427,12 @@ __device__ inline auto kv_lds_base(char* smem, const US& u_skv) {
     return base;
 }
 
-template<class T, class UG, class VP>
-__device__ inline auto kv_gmem_bases(const typename T::D_ATTN* p_kv, const UG& u_gkv,
-                                     const VP& kv_pages, int stride_kv_page) {
+template<class T, int VEC, class UG, class VP>
+__device__ inline auto page_gmem_bases(const typename T::D_ATTN* p, const UG& u_g, const VP& kv_pages, int stride_page) {
     opus::array<const typename T::D_ATTN*, T::smem_n_sub_tile_rpt> bases;
-    auto g_off = opus::layout_to_offsets<T::VEC_KV>(u_gkv);
+    auto g_off = opus::layout_to_offsets<VEC>(u_g);
     opus::static_for<T::smem_n_sub_tile_rpt>([&](auto ig) {
-        bases[ig.value] = p_kv + static_cast<int64_t>(kv_pages[ig.value]) * stride_kv_page + g_off[0];
+        bases[ig.value] = p + static_cast<int64_t>(kv_pages[ig.value]) * stride_page + g_off[0];
     });
     return bases;
 }
@@ -462,17 +467,6 @@ __device__ inline auto scale_lds_bases(char* smem, const US& u_ss) {
     return bases;
 }
 
-template<class T, class UG, class VP>
-__device__ inline auto scale_gmem_bases(const typename T::D_ATTN* p_scale, const UG& u_gs,
-                                        const VP& kv_pages, int stride_kv_scale_page) {
-    opus::array<const typename T::D_ATTN*, T::smem_n_sub_tile_rpt> bases;
-    auto g_off = opus::layout_to_offsets<T::VEC_SCALE>(u_gs);
-    opus::static_for<T::smem_n_sub_tile_rpt>([&](auto ig) {
-        bases[ig.value] = p_scale + static_cast<int64_t>(kv_pages[ig.value]) * stride_kv_scale_page + g_off[0];
-    });
-    return bases;
-}
-
 template<class T, class GB, class LB>
 __device__ inline void async_load_scale_tile(const GB& gmem_bases, const LB& lds_bases) {
     opus::static_for<T::scale_async_load_insts>([&](auto ig) {
@@ -503,11 +497,12 @@ __device__ inline auto load_q(char* smem, const UK& u_rk, int warp_id) {
     return v_q;
 }
 
-template<class T, int SLOT, int STEP, int BUF, class UK, class VK>
+template<class T, int SLOT, int STEP, class UK, class VK>
 __device__ inline void load_k_step(char* smem, const UK& u_rk, VK& v_k) {
     using namespace opus;
     constexpr int ns = STEP / T::GEMM0_E_K;
     constexpr int ek = STEP % T::GEMM0_E_K;
+    constexpr int b  = STEP % K_DEPTH;
 
     auto s_k = make_smem(reinterpret_cast<typename T::D_ATTN*>(smem + k_slot_base<T, SLOT>));
     auto k_offsets = layout_to_offsets<T::VEC_KV>(u_rk);
@@ -519,8 +514,13 @@ __device__ inline void load_k_step(char* smem, const UK& u_rk, VK& v_k) {
             set_slice(op, load<T::VEC_KV>(s_k, k_offsets[i] + kv_sub_tile_off<T, ns> + k_step_off<T, ek>),
                       number<h.value * T::VEC_KV>{}, number<(h.value + 1) * T::VEC_KV>{});
         });
-        v_k[BUF][e2.value] = pin_agpr<K_AGPR_BASE<T> + BUF * K_AGPR_PER_BUF<T> + e2.value * QK_OP_AGPRS<T>>(op);
+        v_k[b][e2.value] = pin_agpr<K_AGPR_BASE<T> + b * K_AGPR_PER_BUF<T> + e2.value * QK_OP_AGPRS<T>>(op);
     });
+}
+
+template<class T, int SLOT, int K0, int K1, class UK, class VK>
+__device__ inline void load_k_steps(char* smem, const UK& u_rk, VK& v_k) {
+    opus::static_for<K1 - K0>([&](auto i) { load_k_step<T, SLOT, K0 + i.value>(smem, u_rk, v_k); });
 }
 
 template<class T, int SLOT, class UKS>
@@ -542,7 +542,7 @@ __device__ inline auto tr_load_v(SM& s_v, int lane_off) {
     return __builtin_bit_cast(opus::vector_t<D_PV, T::VEC_TR_V>, raw);
 }
 
-template<class T, int STEP, int EN, int BUF, class UV, class VV>
+template<class T, int STEP, int EN, int BUF, int H0 = 0, int H1 = V_TR_PER_TILE<T>, class UV, class VV>
 __device__ inline void load_v_tile(char* smem, const UV&, int v_lane_off, VV& v_v) {
     using namespace opus;
     using D_PV = typename T::D_PV;
@@ -551,10 +551,11 @@ __device__ inline void load_v_tile(char* smem, const UV&, int v_lane_off, VV& v_
     constexpr auto imm = layout_imm_offsets_v<remove_cvref_t<UV>, T::VEC_TR_V>;
 
     auto s_v = make_smem(reinterpret_cast<D_PV*>(smem + v_base<T>));
-    static_for<V_TR_PER_TILE<T>>([&](auto h) {
-        constexpr int i = EN * V_TR_PER_TILE<T> + h.value;
+    static_for<H1 - H0>([&](auto hh) {
+        constexpr int h = H0 + hh.value;
+        constexpr int i = EN * V_TR_PER_TILE<T> + h;
         auto chunk = tr_load_v<T, (v_step_off<T, ks, dv> + imm[i]) * (int)sizeof(D_PV)>(s_v, v_lane_off);
-        set_slice(v_v[BUF][EN], chunk, number<h.value * T::VEC_TR_V>{}, number<(h.value + 1) * T::VEC_TR_V>{});
+        set_slice(v_v[BUF][EN], chunk, number<h * T::VEC_TR_V>{}, number<(h + 1) * T::VEC_TR_V>{});
     });
 }
 
@@ -566,25 +567,22 @@ __device__ inline void load_v_step(char* smem, const UV& u_rv, int v_lane_off, V
 // ----------------------------------------------------------------------------------- dequant
 
 template<class T, int SLOT, int I, class UD, class UDS, class DS, class DE>
-__device__ inline void dequant_read(char* smem, const UD& u_rv_dequant, const UDS& u_rs_dequant, DS& deq_src, DE& deq_e8m0) {
+__device__ inline void dequant_read(char* smem_k, char* smem_scale, const UD& u_rv_dequant, const UDS& u_rs_dequant,
+                                    DS& deq_src, DE& deq_e8m0) {
     using namespace opus;
     using D_ATTN = typename T::D_ATTN;
     constexpr int r = I % DEQ_RING<T>;
-    auto s_k     = make_smem(reinterpret_cast<D_ATTN*>(smem + k_slot_base<T, SLOT>));
-    auto s_scale = make_smem(reinterpret_cast<D_ATTN*>(smem + scale_slot_base<T, SLOT>));
+    auto s_k     = make_smem(reinterpret_cast<D_ATTN*>(smem_k + k_slot_base<T, SLOT>));
+    auto s_scale = make_smem(reinterpret_cast<D_ATTN*>(smem_scale + scale_slot_base<T, SLOT>));
     deq_src[r]  = load<T::VEC_DEQ>(s_k, layout_to_offsets<T::VEC_DEQ>(u_rv_dequant)[I]);
     deq_e8m0[r] = load<1>(s_scale, layout_to_offsets<1>(u_rs_dequant)[I]);
 }
 
 template<class T, int I, class USD, class DS, class DE>
-__device__ inline void dequant_write(char* smem, const USD& u_sv_dequant, const DS& deq_src, const DE& deq_e8m0,
-                                     int valid_rows, int warp_id, int lane_id) {
+__device__ inline void dequant_write(char* smem, const USD& u_sv_dequant, const DS& deq_src, const DE& deq_e8m0) {
     using namespace opus;
     using D_PV = typename T::D_PV;
     constexpr int r = I % DEQ_RING<T>;
-    constexpr int threads_d = T::D_128B_SIZE / T::VEC_DEQ;
-    constexpr int ig = I / (T::smem_d_rpt * T::smem_n_per_wave / T::deq_rows_per_inst);
-    constexpr int rh = I % (T::smem_n_per_wave / T::deq_rows_per_inst);
 
     const u32_t e8m0 = __builtin_bit_cast(unsigned char, deq_e8m0[r]);
     const float scale = std::bit_cast<float>(e8m0 << 23);
@@ -596,10 +594,6 @@ __device__ inline void dequant_write(char* smem, const USD& u_sv_dequant, const 
         dst_pk[d.value * 2 + 0] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(src_w[d.value], scale, false);
         dst_pk[d.value * 2 + 1] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(src_w[d.value], scale, true);
     });
-    if (valid_rows < T::KV_TILE_SIZE) {
-        const int pos = ig * T::smem_n_sub_tile + (rh * T::deq_rows_per_inst + lane_id / threads_d) * T::NUM_WARPS + warp_id;
-        if (pos >= valid_rows) v_dst = vector_t<D_PV, T::VEC_DEQ>{0};
-    }
 
     auto s_v = make_smem(reinterpret_cast<D_PV*>(smem + v_base<T>));
     store<T::VEC_DEQ>(s_v, v_dst, layout_to_offsets<T::VEC_DEQ>(u_sv_dequant)[I]);
@@ -607,9 +601,10 @@ __device__ inline void dequant_write(char* smem, const USD& u_sv_dequant, const 
 
 // -------------------------------------------------------------------------------------- gemm
 
-template<class T, int SLOT, class UK, class VQ, class SK, class VS, class VK, class DR, class DW, class EM>
+template<class T, int SLOT, class UK, class VQ, class SK, class VS, class VK, class DR, class DW, class EM, class SH>
 __device__ inline void compute_qk(char* smem, const UK& u_rk, const VQ& v_q, int scale_q, const SK& scale_k,
-                                  VS& v_s, VK& v_k, const DR& deq_read, const DW& deq_write, const EM& issue_dma) {
+                                  VS& v_s, VK& v_k, const DR& deq_read, const DW& deq_write, const EM& issue_dma,
+                                  const SH& step_hook) {
     using namespace opus;
     using D_ATTN = typename T::D_ATTN;
 
@@ -619,8 +614,6 @@ __device__ inline void compute_qk(char* smem, const UK& u_rk, const VQ& v_q, int
 
     auto* s_tiles = reinterpret_cast<s_tile_t*>(&v_s);
 
-    static_for<DEQ_PER_STEP<T>>([&](auto j) { deq_read(j); });
-
     static_for<QK_STEPS<T>>([&](auto st) {
         constexpr int step = st.value;
         constexpr int b    = step % K_DEPTH;
@@ -628,27 +621,28 @@ __device__ inline void compute_qk(char* smem, const UK& u_rk, const VQ& v_q, int
         constexpr int ek   = step % T::GEMM0_E_K;
 
         if constexpr (step + K_DEPTH - 1 < QK_STEPS<T>) {
-            load_k_step<T, SLOT, step + K_DEPTH - 1, (step + K_DEPTH - 1) % K_DEPTH>(smem, u_rk, v_k);
+            load_k_step<T, SLOT, step + K_DEPTH - 1>(smem, u_rk, v_k);
         }
-        issue_dma(number<step>{});
         if constexpr (step + 1 < QK_STEPS<T>) {
             static_for<DEQ_PER_STEP<T>>([&](auto j) { deq_read(number<(step + 1) * DEQ_PER_STEP<T> + j.value>{}); });
         }
 
         static_for<N_TILES_SUB<T>>([&](auto e2) {
             constexpr int e = ns * N_TILES_SUB<T> + e2.value;
-            s_tiles[e] = pin_vgpr<S_VGPR_BASE + e * ACC_PER_TILE<T>>(
+            s_tiles[e] = pin_vgpr<S_VGPR_BASE<T> + SLOT * S_ELEMS<T> + e * ACC_PER_TILE<T>>(
                 mfma_qk(v_k[b][e2.value], v_q[ek], s_tiles[e], scale_k[e], scale_q, number<ek>{}, number<ek>{}));
         });
 
         static_for<DEQ_PER_STEP<T>>([&](auto j) { deq_write(number<step * DEQ_PER_STEP<T> + j.value>{}); });
+        issue_dma(number<step>{});
+        step_hook(number<step>{});
         __builtin_amdgcn_sched_barrier(0);
     });
 }
 
-template<class T, int NXT, class UK, class UKS, class UV, class VP, class VO, class VK, class VV, class SK>
-__device__ inline void compute_pv(char* smem, const UK& u_rk, const UKS& u_rk_scale, const UV& u_rv, int v_lane_off,
-                                  const VP& v_p, VO& v_o, VK& v_k, VV& v_v, SK& scale_k) {
+template<class T, class UV, class VP, class VO, class VV, class BH, class AH, class TH>
+__device__ inline void compute_pv(char* smem, const UV& u_rv, int v_lane_off, const VP& v_p, VO& v_o, VV& v_v,
+                                  const BH& b2_hook, const AH& after_b2, const TH& tail_hook) {
     using namespace opus;
     using D_PV = typename T::D_PV;
 
@@ -660,45 +654,40 @@ __device__ inline void compute_pv(char* smem, const UK& u_rk, const UKS& u_rk_sc
     const auto* p_chunks = reinterpret_cast<const p_chunk_t*>(&v_p);
     auto* o_tiles = reinterpret_cast<o_tile_t*>(&v_o);
 
-    constexpr int K_PRIME_STEPS  = K_DEPTH - 1;
-    constexpr int TAIL_STEPS     = V_DEPTH;
-    constexpr int SLOT_SWAP_STEP = PV_STEPS<T> - 1 - TAIL_STEPS;
-    constexpr int V_TILES        = PV_STEPS<T> * V_N_TILES<T>;
-    constexpr int V_RING_TILES   = V_DEPTH * V_N_TILES<T>;
+    constexpr int B2_STEP      = PV_STEPS<T> - 1 - PV_TAIL_STEPS;
+    constexpr int V_RING_TILES = V_DEPTH * V_N_TILES<T>;
+
+    static_for<V_DEPTH>([&](auto i) { load_v_step<T, i.value, i.value>(smem, u_rv, v_lane_off, v_v); });
 
     static_for<PV_STEPS<T>>([&](auto st) {
-        constexpr int step = st.value;
-        constexpr int b    = step % V_DEPTH;
-        constexpr int ks   = step / DV_STEPS<T>;
-        constexpr int dv   = step % DV_STEPS<T>;
+        constexpr int step    = st.value;
+        constexpr int b       = step % V_DEPTH;
+        constexpr int ks      = step / DV_STEPS<T>;
+        constexpr int dv      = step % DV_STEPS<T>;
+        constexpr bool REFILL = step <= B2_STEP;
 
-        if constexpr (step > SLOT_SWAP_STEP) {
-            constexpr int t  = step - SLOT_SWAP_STEP - 1;
-            constexpr int k0 = (t * K_PRIME_STEPS + TAIL_STEPS - 1) / TAIL_STEPS;
-            constexpr int k1 = ((t + 1) * K_PRIME_STEPS + TAIL_STEPS - 1) / TAIL_STEPS;
-            static_for<k1 - k0>([&](auto i) { load_k_step<T, NXT, k0 + i.value, k0 + i.value>(smem, u_rk, v_k); });
-        }
+        if constexpr (!REFILL) tail_hook(number<step - B2_STEP - 1>{});
 
         static_for<V_N_TILES<T>>([&](auto en) {
             constexpr int j  = step * V_N_TILES<T> + en.value;
             constexpr int ot = dv * V_N_TILES<T> + en.value;
-            if constexpr (step <= SLOT_SWAP_STEP) {
-                constexpr int v_last = j + V_RING_TILES - 1 < V_TILES - 1 ? j + V_RING_TILES - 1 : V_TILES - 1;
-                s_waitcnt_lgkmcnt(number<(v_last - j) * V_TR_PER_TILE<T>>{});
+            if constexpr (REFILL) {
+                s_waitcnt_lgkmcnt(number<(V_RING_TILES - 1) * V_TR_PER_TILE<T>>{});
                 __builtin_amdgcn_sched_barrier(0);
             }
-            o_tiles[ot] = pin_vgpr<O_VGPR_BASE + ot * ACC_PER_TILE<T>>(mfma_pv(p_chunks[ks], v_v[b][en.value], o_tiles[ot]));
-            if constexpr (j + V_RING_TILES < V_TILES) {
-                load_v_tile<T, (j + V_RING_TILES) / V_N_TILES<T>, en.value, b>(smem, u_rv, v_lane_off, v_v);
-            }
+            const auto v_op = pin_agpr<V_AGPR_BASE<T> + j % V_SLOTS<T> * V_AGPRS<T>>(v_v[b][en.value]);
+            if constexpr (REFILL) load_v_tile<T, step + V_DEPTH, en.value, b, 0, 1>(smem, u_rv, v_lane_off, v_v);
+            o_tiles[ot] = pin_vgpr<O_VGPR_BASE + ot * ACC_PER_TILE<T>>(mfma_pv(p_chunks[ks], v_op, o_tiles[ot]));
+            if constexpr (REFILL) load_v_tile<T, step + V_DEPTH, en.value, b, 1>(smem, u_rv, v_lane_off, v_v);
         });
 
-        if constexpr (step == SLOT_SWAP_STEP) {
+        if constexpr (step == B2_STEP) {
+            b2_hook();
             s_waitcnt_lgkmcnt(0_I);
             __builtin_amdgcn_sched_barrier(0);
             s_waitcnt_vmcnt(0_I);
             __builtin_amdgcn_s_barrier();
-            scale_k = load_k_scale<T, NXT>(smem, u_rk_scale);
+            after_b2();
         }
         __builtin_amdgcn_sched_barrier(0);
     });
@@ -706,113 +695,102 @@ __device__ inline void compute_pv(char* smem, const UK& u_rk, const UKS& u_rk_sc
 
 // ----------------------------------------------------------------------------------- softmax
 
-template<int THR_X, int THR_Y>
-__device__ inline void attn_mask_vec2_imm(opus::u32_t rel, opus::u32_t neg_inf_v,
-                                          opus::u32_t& x_ref, opus::u32_t& y_ref) {
-    opus::u64_t x_mask, y_mask;
-    asm volatile(
-        "v_cmp_lt_i32_e64 %0, %6, %7\n\t"
-        "v_cmp_lt_i32_e64 %1, %6, %9\n\t"
-        "v_cndmask_b32_e64 %2, %4, %8, %0\n\t"
-        "v_cndmask_b32_e64 %3, %5, %8, %1\n\t"
-        : "=s"(x_mask), "=s"(y_mask), "=v"(x_ref), "=v"(y_ref)
-        : "v"(x_ref), "v"(y_ref), "v"(rel),
-          "n"(THR_X), "v"(neg_inf_v), "n"(THR_Y)
-        : "vcc"
-    );
-}
-
 template<class T, class V>
-__device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_tile_idx, opus::u32_t neg_inf_v) {
+__device__ inline void mask_tail_tile(V& v_s, int valid_rows, int lane_id) {
     using D_ACC = typename T::D_ACC;
-    using D_ACC_X2 = opus::vector_t<D_ACC, 2>;
-    using U32_X2 = opus::vector_t<opus::u32_t, 2>;
-
-    constexpr int c_pack = T::W_M * T::W_N / T::WARP_SIZE;
-
-    const int last_valid_kv_pos = valid_kv_len - 1;
-    const int k_start_pos = kv_tile_idx * T::KV_TILE_SIZE;
-    int lane_id = opus::thread_id_x() % T::WARP_SIZE;
-    asm volatile("" : "+v"(lane_id));
-    const int lane_group = lane_id / T::W_N;
-
-    opus::static_for<T::GEMM0_E_N>([&](auto i_n) {
-        const int k_pos = k_start_pos + i_n.value * T::W_N + lane_group * c_pack;
-        const opus::u32_t rel = static_cast<opus::u32_t>(last_valid_kv_pos - k_pos);
-
-        opus::static_for<c_pack / 2>([&](auto i_pair) {
-            constexpr int idx = i_n.value * c_pack + i_pair.value * 2;
-            auto pair_bits = __builtin_bit_cast(U32_X2, opus::slice(v_s, opus::number<idx>{}, opus::number<idx + 2>{}));
-            opus::u32_t x_ref = pair_bits[0];
-            opus::u32_t y_ref = pair_bits[1];
-            attn_mask_vec2_imm<i_pair.value * 2, i_pair.value * 2 + 1>(rel, neg_inf_v, x_ref, y_ref);
-            pair_bits[0] = x_ref;
-            pair_bits[1] = y_ref;
-            opus::set_slice(v_s, __builtin_bit_cast(D_ACC_X2, pair_bits), opus::number<idx>{}, opus::number<idx + 2>{});
+    const int lane_row = lane_id / T::W_N * ACC_PER_TILE<T>;
+    opus::static_for<T::GEMM0_E_N>([&](auto e) {
+        const int rel = valid_rows - 1 - e.value * T::W_N - lane_row;
+        opus::static_for<ACC_PER_TILE<T>>([&](auto j) {
+            constexpr int idx = e.value * ACC_PER_TILE<T> + j.value;
+            v_s[idx] = rel < j.value ? -opus::numeric_limits<D_ACC>::infinity() : v_s[idx];
         });
     });
 }
 
-template<class T, class V>
-__device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
-    using D_ACC = typename T::D_ACC;
-    D_ACC row_max = opus::numeric_limits<D_ACC>::lowest();
-    opus::static_for<S_ELEMS<T>>([&](auto i) { row_max = max(row_max, v_s[i.value]); });
-
-    opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
-    row_max = max(std::bit_cast<D_ACC>(res32.x), std::bit_cast<D_ACC>(res32.y));
-    opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
-    return max(std::bit_cast<D_ACC>(res16.x), std::bit_cast<D_ACC>(res16.y));
-}
-
-template<class T, class V>
-__device__ inline typename T::D_ACC attn_row_sum(const V& v_s) {
-    using D_ACC = typename T::D_ACC;
-    D_ACC row_sum = D_ACC(0.0f);
-    opus::static_for<S_ELEMS<T>>([&](auto i) { row_sum += v_s[i.value]; });
-
-    opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
-    row_sum = std::bit_cast<D_ACC>(res32.x) + std::bit_cast<D_ACC>(res32.y);
-    opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
-    return std::bit_cast<D_ACC>(res16.x) + std::bit_cast<D_ACC>(res16.y);
+template<class T, class VO, class F>
+__device__ inline void update_o(VO& v_o, const F& f) {
+    using acc_tile_t = opus::vector_t<typename T::D_ACC, ACC_PER_TILE<T>>;
+    auto* o_tiles = reinterpret_cast<acc_tile_t*>(&v_o);
+    opus::static_for<O_ELEMS<T> / ACC_PER_TILE<T>>([&](auto i) {
+        o_tiles[i.value] = pin_vgpr<O_VGPR_BASE + i.value * ACC_PER_TILE<T>>(f(o_tiles[i.value]));
+    });
 }
 
 template<class T, class VO>
-__device__ inline void scale_o_tile(VO& v_o, typename T::D_ACC scale) {
-    using namespace opus;
-    using acc_tile_t = vector_t<typename T::D_ACC, ACC_PER_TILE<T>>;
-    auto o_tiles = reinterpret_cast<acc_tile_t*>(&v_o);
-    static_for<O_ELEMS<T> / ACC_PER_TILE<T>>([&](auto i) {
-        o_tiles[i.value] = pin_vgpr<O_VGPR_BASE + i.value * ACC_PER_TILE<T>>(o_tiles[i.value] * scale);
-    });
+__device__ inline void pin_o(VO& v_o) {
+    update_o<T>(v_o, [](const auto& o) { return o; });
 }
 
-template<class T, class VS, class VP, class VO>
-__device__ inline void softmax_tile(VS& v_s, VP& v_p, VO& v_o,
-                                    typename T::D_ACC& m_row, typename T::D_ACC& l_row,
-                                    typename T::D_ACC temperature_scale) {
+template<class T, class VO>
+__device__ inline void scale_o(VO& v_o, typename T::D_ACC scale) {
+    update_o<T>(v_o, [&](const auto& o) { return o * scale; });
+}
+
+template<class D, class F>
+__device__ inline D row_reduce(D x, const F& op) {
+    using opus::u32_t;
+    const auto r32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<u32_t>(x), std::bit_cast<u32_t>(x), false, true);
+    x = op(std::bit_cast<D>(r32.x), std::bit_cast<D>(r32.y));
+    const auto r16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<u32_t>(x), std::bit_cast<u32_t>(x), false, true);
+    return op(std::bit_cast<D>(r16.x), std::bit_cast<D>(r16.y));
+}
+
+template<class T>
+struct softmax_state {
+    typename T::D_ACC row_max;
+    typename T::D_ACC sum;
+    bool all_below;
+};
+
+template<class T, int STEP, class VS, class VP>
+__device__ inline void softmax_step(VS& v_s, VP& v_p, softmax_state<T>& st,
+                                    typename T::D_ACC m_row, typename T::D_ACC temperature_scale) {
+    using namespace opus;
     using D_ACC = typename T::D_ACC;
     constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
+    constexpr int EXP_STEPS = 4;
+    constexpr int EXP_PER_STEP = S_ELEMS<T> / EXP_STEPS;
+    static_assert(QK_STEPS<T> == 2 + EXP_STEPS + 2);
 
-    D_ACC row_max = attn_row_max<T>(v_s) * temperature_scale;
-    const bool all_below = __builtin_amdgcn_ballot_w64((row_max - m_row) <= RESCALE_THRESHOLD)
-                        == __builtin_amdgcn_read_exec();
-    row_max = all_below ? m_row : max(m_row, row_max);
-
-    opus::static_for<S_ELEMS<T>>([&](auto i) {
-        v_s[i.value] = __builtin_amdgcn_exp2f(__builtin_fmaf(v_s[i.value], temperature_scale, -row_max));
-    });
-    const D_ACC row_sum = attn_row_sum<T>(v_s);
-    v_p = opus::cast<typename T::D_PV>(v_s);
-    asm volatile("" : "+v"(v_p));
-
-    if (!all_below) {
-        const D_ACC rescale = __builtin_amdgcn_exp2f(m_row - row_max);
-        m_row = row_max;
-        l_row *= rescale;
-        scale_o_tile<T>(v_o, rescale);
+    if constexpr (STEP == 0) {
+        D_ACC mx = numeric_limits<D_ACC>::lowest();
+        static_for<S_ELEMS<T>>([&](auto i) { mx = max(mx, v_s[i.value]); });
+        st.row_max = mx;
+    } else if constexpr (STEP == 1) {
+        const D_ACC row_max = row_reduce(st.row_max, [](D_ACC a, D_ACC b) { return max(a, b); }) * temperature_scale;
+        st.all_below = __builtin_amdgcn_ballot_w64((row_max - m_row) <= RESCALE_THRESHOLD) == __builtin_amdgcn_read_exec();
+        st.row_max = st.all_below ? m_row : max(m_row, row_max);
+    } else if constexpr (STEP < 2 + EXP_STEPS) {
+        const D_ACC neg_max = -st.row_max;
+        static_for<EXP_PER_STEP>([&](auto k) {
+            constexpr int i = (STEP - 2) * EXP_PER_STEP + k.value;
+            D_ACC x;
+            asm("v_fma_f32 %0, %1, %2, %3" : "=v"(x) : "v"(v_s[i]), "v"(temperature_scale), "v"(neg_max));
+            v_s[i] = __builtin_amdgcn_exp2f(x);
+        });
+    } else if constexpr (STEP == 2 + EXP_STEPS) {
+        D_ACC sum = D_ACC(0.0f);
+        static_for<S_ELEMS<T>>([&](auto i) { sum += v_s[i.value]; });
+        st.sum = sum;
+    } else {
+        v_p = cast<typename T::D_PV>(v_s);
+        asm volatile("" : "+v"(v_p));
+        st.sum = row_reduce(st.sum, [](D_ACC a, D_ACC b) { return a + b; });
     }
-    l_row += row_sum;
+}
+
+template<class T, class VO>
+__device__ inline void softmax_finish(const softmax_state<T>& st, VO& v_o,
+                                      typename T::D_ACC& m_row, typename T::D_ACC& l_row) {
+    using D_ACC = typename T::D_ACC;
+    if (__builtin_expect(!st.all_below, 0)) {
+        const D_ACC rescale = __builtin_amdgcn_exp2f(m_row - st.row_max);
+        m_row = st.row_max;
+        l_row *= rescale;
+        scale_o<T>(v_o, rescale);
+    }
+    l_row += st.sum;
 }
 
 // --------------------------------------------------------------------------------- epilogue
@@ -847,7 +825,6 @@ __device__ void attention_segment(const opus_mla_v41_prefill_kargs& kargs,
                                   typename T::D_ACC temperature_scale) {
     using namespace opus;
     using D_ATTN = typename T::D_ATTN;
-    using D_ACC  = typename T::D_ACC;
 
     const int page_idx_begin = kv_indptr[q_token_idx];
     const int valid_kv_len   = kv_indptr[q_token_idx + 1] - page_idx_begin;
@@ -875,80 +852,147 @@ __device__ void attention_segment(const opus_mla_v41_prefill_kargs& kargs,
     auto u_sv_dequant = make_layout_sv_dequant<T>(warp_id, lane_id);
     const int v_lane_off = layout_to_offsets<T::VEC_TR_V>(u_rv)[0];
 
-    const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
-
-    v_s_t<T> v_s;
-    auto& v_p = reinterpret_cast<v_p_t<T>&>(v_s);
+    v_s_t<T> v_s[2];
     v_k_t<T> v_k[K_DEPTH][N_TILES_SUB<T>];
     v_v_t<T> v_v[V_DEPTH][V_N_TILES<T>];
     vector_t<int, T::GEMM0_E_N> scale_k;
     vector_t<D_ATTN, T::VEC_DEQ> deq_src[DEQ_RING<T>];
     vector_t<D_ATTN, 1> deq_e8m0[DEQ_RING<T>];
 
-    auto load_pages = [&](int tile_idx) { return load<1>(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE); };
-    decltype(load_pages(0)) kv_pages;
+    const auto kv_rows = layout_to_offsets<1>(u_kv_indices);
+    vector_t<int, T::smem_n_sub_tile_rpt> kv_pages;
+    auto load_pages = [&](int tile_idx) {
+        static_for<T::smem_n_sub_tile_rpt>([&](auto ig) {
+            kv_pages[ig.value] = load<1>(g_kv_indices, min(kv_rows[ig.value] + tile_idx * T::KV_TILE_SIZE, valid_kv_len - 1))[0];
+        });
+    };
 
-    auto run_tile = [&](auto cur, int tile_idx) {
+    softmax_state<T> st;
+    auto sm_head = [&](auto buf) {
+        auto& s = v_s[decltype(buf)::value];
+        softmax_step<T, 0>(s, s, st, m_row, temperature_scale);
+        softmax_step<T, 1>(s, s, st, m_row, temperature_scale);
+    };
+    auto deq_prefetch = [&](auto slot) {
+        static_for<DEQ_PER_STEP<T>>([&](auto j) {
+            dequant_read<T, decltype(slot)::value, j.value>(smem, smem, u_rv_dequant, u_rs_dequant, deq_src, deq_e8m0);
+        });
+    };
+
+    auto run_stage = [&](auto cur, int tile_idx, auto has_prev) {
         constexpr int CUR = decltype(cur)::value;
         constexpr int NXT = 1 - CUR;
+        constexpr bool PREV = decltype(has_prev)::value;
 
         auto kv_lds   = kv_lds_base<T, NXT>(smem, u_skv);
-        auto kv_gmem  = kv_gmem_bases<T>(p_kv, u_gkv, kv_pages, kargs.stride_kv_page);
+        auto kv_gmem  = page_gmem_bases<T, T::VEC_KV>(p_kv, u_gkv, kv_pages, kargs.stride_kv_page);
         auto scl_lds  = scale_lds_bases<T, NXT>(smem, u_sk_scale);
-        auto scl_gmem = scale_gmem_bases<T>(p_scale, u_gk_scale, kv_pages, kargs.stride_kv_scale_page);
+        auto scl_gmem = page_gmem_bases<T, T::VEC_SCALE>(p_scale, u_gk_scale, kv_pages, kargs.stride_kv_scale_page);
         auto issue_dma = [&](auto idx) {
             constexpr int i = decltype(idx)::value;
+            constexpr int SCALE_STEPS = QK_STEPS<T> / T::scale_async_load_insts;
             if constexpr (i < T::kv_async_load_insts) async_load_kv_inst<T, i>(kv_gmem, kv_lds, u_skv);
-            if constexpr (i < T::scale_async_load_insts) global_load_lds<T::VEC_SCALE, 0, 0>(scl_gmem[i], scl_lds[i]);
+            if constexpr (i % SCALE_STEPS == SCALE_STEPS - 1) {
+                global_load_lds<T::VEC_SCALE, 0, 0>(scl_gmem[i / SCALE_STEPS], scl_lds[i / SCALE_STEPS]);
+            }
+        };
+
+        auto& s_prev = v_s[NXT];
+        auto& p_prev = reinterpret_cast<v_p_t<T>&>(s_prev);
+        auto deq_read = [&](auto i) {
+            if constexpr (PREV) dequant_read<T, NXT, decltype(i)::value>(smem, smem, u_rv_dequant, u_rs_dequant, deq_src, deq_e8m0);
+        };
+        auto deq_write = [&](auto i) {
+            if constexpr (PREV) dequant_write<T, decltype(i)::value>(smem, u_sv_dequant, deq_src, deq_e8m0);
+        };
+        auto sm_step = [&](auto i) {
+            constexpr int k = decltype(i)::value + 2;
+            if constexpr (PREV && k < QK_STEPS<T>) softmax_step<T, k>(s_prev, p_prev, st, m_row, temperature_scale);
         };
 
         const int valid_rows = valid_kv_len - tile_idx * T::KV_TILE_SIZE;
-        auto deq_read = [&](auto i) {
-            dequant_read<T, CUR, decltype(i)::value>(smem, u_rv_dequant, u_rs_dequant, deq_src, deq_e8m0);
-        };
-        auto deq_write = [&](auto i) {
-            dequant_write<T, decltype(i)::value>(smem, u_sv_dequant, deq_src, deq_e8m0, valid_rows, warp_id, lane_id);
-        };
-
-        clear(v_s);
-        compute_qk<T, CUR>(smem, u_rk, v_q, scale_q, scale_k, v_s, v_k, deq_read, deq_write, issue_dma);
-        kv_pages = load_pages(tile_idx + 2);
+        clear(v_s[CUR]);
+        compute_qk<T, CUR>(smem, u_rk, v_q, scale_q, scale_k, v_s[CUR], v_k, deq_read, deq_write, issue_dma, sm_step);
+        if (__builtin_expect(valid_rows < T::KV_TILE_SIZE, 0)) {
+            mask_tail_tile<T>(v_s[CUR], valid_rows, lane_id);
+        }
+        if constexpr (PREV) softmax_finish<T>(st, v_o, m_row, l_row);
+        load_pages(tile_idx + 2);
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
-        static_for<V_DEPTH>([&](auto i) { load_v_step<T, i.value, i.value>(smem, u_rv, v_lane_off, v_v); });
-
-        if (valid_rows < T::KV_TILE_SIZE) {
-            attn_mask_oob_kv_tile<T>(v_s, valid_kv_len, tile_idx, neg_inf_v);
+        if constexpr (PREV) {
+            auto load_k_part = [&](auto part) {
+                constexpr int t = decltype(part)::value;
+                load_k_steps<T, NXT, ceil_div(t * (K_DEPTH - 1), PV_TAIL_STEPS),
+                             ceil_div((t + 1) * (K_DEPTH - 1), PV_TAIL_STEPS)>(smem, u_rk, v_k);
+                if constexpr (t == PV_TAIL_STEPS - 1) deq_prefetch(number<CUR>{});
+            };
+            compute_pv<T>(smem, u_rv, v_lane_off, p_prev, v_o, v_v, [&] { sm_head(number<CUR>{}); },
+                          [&] { scale_k = load_k_scale<T, NXT>(smem, u_rk_scale); }, load_k_part);
+        } else {
+            sm_head(number<CUR>{});
+            s_waitcnt_vmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+            scale_k = load_k_scale<T, NXT>(smem, u_rk_scale);
+            load_k_steps<T, NXT, 0, K_DEPTH - 1>(smem, u_rk, v_k);
+            deq_prefetch(number<CUR>{});
         }
-        softmax_tile<T>(v_s, v_p, v_o, m_row, l_row, temperature_scale);
-        compute_pv<T, NXT>(smem, u_rk, u_rk_scale, u_rv, v_lane_off, v_p, v_o, v_k, v_v, scale_k);
     };
 
-    kv_pages = load_pages(0);
+    auto run_last = [&](int last_slot) {
+        if (last_slot) v_s[0] = v_s[1];
+        char* smem_k     = smem + last_slot * T::smem_kv_bytes;
+        char* smem_scale = smem + last_slot * T::smem_scale_bytes;
+        auto& p_last = reinterpret_cast<v_p_t<T>&>(v_s[0]);
+        static_for<QK_STEPS<T>>([&](auto stp) {
+            constexpr int step = stp.value;
+            if constexpr (step + 1 < QK_STEPS<T>) {
+                static_for<DEQ_PER_STEP<T>>([&](auto j) {
+                    dequant_read<T, 0, (step + 1) * DEQ_PER_STEP<T> + j.value>(smem_k, smem_scale, u_rv_dequant, u_rs_dequant,
+                                                                               deq_src, deq_e8m0);
+                });
+            }
+            if constexpr (step + 2 < QK_STEPS<T>) softmax_step<T, step + 2>(v_s[0], p_last, st, m_row, temperature_scale);
+            static_for<DEQ_PER_STEP<T>>([&](auto j) {
+                dequant_write<T, step * DEQ_PER_STEP<T> + j.value>(smem, u_sv_dequant, deq_src, deq_e8m0);
+            });
+            __builtin_amdgcn_sched_barrier(0);
+        });
+        softmax_finish<T>(st, v_o, m_row, l_row);
+        s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
+        compute_pv<T>(smem, u_rv, v_lane_off, p_last, v_o, v_v, [] {}, [] {}, [](auto) {});
+    };
+
+    load_pages(0);
     __builtin_amdgcn_sched_barrier(0);
     issue_q();
     __builtin_amdgcn_sched_barrier(0);
-    async_load_kv_tile<T>(kv_gmem_bases<T>(p_kv, u_gkv, kv_pages, kargs.stride_kv_page),
+    async_load_kv_tile<T>(page_gmem_bases<T, T::VEC_KV>(p_kv, u_gkv, kv_pages, kargs.stride_kv_page),
                           kv_lds_base<T, 0>(smem, u_skv), u_skv);
-    async_load_scale_tile<T>(scale_gmem_bases<T>(p_scale, u_gk_scale, kv_pages, kargs.stride_kv_scale_page),
+    async_load_scale_tile<T>(page_gmem_bases<T, T::VEC_SCALE>(p_scale, u_gk_scale, kv_pages, kargs.stride_kv_scale_page),
                              scale_lds_bases<T, 0>(smem, u_sk_scale));
-    kv_pages = load_pages(1);
+    load_pages(1);
     s_waitcnt_vmcnt(0_I);
     __builtin_amdgcn_s_barrier();
     scale_k = load_k_scale<T, 0>(smem, u_rk_scale);
     read_q();
-    static_for<K_DEPTH - 1>([&](auto i) { load_k_step<T, 0, i.value, i.value>(smem, u_rk, v_k); });
+    load_k_steps<T, 0, 0, K_DEPTH - 1>(smem, u_rk, v_k);
 
-    int tile_idx = 0;
+    run_stage(0_I, 0, false_type{});
+    int tile_idx = 1;
     #pragma clang loop unroll(disable)
     for (; tile_idx + 1 < num_kv_tiles; tile_idx += 2) {
-        run_tile(0_I, tile_idx);
-        run_tile(1_I, tile_idx + 1);
+        pin_o<T>(v_o);
+        run_stage(1_I, tile_idx, true_type{});
+        run_stage(0_I, tile_idx + 1, true_type{});
     }
     if (tile_idx < num_kv_tiles) {
-        run_tile(0_I, tile_idx);
+        run_stage(1_I, tile_idx, true_type{});
+        ++tile_idx;
     }
+    run_last(1 - (tile_idx & 1));
 }
 
 } // namespace opus_mla_v41_prefill_a8w8_16mx4_64nx1
@@ -1024,7 +1068,7 @@ void opus_mla_v41_prefill_a8w8_16mx4_64nx1_kernel(opus_mla_v41_prefill_kargs kar
     const D_ACC m_final = max(m_row, sink_log2);
     const D_ACC alpha   = __builtin_amdgcn_exp2f(m_row - m_final);
     const D_ACC l_final = l_row * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);
-    scale_o_tile<T>(v_o, (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f));
+    scale_o<T>(v_o, (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f));
 
     const int64_t o_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_o_n
                                 + static_cast<int64_t>(h_block_start) * kargs.stride_o_h;
