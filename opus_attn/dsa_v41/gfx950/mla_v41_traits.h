@@ -62,7 +62,7 @@ struct opus_mla_v41_prefill_a8w8_16mx4_64nx1_traits {
 
     // Scale rows ride the K lanes (8 per row), so each row takes a 32 B slot holding its 16 B twice.
     static constexpr int smem_scale_row = D_128B_SIZE / VEC_KV * VEC_SCALE;
-    static constexpr int smem_scale_padding = 8;
+    static constexpr int smem_scale_padding = 16;
     static constexpr int smem_scale_brick = smem_n_per_wave * smem_scale_row + smem_scale_padding;
     static constexpr int scale_async_load_insts = smem_n_sub_tile_rpt;
     static constexpr int smem_scale_bytes = smem_n_rpt * smem_scale_brick;
