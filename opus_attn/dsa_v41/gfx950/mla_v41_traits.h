@@ -75,5 +75,10 @@ struct opus_mla_v41_prefill_a8w8_16mx4_64nx1_traits {
     static constexpr int deq_rows_per_inst = WARP_SIZE * VEC_DEQ / D_128B_SIZE;
     static constexpr int deq_insts = smem_n_sub_tile_rpt * smem_d_rpt * smem_n_per_wave / deq_rows_per_inst;
 
-    static constexpr int smem_bytes() { return 2 * smem_kv_bytes + 2 * smem_scale_bytes + smem_v_bytes; }
+    static constexpr int smem_p_bytes   = NUM_WARPS * Q_TILE_SIZE * KV_TILE_SIZE * sizeof(D_PV);
+    static constexpr int smem_fac_bytes = NUM_WARPS * Q_TILE_SIZE * sizeof(D_ACC);
+
+    static constexpr int smem_bytes() {
+        return 2 * smem_kv_bytes + 2 * smem_scale_bytes + smem_v_bytes + smem_p_bytes + smem_fac_bytes;
+    }
 };
