@@ -593,9 +593,11 @@ __device__ inline void dequant_read(char* smem_k, char* smem_scale, const UD& u_
                                     DS& deq_src, DE& deq_scale) {
     using namespace opus;
     using D_ATTN = typename T::D_ATTN;
+    using raw_t = vector_t<u32_t, T::VEC_DEQ / 4>;
     constexpr int r = I % DEQ_RING<T>;
     auto s_k = make_smem(reinterpret_cast<D_ATTN*>(smem_k + k_slot_base<T, SLOT>));
-    deq_src[r] = load<T::VEC_DEQ>(s_k, layout_to_offsets<T::VEC_DEQ>(u_rv_dequant)[I]);
+    const auto* src = reinterpret_cast<volatile OPUS_LDS_ADDR raw_t*>(s_k.ptr + layout_to_offsets<T::VEC_DEQ>(u_rv_dequant)[I]);
+    deq_src[r] = __builtin_bit_cast(vector_t<D_ATTN, T::VEC_DEQ>, raw_t(*src));
     if constexpr (I % DEQ_PER_IG<T> < DEQ_RH<T>) {
         constexpr int row = deq_scale_row<T, I>;
         auto s_scale = make_smem(reinterpret_cast<D_ATTN*>(smem_scale + scale_slot_base<T, SLOT>));
