@@ -34,13 +34,19 @@ constexpr int K_DEPTH       = 4;
 constexpr int V_DEPTH       = 2;
 constexpr int PV_TAIL_STEPS = V_DEPTH;
 
+constexpr int MFMA_MASK     = 0x008;
+constexpr int DS_READ_MASK  = 0x100;
+constexpr int DS_WRITE_MASK = 0x200;
+
 template<class T> constexpr int QK_STEPS     = T::smem_n_sub_tile_rpt * T::GEMM0_E_K;
+template<class T> constexpr int SM_STEPS     = QK_STEPS<T> + 1;
 template<class T> constexpr int DV_STEPS     = T::D_HEAD_SIZE / T::D_128B_V_SIZE;
 template<class T> constexpr int PV_STEPS     = T::GEMM1_E_K * DV_STEPS<T>;
 template<class T> constexpr int DEQ_PER_STEP = T::deq_insts / QK_STEPS<T>;
 template<class T> constexpr int DEQ_RING     = 2 * DEQ_PER_STEP<T>;
 template<class T> constexpr int DEQ_RH       = T::smem_n_per_wave / T::deq_rows_per_inst;
 template<class T> constexpr int DEQ_PER_IG   = T::smem_d_rpt * DEQ_RH<T>;
+template<class T> constexpr int QK_DS_READS  = N_TILES_SUB<T> * K_PIECES<T> + DEQ_PER_STEP<T> + DEQ_RH<T>;
 
 // ---------------------------------------------------------------------------- register budget
 
@@ -321,7 +327,7 @@ __device__ inline auto make_layout_rv_dequant(int warp_id, int lane_id) {
         opus::number<T::smem_n_sub_tile_rpt>{},
         opus::number<T::smem_d_rpt>{},
         opus::number<T::NUM_WARPS>{},
-        opus::number<T::smem_n_per_wave / T::deq_rows_per_inst>{},
+        opus::number<DEQ_RH<T>>{},
         opus::number<T::deq_rows_per_inst>{},
         opus::number<threads_d>{},
         opus::number<T::VEC_DEQ>{});
@@ -340,30 +346,22 @@ __device__ inline auto make_layout_rv_dequant(int warp_id, int lane_id) {
 template<class T>
 __device__ inline auto make_layout_rs_dequant(int warp_id, int lane_id) {
     constexpr int threads_d = T::D_128B_SIZE / T::VEC_DEQ;
-    constexpr int blks_d = T::D_128B_SIZE / T::D_SCALE_BLOCK;
 
     constexpr auto rsd_shape = opus::make_tuple(
         opus::number<T::smem_n_sub_tile_rpt>{},
         opus::number<T::NUM_WARPS>{},
-        opus::number<T::smem_d_rpt>{},
-        opus::number<T::smem_n_per_wave / T::deq_rows_per_inst>{},
-        opus::number<T::deq_rows_per_inst>{},
-        opus::number<blks_d>{},
-        1_I);
+        opus::number<DEQ_RH<T>>{},
+        opus::number<T::deq_rows_per_inst>{});
 
     constexpr auto rsd_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}));
 
     return opus::make_layout(
         rsd_shape,
         opus::unfold_x_stride(rsd_dim, rsd_shape, opus::tuple{opus::number<T::smem_scale_brick>{},
-                                                              opus::number<blks_d>{},
-                                                              opus::number<T::smem_scale_row>{},
-                                                              1_I}),
-        opus::unfold_p_coord(rsd_dim, opus::tuple{warp_id, lane_id / threads_d, 0}));
+                                                              opus::number<T::smem_scale_row>{}}),
+        opus::unfold_p_coord(rsd_dim, opus::tuple{warp_id, lane_id / threads_d}));
 }
 
 template<class T>
@@ -373,7 +371,7 @@ __device__ inline auto make_layout_sv_dequant(int warp_id, int lane_id) {
     constexpr auto sd_shape = opus::make_tuple(
         opus::number<T::smem_n_sub_tile_rpt>{},
         opus::number<T::smem_d_rpt>{},
-        opus::number<T::smem_n_per_wave / T::deq_rows_per_inst>{},
+        opus::number<DEQ_RH<T>>{},
         opus::number<T::deq_rows_per_inst>{},
         opus::number<T::NUM_WARPS>{},
         opus::number<threads_d>{},
@@ -450,13 +448,6 @@ __device__ inline void async_load_kv_inst(const GB& gmem_bases, const LB& lds_ba
     global_load_lds<T::VEC_KV, m0_imm, g_imm>(gmem_bases[ig], lds_base);
 }
 
-template<class T, class GB, class LB, class US>
-__device__ inline void async_load_kv_tile(const GB& gmem_bases, const LB& lds_base, const US& u_skv) {
-    opus::static_for<T::kv_async_load_insts>([&](auto i) {
-        async_load_kv_inst<T, i.value>(gmem_bases, lds_base, u_skv);
-    });
-}
-
 template<class T, int SLOT, class US>
 __device__ inline auto scale_lds_bases(char* smem, const US& u_ss) {
     auto s_off = opus::layout_to_offsets<T::VEC_SCALE>(u_ss);
@@ -467,13 +458,6 @@ __device__ inline auto scale_lds_bases(char* smem, const US& u_ss) {
         bases[ig.value] = base;
     });
     return bases;
-}
-
-template<class T, class GB, class LB>
-__device__ inline void async_load_scale_tile(const GB& gmem_bases, const LB& lds_bases) {
-    opus::static_for<T::scale_async_load_insts>([&](auto ig) {
-        global_load_lds<T::VEC_SCALE, 0, 0>(gmem_bases[ig.value], lds_bases[ig.value]);
-    });
 }
 
 // ------------------------------------------------------------------------------------ q / k / v
@@ -568,6 +552,19 @@ __device__ inline void load_v_step(char* smem, const UV& u_rv, int v_lane_off, V
 
 // ----------------------------------------------------------------------------------- dequant
 
+template<class T, int I> constexpr int deq_scale_row = I / DEQ_PER_IG<T> * DEQ_RH<T> + I % DEQ_RH<T>;
+
+template<class T, int STEP, class F>
+__device__ inline void for_each_deq(const F& f) {
+    opus::static_for<DEQ_PER_STEP<T>>([&](auto j) { f(opus::number<STEP * DEQ_PER_STEP<T> + j.value>{}); });
+}
+
+template<class T>
+__device__ inline opus::u32_t dequant_scale_rot(int lane_id) {
+    const int scale_byte = (lane_id % (T::D_128B_SIZE / T::VEC_DEQ)) / (T::D_SCALE_BLOCK / T::VEC_DEQ);
+    return (8 * scale_byte - 23) & 31;
+}
+
 template<class T, int SLOT, int I, class UD, class UDS, class DS, class DE>
 __device__ inline void dequant_read(char* smem_k, char* smem_scale, const UD& u_rv_dequant, const UDS& u_rs_dequant,
                                     DS& deq_src, DE& deq_scale) {
@@ -577,9 +574,10 @@ __device__ inline void dequant_read(char* smem_k, char* smem_scale, const UD& u_
     auto s_k = make_smem(reinterpret_cast<D_ATTN*>(smem_k + k_slot_base<T, SLOT>));
     deq_src[r] = load<T::VEC_DEQ>(s_k, layout_to_offsets<T::VEC_DEQ>(u_rv_dequant)[I]);
     if constexpr (I % DEQ_PER_IG<T> < DEQ_RH<T>) {
+        constexpr int row = deq_scale_row<T, I>;
         auto s_scale = make_smem(reinterpret_cast<D_ATTN*>(smem_scale + scale_slot_base<T, SLOT>));
-        deq_scale[I / DEQ_PER_IG<T>][I % DEQ_RH<T>] = __builtin_bit_cast(
-            vector_t<u32_t, T::D_SCALE_SIZE / 4>, load<T::D_SCALE_SIZE>(s_scale, layout_to_offsets<1>(u_rs_dequant)[I]));
+        deq_scale[row] = __builtin_bit_cast(vector_t<u32_t, T::D_SCALE_SIZE / 4>,
+                                            load<T::D_SCALE_SIZE>(s_scale, layout_to_offsets<1>(u_rs_dequant)[row]));
     }
 }
 
@@ -591,8 +589,7 @@ __device__ inline void dequant_write(char* smem, const USD& u_sv_dequant, const 
     constexpr int r  = I % DEQ_RING<T>;
     constexpr int id = I % DEQ_PER_IG<T> / DEQ_RH<T>;
 
-    const float scale = std::bit_cast<float>(
-        __builtin_rotateright32(deq_scale[I / DEQ_PER_IG<T>][I % DEQ_RH<T>][id], scale_rot));
+    const float scale = std::bit_cast<float>(__builtin_rotateright32(deq_scale[deq_scale_row<T, I>][id], scale_rot));
     const auto src_w = __builtin_bit_cast(vector_t<u32_t, T::VEC_DEQ / 4>, deq_src[r]);
 
     vector_t<D_PV, T::VEC_DEQ> v_dst;
@@ -607,6 +604,16 @@ __device__ inline void dequant_write(char* smem, const USD& u_sv_dequant, const 
 }
 
 // -------------------------------------------------------------------------------------- gemm
+
+template<class T>
+__device__ inline void sched_qk_step() {
+    __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, QK_DS_READS<T>, 0);
+    opus::static_for<N_TILES_SUB<T>>([&](auto) {
+        __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
+        __builtin_amdgcn_sched_group_barrier(DS_WRITE_MASK, DEQ_PER_STEP<T> / N_TILES_SUB<T>, 0);
+    });
+    __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
+}
 
 template<class T, int SLOT, class UK, class VQ, class SK, class VS, class VK, class DR, class DW, class EM, class SH>
 __device__ inline void compute_qk(char* smem, const UK& u_rk, const VQ& v_q, int scale_q, const SK& scale_k,
@@ -630,9 +637,7 @@ __device__ inline void compute_qk(char* smem, const UK& u_rk, const VQ& v_q, int
         if constexpr (step + K_DEPTH - 1 < QK_STEPS<T>) {
             load_k_step<T, SLOT, step + K_DEPTH - 1>(smem, u_rk, v_k);
         }
-        if constexpr (step + 1 < QK_STEPS<T>) {
-            static_for<DEQ_PER_STEP<T>>([&](auto j) { deq_read(number<(step + 1) * DEQ_PER_STEP<T> + j.value>{}); });
-        }
+        if constexpr (step + 1 < QK_STEPS<T>) for_each_deq<T, step + 1>(deq_read);
 
         static_for<N_TILES_SUB<T>>([&](auto e2) {
             constexpr int e = ns * N_TILES_SUB<T> + e2.value;
@@ -640,9 +645,10 @@ __device__ inline void compute_qk(char* smem, const UK& u_rk, const VQ& v_q, int
                 mfma_qk(v_k[b][e2.value], v_q[ek], s_tiles[e], scale_k[e], scale_q, number<ek>{}, number<ek>{}));
         });
 
-        static_for<DEQ_PER_STEP<T>>([&](auto j) { deq_write(number<step * DEQ_PER_STEP<T> + j.value>{}); });
+        for_each_deq<T, step>(deq_write);
         issue_dma(number<step>{});
         step_hook(number<step>{});
+        sched_qk_step<T>();
         __builtin_amdgcn_sched_barrier(0);
     });
 }
@@ -746,7 +752,7 @@ __device__ inline D row_reduce(D x, const F& op) {
 template<class T>
 struct softmax_state {
     typename T::D_ACC row_max;
-    typename T::D_ACC sum;
+    opus::vector_t<typename T::D_ACC, ACC_PER_TILE<T>> sum_acc;
     bool all_below;
 };
 
@@ -758,7 +764,7 @@ __device__ inline void softmax_step(VS& v_s, VP& v_p, softmax_state<T>& st,
     constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
     constexpr int EXP_STEPS = 4;
     constexpr int EXP_PER_STEP = S_ELEMS<T> / EXP_STEPS;
-    static_assert(QK_STEPS<T> == 2 + EXP_STEPS + 2);
+    static_assert(SM_STEPS<T> == 3 + EXP_STEPS + T::GEMM1_E_K);
 
     if constexpr (STEP == 0) {
         D_ACC mx = numeric_limits<D_ACC>::lowest();
@@ -787,13 +793,12 @@ __device__ inline void softmax_step(VS& v_s, VP& v_p, softmax_state<T>& st,
             number<T::W_M>{}, number<T::W_N>{}, number<T::W_K_PV>{}, mfma_adaptor_swap_ab{});
         using p_chunk_t = typename decltype(mfma_sum)::vtype_a;
         using ones_t    = typename decltype(mfma_sum)::vtype_b;
-        typename decltype(mfma_sum)::vtype_c acc;
-        clear(acc);
+        constexpr int ks = STEP - 3 - EXP_STEPS;
+        if constexpr (ks == 0) clear(st.sum_acc);
         ones_t ones;
         static_for<vector_traits<ones_t>::size()>([&](auto i) { ones[i.value] = D_PV(1.0f); });
         const auto* p_chunks = reinterpret_cast<const p_chunk_t*>(&v_p);
-        static_for<T::GEMM1_E_K>([&](auto ks) { acc = mfma_sum(p_chunks[ks.value], ones, acc); });
-        st.sum = acc[0];
+        st.sum_acc = mfma_sum(p_chunks[ks], ones, st.sum_acc);
     }
 }
 
@@ -807,7 +812,7 @@ __device__ inline void softmax_finish(const softmax_state<T>& st, VO& v_o,
         l_row *= rescale;
         scale_o<T>(v_o, rescale);
     }
-    l_row += st.sum;
+    l_row += st.sum_acc[0];
 }
 
 // --------------------------------------------------------------------------------- epilogue
@@ -874,9 +879,8 @@ __device__ void attention_segment(const opus_mla_v41_prefill_kargs& kargs,
     v_v_t<T> v_v[V_DEPTH][V_N_TILES<T>];
     vector_t<int, T::GEMM0_E_N> scale_k;
     vector_t<D_ATTN, T::VEC_DEQ> deq_src[DEQ_RING<T>];
-    vector_t<u32_t, T::D_SCALE_SIZE / 4> deq_scale[T::smem_n_sub_tile_rpt][DEQ_RH<T>];
-    const int scale_byte = (lane_id % (T::D_128B_SIZE / T::VEC_DEQ)) / (T::D_SCALE_BLOCK / T::VEC_DEQ);
-    const u32_t scale_rot = (8 * scale_byte - 23) & 31;
+    vector_t<u32_t, T::D_SCALE_SIZE / 4> deq_scale[T::smem_n_sub_tile_rpt * DEQ_RH<T>];
+    const u32_t scale_rot = dequant_scale_rot<T>(lane_id);
 
     const auto kv_rows = layout_to_offsets<1>(u_kv_indices);
     vector_t<int, T::smem_n_sub_tile_rpt> kv_pages;
@@ -893,21 +897,18 @@ __device__ void attention_segment(const opus_mla_v41_prefill_kargs& kargs,
         softmax_step<T, 1>(s, s, st, m_row, temperature_scale);
     };
     auto deq_prefetch = [&](auto slot) {
-        static_for<DEQ_PER_STEP<T>>([&](auto j) {
-            dequant_read<T, decltype(slot)::value, j.value>(smem, smem, u_rv_dequant, u_rs_dequant, deq_src, deq_scale);
+        for_each_deq<T, 0>([&](auto i) {
+            dequant_read<T, decltype(slot)::value, i.value>(smem, smem, u_rv_dequant, u_rs_dequant, deq_src, deq_scale);
         });
     };
 
-    auto run_stage = [&](auto cur, int tile_idx, auto has_prev) {
-        constexpr int CUR = decltype(cur)::value;
-        constexpr int NXT = 1 - CUR;
-        constexpr bool PREV = decltype(has_prev)::value;
-
-        auto kv_lds   = kv_lds_base<T, NXT>(smem, u_skv);
+    auto make_dma = [&](auto slot) {
+        constexpr int SLOT = decltype(slot)::value;
+        auto kv_lds   = kv_lds_base<T, SLOT>(smem, u_skv);
         auto kv_gmem  = page_gmem_bases<T, T::VEC_KV>(p_kv, u_gkv, kv_pages, kargs.stride_kv_page);
-        auto scl_lds  = scale_lds_bases<T, NXT>(smem, u_sk_scale);
+        auto scl_lds  = scale_lds_bases<T, SLOT>(smem, u_sk_scale);
         auto scl_gmem = page_gmem_bases<T, T::VEC_SCALE>(p_scale, u_gk_scale, kv_pages, kargs.stride_kv_scale_page);
-        auto issue_dma = [&](auto idx) {
+        return [=](auto idx) {
             constexpr int i = decltype(idx)::value;
             constexpr int SCALE_STEPS = QK_STEPS<T> / T::scale_async_load_insts;
             if constexpr (i < T::kv_async_load_insts) async_load_kv_inst<T, i>(kv_gmem, kv_lds, u_skv);
@@ -915,6 +916,14 @@ __device__ void attention_segment(const opus_mla_v41_prefill_kargs& kargs,
                 global_load_lds<T::VEC_SCALE, 0, 0>(scl_gmem[i / SCALE_STEPS], scl_lds[i / SCALE_STEPS]);
             }
         };
+    };
+
+    auto run_stage = [&](auto cur, int tile_idx, auto has_prev) {
+        constexpr int CUR = decltype(cur)::value;
+        constexpr int NXT = 1 - CUR;
+        constexpr bool PREV = decltype(has_prev)::value;
+
+        auto issue_dma = make_dma(number<NXT>{});
 
         auto& s_prev = v_s[NXT];
         auto& p_prev = reinterpret_cast<v_p_t<T>&>(s_prev);
@@ -926,7 +935,7 @@ __device__ void attention_segment(const opus_mla_v41_prefill_kargs& kargs,
         };
         auto sm_step = [&](auto i) {
             constexpr int k = decltype(i)::value + 2;
-            if constexpr (PREV && k < QK_STEPS<T>) softmax_step<T, k>(s_prev, p_prev, st, m_row, temperature_scale);
+            if constexpr (PREV && k < SM_STEPS<T>) softmax_step<T, k>(s_prev, p_prev, st, m_row, temperature_scale);
         };
 
         const int valid_rows = valid_kv_len - tile_idx * T::KV_TILE_SIZE;
@@ -964,18 +973,17 @@ __device__ void attention_segment(const opus_mla_v41_prefill_kargs& kargs,
         char* smem_k     = smem + last_slot * T::smem_kv_bytes;
         char* smem_scale = smem + last_slot * T::smem_scale_bytes;
         auto& p_last = reinterpret_cast<v_p_t<T>&>(v_s[0]);
+        auto deq_read = [&](auto i) {
+            dequant_read<T, 0, decltype(i)::value>(smem_k, smem_scale, u_rv_dequant, u_rs_dequant, deq_src, deq_scale);
+        };
+        auto deq_write = [&](auto i) {
+            dequant_write<T, decltype(i)::value>(smem, u_sv_dequant, deq_src, deq_scale, scale_rot);
+        };
         static_for<QK_STEPS<T>>([&](auto stp) {
             constexpr int step = stp.value;
-            if constexpr (step + 1 < QK_STEPS<T>) {
-                static_for<DEQ_PER_STEP<T>>([&](auto j) {
-                    dequant_read<T, 0, (step + 1) * DEQ_PER_STEP<T> + j.value>(smem_k, smem_scale, u_rv_dequant, u_rs_dequant,
-                                                                               deq_src, deq_scale);
-                });
-            }
-            if constexpr (step + 2 < QK_STEPS<T>) softmax_step<T, step + 2>(v_s[0], p_last, st, m_row, temperature_scale);
-            static_for<DEQ_PER_STEP<T>>([&](auto j) {
-                dequant_write<T, step * DEQ_PER_STEP<T> + j.value>(smem, u_sv_dequant, deq_src, deq_scale, scale_rot);
-            });
+            if constexpr (step + 1 < QK_STEPS<T>) for_each_deq<T, step + 1>(deq_read);
+            if constexpr (step + 2 < SM_STEPS<T>) softmax_step<T, step + 2>(v_s[0], p_last, st, m_row, temperature_scale);
+            for_each_deq<T, step>(deq_write);
             __builtin_amdgcn_sched_barrier(0);
         });
         softmax_finish<T>(st, v_o, m_row, l_row);
@@ -988,10 +996,7 @@ __device__ void attention_segment(const opus_mla_v41_prefill_kargs& kargs,
     __builtin_amdgcn_sched_barrier(0);
     issue_q();
     __builtin_amdgcn_sched_barrier(0);
-    async_load_kv_tile<T>(page_gmem_bases<T, T::VEC_KV>(p_kv, u_gkv, kv_pages, kargs.stride_kv_page),
-                          kv_lds_base<T, 0>(smem, u_skv), u_skv);
-    async_load_scale_tile<T>(page_gmem_bases<T, T::VEC_SCALE>(p_scale, u_gk_scale, kv_pages, kargs.stride_kv_scale_page),
-                             scale_lds_bases<T, 0>(smem, u_sk_scale));
+    static_for<QK_STEPS<T>>(make_dma(0_I));
     load_pages(1);
     s_waitcnt_vmcnt(0_I);
     __builtin_amdgcn_s_barrier();
