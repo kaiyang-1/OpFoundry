@@ -1216,6 +1216,7 @@ void opus_mla_v41_prefill_a8w8_16mx4_64nx1_kernel(opus_mla_v41_prefill_kargs kar
     __builtin_amdgcn_s_barrier();
     const auto fac = __builtin_bit_cast(vector_t<D_ACC, PV_GROUPS<T>>, lds_read_b128_v(fac_addr<T>(smem, lane_id)));
     s_waitcnt_lgkmcnt(0_I);
+    __builtin_amdgcn_sched_barrier(0);
     scale_o<T>(v_o, fac, warp_id);
 
     const int64_t o_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_o_n
