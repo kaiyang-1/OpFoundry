@@ -309,6 +309,22 @@ bool validate_mla_v41_results(const DType* ref, const DType* gpu,
     return all_valid;
 }
 
+bool validate_mla_v41_lse(const float* ref, const float* gpu, size_t n, float atol = 2e-3f) {
+    size_t errors        = 0;
+    float  max_abs_delta = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const bool  both_inf = std::isinf(ref[i]) && ref[i] == gpu[i];
+        const float delta    = both_inf ? 0.0f : std::abs(gpu[i] - ref[i]);
+        if (!(delta <= atol)) {
+            if (errors++ < 10) printf("  lse mismatch [%zu] ref=%.6f gpu=%.6f\n", i, ref[i], gpu[i]);
+        } else {
+            max_abs_delta = std::max(max_abs_delta, delta);
+        }
+    }
+    printf("  lse: atol=%.0e max_abs_delta=%.3e | mismatch %zu/%zu\n", atol, max_abs_delta, errors, n);
+    return errors == 0;
+}
+
 template<class Traits>
 inline void dequant_mxfp8_row(const uint8_t* row, const uint8_t* scale, float* out) {
     constexpr int D = Traits::D_HEAD_SIZE;
@@ -318,7 +334,7 @@ inline void dequant_mxfp8_row(const uint8_t* row, const uint8_t* scale, float* o
 
 template<class Traits>
 inline void mla_v41_attention_compute(const float* q_dense, const float* kv_dense, int num_rows,
-                                      float sink, typename Traits::D_OUT* o_row) {
+                                      float sink, typename Traits::D_OUT* o_row, float* lse) {
     using O_t = typename Traits::D_OUT;
     constexpr int D = Traits::D_HEAD_SIZE;
     const float softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
@@ -330,6 +346,10 @@ inline void mla_v41_attention_compute(const float* q_dense, const float* kv_dens
         for (int d = 0; d < D; d++) dot += q_dense[d] * k[d];
         scores[p] = dot * softmax_scale;
     }
+    const float row_max = *std::max_element(scores.begin(), scores.end());
+    double      row_sum = 0.0;
+    for (int p = 0; p < num_rows; p++) row_sum += std::exp(double(scores[p] - row_max));
+    *lse = row_max + static_cast<float>(std::log(row_sum));
     float max_score = std::max(*std::max_element(scores.begin(), scores.end()), sink);
     float sum_exp = 0.0f;
     for (int p = 0; p < num_rows; p++) { scores[p] = std::exp(scores[p] - max_score); sum_exp += scores[p]; }
@@ -350,6 +370,7 @@ void mla_v41_attention_ref(
     const uint8_t* KV, const uint8_t* KV_scale,
     const float* AttnSink,
     typename Traits::D_OUT* O,
+    float* LSE,
     const int* kv_indptr_prefix,
     const int* kv_indices_prefix,
     const int* kv_indptr_extend,
@@ -372,6 +393,7 @@ void mla_v41_attention_ref(
         O_t* o_row = O + ((size_t)i * H + h) * D;
         if (num_rows <= 0) {
             for (int d = 0; d < D; d++) o_row[d] = static_cast<O_t>(0.0f);
+            LSE[(size_t)i * H + h] = std::numeric_limits<float>::infinity();
             return;
         }
 
@@ -391,18 +413,20 @@ void mla_v41_attention_ref(
                                       kv_dense.data() + (size_t)(num_prefix + p) * D);
         }
 
-        mla_v41_attention_compute<Traits>(q_dense.data(), kv_dense.data(), num_rows, AttnSink[h], o_row);
+        const float sink = AttnSink ? AttnSink[h] : -std::numeric_limits<float>::infinity();
+        mla_v41_attention_compute<Traits>(q_dense.data(), kv_dense.data(), num_rows, sink, o_row,
+                                          LSE + (size_t)i * H + h);
     });
 }
 
 template<class Traits>
 int run_mla_v41_prefill_case(int H, int N, int total_pages, int total_tokens,
-                             int topk, bool verify) {
+                             int topk, bool verify, bool with_sink, bool with_lse) {
     using OType = typename Traits::D_OUT;
     constexpr int D     = Traits::D_HEAD_SIZE;
     constexpr int SCALE = Traits::D_SCALE_SIZE;
-    printf("MLA-v4.1 Prefill Attention: H_Q=%d, N=%d, D=%d, mxfp8, total_pages=%d, total_tokens=%d, topk=%d\n",
-           H, N, D, total_pages, total_tokens, topk);
+    printf("MLA-v4.1 Prefill Attention: H_Q=%d, N=%d, D=%d, mxfp8, total_pages=%d, total_tokens=%d, topk=%d%s%s\n",
+           H, N, D, total_pages, total_tokens, topk, with_sink ? "" : ", no sink", with_lse ? ", lse" : "");
 
     const size_t q_rows = (size_t)N * H;
     const size_t o_size = q_rows * D;
@@ -416,6 +440,8 @@ int run_mla_v41_prefill_case(int H, int N, int total_pages, int total_tokens,
     auto host_kv_scale         = std::make_unique<uint8_t[]>((size_t)total_tokens * SCALE);
     auto host_o_ref            = std::make_unique<OType[]>(o_size);
     auto host_o_gpu            = std::make_unique<OType[]>(o_size);
+    auto host_lse_ref          = std::make_unique<float[]>(q_rows);
+    auto host_lse_gpu          = std::make_unique<float[]>(q_rows);
     const uint64_t seed_sink = MLA_V41_SEED + 1, seed_q = MLA_V41_SEED + 2, seed_ukv = MLA_V41_SEED + 3,
                    seed_kv = MLA_V41_SEED + 4, seed_idx_prefix = MLA_V41_SEED + 5,
                    seed_idx_extend = MLA_V41_SEED + 6;
@@ -441,7 +467,8 @@ int run_mla_v41_prefill_case(int H, int N, int total_pages, int total_tokens,
         mla_v41_attention_ref<Traits>(host_q.get(), host_q_scale.get(),
                                       host_unified_kv.get(), host_unified_kv_scale.get(),
                                       host_kv.get(), host_kv_scale.get(),
-                                      host_attn_sink.get(), host_o_ref.get(),
+                                      with_sink ? host_attn_sink.get() : nullptr,
+                                      host_o_ref.get(), host_lse_ref.get(),
                                       host_kv_indptr_prefix.data(), host_kv_indices_prefix.data(),
                                       host_kv_indptr_extend.data(), host_kv_indices_extend.data(), N, H);
 
@@ -453,6 +480,7 @@ int run_mla_v41_prefill_case(int H, int N, int total_pages, int total_tokens,
     dev_buf<uint8_t> dev_kv((size_t)total_tokens * D);
     dev_buf<uint8_t> dev_kv_scale((size_t)total_tokens * SCALE);
     dev_buf<OType> dev_o(o_size);
+    dev_buf<float> dev_lse(q_rows);
     dev_buf<int> dev_kv_indptr_prefix(host_kv_indptr_prefix.size());
     dev_buf<int> dev_kv_indices_prefix(host_kv_indices_prefix.size());
     dev_buf<int> dev_kv_indptr_extend(host_kv_indptr_extend.size());
@@ -477,8 +505,9 @@ int run_mla_v41_prefill_case(int H, int N, int total_pages, int total_tokens,
     kargs.unified_kv_scale_ptr = dev_unified_kv_scale;
     kargs.kv_ptr = dev_kv;
     kargs.kv_scale_ptr = dev_kv_scale;
-    kargs.attn_sink_ptr = dev_attn_sink;
+    kargs.attn_sink_ptr = with_sink ? dev_attn_sink.ptr : nullptr;
     kargs.out_ptr = dev_o;
+    kargs.lse_ptr = with_lse ? dev_lse.ptr : nullptr;
     kargs.kv_indptr_prefix = dev_kv_indptr_prefix;
     kargs.kv_indices_prefix = dev_kv_indices_prefix;
     kargs.kv_indptr_extend = dev_kv_indptr_extend;
@@ -493,6 +522,7 @@ int run_mla_v41_prefill_case(int H, int N, int total_pages, int total_tokens,
     kargs.stride_q_scale_h = SCALE;
     kargs.stride_o_n = H * D;
     kargs.stride_o_h = D;
+    kargs.stride_lse_n = H;
     kargs.stride_kv_page = D;
     kargs.stride_kv_scale_page = SCALE;
     kargs.softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
@@ -508,7 +538,11 @@ int run_mla_v41_prefill_case(int H, int N, int total_pages, int total_tokens,
     if (verify) {
         printf("\nValidating GPU results against CPU reference...\n");
         dev_o.download(host_o_gpu.get(), o_size);
-        const bool all_valid = validate_mla_v41_results<OType>(host_o_ref.get(), host_o_gpu.get(), N, H, D);
+        bool all_valid = validate_mla_v41_results<OType>(host_o_ref.get(), host_o_gpu.get(), N, H, D);
+        if (with_lse) {
+            dev_lse.download(host_lse_gpu.get(), q_rows);
+            all_valid &= validate_mla_v41_lse(host_lse_ref.get(), host_lse_gpu.get(), q_rows);
+        }
         printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
         if (!all_valid) return 1;
     }
@@ -527,6 +561,8 @@ int main(int argc, char** argv) {
     int total_pages = -1;
     int total_tokens = -1;
     bool verify = false;
+    bool with_sink = true;
+    bool with_lse = false;
 
     auto parse_val = [](const char* arg, const char* flag) -> const char* {
         size_t len = std::strlen(flag);
@@ -540,6 +576,8 @@ int main(int argc, char** argv) {
         const char* arg = argv[i];
         const char* val;
         if (std::strcmp(arg, "--verify") == 0) { verify = true; continue; }
+        if (std::strcmp(arg, "-no_sink") == 0) { with_sink = false; continue; }
+        if (std::strcmp(arg, "-lse") == 0)     { with_lse = true; continue; }
         auto try_parse = [&](int& target, const char* flag) {
             if ((val = parse_val(arg, flag))) {
                 if (val == reinterpret_cast<const char*>(1)) { if (i + 1 < argc) target = std::atoi(argv[++i]); }
@@ -568,5 +606,5 @@ int main(int argc, char** argv) {
     }
 
     return run_mla_v41_prefill_case<opus_mla_v41_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(
-        H, N, total_pages, total_tokens, topk, verify);
+        H, N, total_pages, total_tokens, topk, verify, with_sink, with_lse);
 }
