@@ -51,17 +51,17 @@ inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<Q,
 #include "gfx1250/mla_v4_traits.h"
 
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel(opus_mla_v4_prefill_kargs kargs);
+__global__ void opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs kargs);
+__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a16w16_32mx1_16nx4_kernel(opus_mla_v4_prefill_kargs kargs);
+__global__ void opus_mla_v4_prefill_a16w16_32mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a8w8_16mx4_64nx1_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
+__global__ void opus_mla_v4_prefill_a8w8_16mx4_64nx1_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
+__global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
+__global__ void opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 
 constexpr int mla_v4_max_cluster_y = 2;
 
