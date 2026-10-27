@@ -3,7 +3,7 @@
 #include <cfloat>
 #include <cstdint>
 
-// Split-K partials, same layout as aiter's mla_prefill_split.h
+// Split-K partials
 struct opus_mla_prefill_split_args {
     float* __restrict__ partial_o;   // [N, num_splits, H, 512]
     float* __restrict__ partial_max; // [N, num_splits, H]

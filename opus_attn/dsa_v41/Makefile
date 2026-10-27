@@ -18,7 +18,7 @@ OUT   = $(BUILD)/mla_v41_prefill.exe
 
 KERNEL_SRCS = $(wildcard $(ARCH)/mla_v41_prefill_*_kernel.cc)
 HOST_SRC    = common/mla_v41_host.cc
-COMMON_HDRS = common/mla_v41_defs.h common/mla_v41_parallel.h
+COMMON_HDRS = common/mla_v41_defs.h common/mla_v41_parallel.h common/mla_prefill_split.h
 SHARED_HDRS = $(filter-out %_template.hpp,$(wildcard $(ARCH)/*.h) $(wildcard $(ARCH)/*.hpp)) $(COMMON_HDRS)
 KERNEL_OBJS = $(patsubst %.cc,$(BUILD)/%.o,$(notdir $(KERNEL_SRCS)))
 KERNEL_ASMS = $(patsubst %.cc,$(BUILD)/%.s,$(notdir $(KERNEL_SRCS)))

@@ -1,15 +1,21 @@
 #pragma once
 
+#include <type_traits>
+
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
          int NUM_WARPS_ = 4,
          typename D_ATTN_ = fp8_t,
          typename D_PV_ = bf16_t,
-         typename D_OUT_ = bf16_t>
+         typename D_OUT_ = bf16_t,
+         bool SPLIT_ = false>
 struct opus_mla_v41_prefill_a8w8_16mx4_64nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
+    static constexpr bool SPLIT = SPLIT_;
+    using kargs_type = std::conditional_t<SPLIT_, opus_mla_prefill_split_kargs<opus_mla_v41_prefill_kargs>,
+                                          opus_mla_v41_prefill_kargs>;
 
     static constexpr int WARP_SIZE = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;

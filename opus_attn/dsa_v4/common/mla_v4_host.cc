@@ -18,13 +18,13 @@
 #include "gfx950/mla_v4_traits.h"
 
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs kargs);
+__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs kargs);
+__global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
+__global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
+__global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(typename Traits::kargs_type kargs);
 
 template<int Q, int KV, int D, int NW, class DT, class DO>
 inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>,

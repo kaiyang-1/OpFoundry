@@ -2,21 +2,27 @@
 
 #include <opus/opus.hpp>
 
-// global -> LDS async copy (GLOBAL_LOAD_LDS). Same call shape as opus::async_load; completion is
-// tracked by vmcnt only (ISA 10.4). u_smem must be wave-uniform: it feeds M0.
+// The lane's loop-invariant offset into the tile, so a tile's address is one add of its page offset.
+template<opus::index_t VEC, class D, class LayoutG>
+__device__ inline const D* global_load_base(const D* g_base, const LayoutG& u_gmem) {
+    return g_base + static_cast<uint32_t>(opus::layout_to_offsets<VEC>(u_gmem)[0]);
+}
+
+// global -> LDS async copy (GLOBAL_LOAD_LDS). g_base is global_load_base() of u_gmem plus the tile's
+// offset; completion is tracked by vmcnt only (ISA 10.4). u_smem must be wave-uniform: it feeds M0.
 template<opus::index_t VEC, class D, class LayoutG, class LayoutS>
 __device__ inline void global_load(const D* g_base, void* smem_base,
-                                   const LayoutG& u_gmem, const LayoutS& u_smem) {
+                                   const LayoutG&, const LayoutS& u_smem) {
     constexpr opus::index_t BYTES = VEC * static_cast<opus::index_t>(sizeof(D));
     constexpr opus::index_t N     = opus::layout_load_traits<LayoutG, VEC>::r_elem.value;
     constexpr auto g_imm = opus::layout_imm_offsets_v<LayoutG, VEC>;
     constexpr auto s_imm = opus::layout_imm_offsets_v<LayoutS, VEC>;
+    static_assert(BYTES == 16 || BYTES == 12 || BYTES == 4 || BYTES == 2 || BYTES == 1,
+                  "global_load_lds has no such width on gfx950");
 
-    const auto g_os = opus::layout_to_offsets<VEC>(u_gmem);
     const auto s_os = opus::layout_to_offsets<VEC>(u_smem);
     auto* s_ptr = reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_base));
-    const char* src = reinterpret_cast<const char*>(g_base)
-                    + static_cast<int64_t>(g_os[0]) * static_cast<int64_t>(sizeof(D));
+    const char* src = reinterpret_cast<const char*>(g_base);
     const unsigned int m0_base = __builtin_amdgcn_readfirstlane(static_cast<unsigned int>(
         reinterpret_cast<__UINTPTR_TYPE__>(s_ptr + s_os[0] * static_cast<int>(sizeof(D)))));
 
@@ -25,6 +31,7 @@ __device__ inline void global_load(const D* g_base, void* smem_base,
         constexpr int m0_fix  = (s_imm[i.value] - s_imm[0]) * static_cast<int>(sizeof(D)) - g_delta;
         static_assert(m0_fix >= 0 && m0_fix % 4 == 0,
                       "offset: shifts the LDS address too, so M0 must absorb it (ISA 9.1.9 / 10.3)");
+        static_assert(g_delta >= -4096 && g_delta <= 4095, "g_delta exceeds the 13-bit offset");
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
         const unsigned int m0_val = m0_base + m0_fix;
         const char* addr = src;   // asm operands do not odr-use, so name it inside the lambda

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "common/mla_prefill_split.h"
 
 using bf16_t = __bf16;
 using fp8_t  = _BitInt(8);
@@ -14,7 +15,6 @@ struct opus_mla_v41_prefill_kargs {
     const void* __restrict__ kv_scale_ptr;         // [total_tokens, D / 32]
     const void* __restrict__ attn_sink_ptr;        // [H] fp32, may be nullptr
     void* __restrict__ out_ptr;                    // [N, H, D] bf16
-    void* __restrict__ lse_ptr;                    // [N, H] fp32, may be nullptr
     const int* __restrict__ kv_indptr_prefix;      // [N + 1]
     const int* __restrict__ kv_indices_prefix;     // [nnz_prefix]
     const int* __restrict__ kv_indptr_extend;      // [N + 1]
@@ -29,9 +29,8 @@ struct opus_mla_v41_prefill_kargs {
     int stride_q_scale_h;
     int stride_o_n;
     int stride_o_h;
-    int stride_lse_n;
-    int stride_kv_page;
-    int stride_kv_scale_page;
+    int stride_kv_page;       // shared by unified_kv and kv
+    int stride_kv_scale_page; // shared by unified_kv_scale and kv_scale
     float softmax_scale;
 };
 
