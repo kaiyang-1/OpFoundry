@@ -242,7 +242,7 @@ __device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
 }
 
 template<typename T, typename V>
-__device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile_idx, int seg_base_rows) {
+__device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile_idx, int rot_rows) {
     using D_ACC = typename T::D_ACC;
 
     if ((kv_tile_idx + 1) * T::KV_TILE_SIZE <= valid_kv_len) return;
@@ -257,7 +257,7 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
     const int rel_base = (valid_kv_len - 1) - kv_tile_idx * T::KV_TILE_SIZE - lane_hi * lane_hi_kv_step;
 
     opus::static_for<T::GEMM0_STAGE_N>([&](auto i_s) {
-        const int rel = rel_base - ((i_s.value * T::W_N) ^ seg_base_rows);
+        const int rel = rel_base - ((i_s.value * T::W_N) ^ rot_rows);
         opus::static_for<elems_per_stage>([&](auto i_reg) {
             constexpr int idx = i_s.value * elems_per_stage + i_reg.value;
             v_s[idx] = (i_reg.value > rel) ? neg_inf : v_s[idx];
@@ -265,7 +265,25 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
     });
 }
 
-template<class Traits, int SLOT_SWAP, class VQN, class VQR, class VQS, class VO>
+template<class T, class V>
+__device__ inline V swap_stage_pairs(const V& v, int slot_swap) {
+    constexpr int dwords = sizeof(V) / sizeof(opus::u32_t);
+    constexpr int stage_dwords = dwords / T::GEMM0_STAGE_N;
+    using U = opus::vector_t<opus::u32_t, dwords>;
+    const U u = __builtin_bit_cast(U, v);
+    const opus::u32_t m = 0u - (opus::u32_t)slot_swap;
+    U r = u;
+    opus::static_for<dwords>([&](auto i) {
+        if constexpr ((i.value & stage_dwords) == 0) {
+            const opus::u32_t t = (u[i.value] ^ u[i.value | stage_dwords]) & m;
+            r[i.value] = u[i.value] ^ t;
+            r[i.value | stage_dwords] = u[i.value | stage_dwords] ^ t;
+        }
+    });
+    return __builtin_bit_cast(V, r);
+}
+
+template<class Traits, class VQN, class VQR, class VQS, class VO>
 __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_fp8_kargs kargs,
                                            const void* kv_nope_ptr, const void* kv_rope_ptr, int kv_rows,
                                            const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
@@ -286,7 +304,9 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     //   wave 0: 0 1 2 3   wave 1: 2 3 0 1   wave 2: 1 0 3 2   wave 3: 3 2 1 0
-    const int wave_rot      = ((warp_id & 1) << 1) | SLOT_SWAP;
+    // One code path for all waves, to fit the instruction cache: S stage j holds rows stage_row(j).
+    const int slot_swap     = warp_id >> 1;
+    const int wave_rot      = ((warp_id & 1) << 1) | slot_swap;
     const int seg_rot_rows  = wave_rot * T::W_N;
     const int seg_base_rows = (seg_rot_rows / T::ROWS_PER_SEG) * T::ROWS_PER_SEG;
     auto stage_row  = [&](int j) { return (j * T::W_N) ^ seg_rot_rows; };
@@ -312,7 +332,7 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
         make_smem(reinterpret_cast<D_ROPE*>(smem_kv_buf + T::K_SLOT_BYTES + (T::SEG_BYTES - v_seg_off))),
     };
     smem<D_ROPE> s_vr[T::GEMM1_STAGE_K] = { s_vw[0], s_vw[1] };
-    constexpr int OWN_V_ROW = (1 ^ SLOT_SWAP) * T::W_N * T::V_ROW_LDS_ELEMS;
+    const int own_v_row = (1 ^ slot_swap) * T::W_N * T::V_ROW_LDS_ELEMS;
 
     int k_slot = 0, tdm_slot = 0, vw_slot = 0, vr_slot = 0;
     auto advance_k = [&]() {
@@ -332,8 +352,8 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
     auto u_rk_nope  = make_layout_qk_nope<T>(lane_id);
     auto u_rk_rope  = make_layout_kv_rope<T, T::K_ROPE_ROW_LDS_ELEMS>(lane_id);
     auto u_rk_mxscl = make_layout_qk_mxscl<T>(lane_id);
-    auto u_rv_nope  = make_layout_v_nope<T>(lane_id) + number<OWN_V_ROW>{};
-    auto u_rv_rope  = make_layout_kv_rope<T, T::V_ROW_LDS_ELEMS>(lane_id);
+    auto u_rv_nope  = make_layout_v_nope<T>(lane_id) + own_v_row;
+    auto u_wv_rope  = make_layout_kv_rope<T, T::V_ROW_LDS_ELEMS>(lane_id) + (own_v_row + T::D_NOPE_SIZE);
     auto u_rv       = make_layout_v<T>(lane_id);
 
     auto mma0_nope = make_tiled_mma<D_NOPE, D_NOPE, D_ACC>(
@@ -477,7 +497,7 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
         auto& scale_q    = reinterpret_cast<scale_t&>(v_q_mxscl);
 
         static_for<T::GEMM0_STAGE_N>([&](auto j) {
-            constexpr int slot = j.value ^ SLOT_SWAP;
+            constexpr int slot = j.value;
             constexpr int buf  = j.value & 1;
 
             auto& scale_k = reinterpret_cast<scale_t&>(v_k_mxscl[buf]);
@@ -495,7 +515,7 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
                 load_k(number<j.value + 1>{}, number<(j.value + 1) & 1>{});
             } else {
                 if constexpr (decltype(fuse_softmax)::value) tr_load_v(0_I, 0_I, 0_I);
-                store<T::VEC_ROPE>(s_vw[1], v_k_rope[buf], u_rv_rope + number<OWN_V_ROW + T::D_NOPE_SIZE>{});
+                store<T::VEC_ROPE>(s_vw[1], v_k_rope[buf], u_wv_rope);
 
                 constexpr index_t mxscl_valid = T::D_NOPE_SIZE / T::MXSCL_BLOCK_SIZE;
 
@@ -513,7 +533,7 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
             if constexpr (decltype(fuse_softmax)::value) {
                 if constexpr (j.value == 0) attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[prev.value]);
                 if constexpr (j.value == 1) l_row += attn_row_sum<T>(v_s[prev.value]);
-                if constexpr (j.value == 2) v_p = cast<D_ROPE>(v_s[prev.value]);
+                if constexpr (j.value == 2) v_p = swap_stage_pairs<T>(cast<D_ROPE>(v_s[prev.value]), slot_swap);
             }
         });
         advance_k();
@@ -574,7 +594,7 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
     issue_tile(1, true_type{});
     load_k(0_I, 0_I);
     compute_qk(0_I, 0_I, false_type{});
-    attn_mask_oob_score<T>(v_s[0], valid_kv_len, 0, seg_base_rows);
+    attn_mask_oob_score<T>(v_s[0], valid_kv_len, 0, seg_rot_rows);
     store_v_nope(0_I, number<V_NOPE_ISSUES>{});
 
     s_wait_tensorcnt(0_I);
@@ -611,14 +631,14 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
     for (; t < num_kv_tiles; ++t) {
         issue_tile(t + 1, true_type{});
         compute_qk(1_I, 0_I, true_type{});       // QK(t) + tail(t-1)
-        attn_mask_oob_score<T>(v_s[1], valid_kv_len, t, seg_base_rows);
+        attn_mask_oob_score<T>(v_s[1], valid_kv_len, t, seg_rot_rows);
         compute_pv(1_I, true_type{});            // PV(t-1) + head(t)
         v_s[0] = v_s[1];
     }
     // Softmax tail of the last tile, with no GEMM left to ride along.
     attn_exp2_slice<T, s_len / 2, s_len / 2>(v_s[0]);
     l_row += attn_row_sum<T>(v_s[0]);
-    v_p = cast<D_ROPE>(v_s[0]);
+    v_p = swap_stage_pairs<T>(cast<D_ROPE>(v_s[0]), slot_swap);
 
     tr_load_v(0_I, 0_I, 0_I);
     compute_pv(0_I, false_type{});
@@ -700,31 +720,26 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void opus_mla_v4_prefill_a8w
             args.split.num_splits, block_id_z());
     }
 
-    auto run_kv_segments = [&](auto slot_swap) __attribute__((always_inline)) {
-        constexpr int SLOT_SWAP = decltype(slot_swap)::value;
-        #pragma clang loop unroll(disable)
-        for (int seg = 0; seg < 2; ++seg) {
-            if (seg) __builtin_amdgcn_s_barrier();
-            const int*  kv_indptr  = seg ? kargs.kv_indptr_extend    : kargs.kv_indptr_prefix;
-            const int*  kv_indices = seg ? kargs.kv_indices_extend   : kargs.kv_indices_prefix;
-            const void* nope_ptr   = seg ? kargs.kv_nope_ptr         : kargs.unified_kv_nope_ptr;
-            const void* rope_ptr   = seg ? kargs.kv_rope_ptr         : kargs.unified_kv_rope_ptr;
-            const int   kv_rows    = seg ? kargs.total_tokens        : kargs.total_pages;
+    #pragma clang loop unroll(disable)
+    for (int seg = 0; seg < 2; ++seg) {
+        if (seg) __builtin_amdgcn_s_barrier();
+        const int*  kv_indptr  = seg ? kargs.kv_indptr_extend    : kargs.kv_indptr_prefix;
+        const int*  kv_indices = seg ? kargs.kv_indices_extend   : kargs.kv_indices_prefix;
+        const void* nope_ptr   = seg ? kargs.kv_nope_ptr         : kargs.unified_kv_nope_ptr;
+        const void* rope_ptr   = seg ? kargs.kv_rope_ptr         : kargs.unified_kv_rope_ptr;
+        const int   kv_rows    = seg ? kargs.total_tokens        : kargs.total_pages;
 
-            int page_idx_begin = kv_indptr[q_token_idx];
-            int valid_kv_len   = kv_indptr[q_token_idx + 1] - page_idx_begin;
-            if constexpr (T::SPLIT) {
-                page_idx_begin += seg ? rows.extend_begin : rows.prefix_begin;
-                valid_kv_len = seg ? rows.extend_len : rows.prefix_len;
-            }
-            const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
-            mla_v4_prefill_accum_pipelined<Traits, SLOT_SWAP>(kargs, nope_ptr, rope_ptr, kv_rows,
-                                                          kv_indices, page_idx_begin, valid_kv_len, num_kv_tiles,
-                                                          smem_buf, v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row, temperature_scale);
+        int page_idx_begin = kv_indptr[q_token_idx];
+        int valid_kv_len   = kv_indptr[q_token_idx + 1] - page_idx_begin;
+        if constexpr (T::SPLIT) {
+            page_idx_begin += seg ? rows.extend_begin : rows.prefix_begin;
+            valid_kv_len = seg ? rows.extend_len : rows.prefix_len;
         }
-    };
-    if (warp_id >> 1) run_kv_segments(number<1>{});
-    else              run_kv_segments(number<0>{});
+        const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+        mla_v4_prefill_accum_pipelined<Traits>(kargs, nope_ptr, rope_ptr, kv_rows,
+                                               kv_indices, page_idx_begin, valid_kv_len, num_kv_tiles,
+                                               smem_buf, v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row, temperature_scale);
+    }
 
     if constexpr (T::SPLIT) {
         const auto& split = args.split;
