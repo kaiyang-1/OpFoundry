@@ -381,6 +381,7 @@ __device__ void mla_v4_prefill_accum_le2_tiles(opus_mla_v4_prefill_kargs kargs,
         mfma_adaptor_swap_ab{});
 
     auto u_gkv = make_layout_gkv<T>(warp_id, lane_id);
+    auto p_kv_lane = global_load_base<T::VEC_KV>(p_kv, u_gkv);
     auto u_skv = make_layout_skv<T>(warp_id);
     auto u_rk = make_layout_rk<T>(lane_id);
     auto u_rv = make_layout_rv<T>(lane_id);
@@ -439,7 +440,7 @@ __device__ void mla_v4_prefill_accum_le2_tiles(opus_mla_v4_prefill_kargs kargs,
 
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         const int kv_page = load_kv_page(tile_idx);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page), s_kv.ptr, u_gkv, u_skv);
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page), s_kv.ptr, u_gkv, u_skv);
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
@@ -514,6 +515,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 
     // Partition layouts
     auto u_gkv = make_layout_gkv<T>(warp_id, lane_id);
+    auto p_kv_lane = global_load_base<T::VEC_KV>(p_kv, u_gkv);
     auto u_skv = make_layout_skv<T>(warp_id);
     auto u_rk = make_layout_rk<T>(lane_id);
     auto u_rv = make_layout_rv<T>(lane_id);
@@ -583,13 +585,13 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 
     // Prologue
     int pg = load_kv_page(0);
-    global_load<T::VEC_KV>(p_kv + kv_token_offset(pg), s_kv[0].ptr, u_gkv, u_skv);
+    global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(pg), s_kv[0].ptr, u_gkv, u_skv);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
     pg = load_kv_page(1);
-    global_load<T::VEC_KV>(p_kv + kv_token_offset(pg), s_kv[0].ptr, u_gkv, u_skv + kv_slot_offset);
+    global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(pg), s_kv[0].ptr, u_gkv, u_skv + kv_slot_offset);
     __builtin_amdgcn_sched_barrier(0);
     kv_page[0] = load_kv_page(2);
     v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk);
@@ -625,7 +627,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
     for (int j = 1; j < num_kv_tiles - 3; j += 2) {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[1] = load_kv_page(j + 2);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
@@ -682,7 +684,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 
         // Cluster 4:
         s_waitcnt_vmcnt(0_I);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[1]), s_kv[1].ptr, u_gkv, u_skv + kv_slot_offset);
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page[1]), s_kv[1].ptr, u_gkv, u_skv + kv_slot_offset);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[0] = load_kv_page(j + 3);
         v_k[0] = load<T::VEC_KV>(s_kv[1], u_rk);
@@ -744,7 +746,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
     if constexpr (OddTail) {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
         v_k[1] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
@@ -861,7 +863,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
     } else {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page[0]), s_kv[1].ptr, u_gkv, u_skv);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[1] = load_kv_page(num_kv_tiles - 1);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
@@ -912,7 +914,7 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 
         // Cluster 4:
         s_waitcnt_vmcnt(0_I);
-        global_load<T::VEC_KV>(p_kv + kv_token_offset(kv_page[1]), s_kv[1].ptr, u_gkv, u_skv + kv_slot_offset);
+        global_load<T::VEC_KV>(p_kv_lane + kv_token_offset(kv_page[1]), s_kv[1].ptr, u_gkv, u_skv + kv_slot_offset);
         v_k[0] = load<T::VEC_KV>(s_kv[1], u_rk);
         v_k[1] = load<T::VEC_KV>(s_kv[1], u_rk + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
@@ -1034,9 +1036,10 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 
 // ─── MLA-v4 kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(typename Traits::kargs_type args) {
     using namespace opus;
     using namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1;
+    const opus_mla_v4_prefill_kargs kargs = opus_mla_prefill_base(args);
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
@@ -1069,11 +1072,23 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
 
+    [[maybe_unused]] opus_mla_prefill_split_rows rows{};
+    if constexpr (T::SPLIT) {
+        rows = opus_mla_prefill_split_rows_of<T::KV_TILE_SIZE>(
+            kargs.kv_indptr_prefix[q_token_idx + 1] - kargs.kv_indptr_prefix[q_token_idx],
+            kargs.kv_indptr_extend[q_token_idx + 1] - kargs.kv_indptr_extend[q_token_idx],
+            args.split.num_splits, block_id_z());
+    }
+
     // ──── Prefix segment ────
     {
-        const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
+        int page_idx_begin       = kargs.kv_indptr_prefix[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
-        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        int valid_kv_len         = page_idx_end - page_idx_begin;
+        if constexpr (T::SPLIT) {
+            page_idx_begin += rows.prefix_begin;
+            valid_kv_len = rows.prefix_len;
+        }
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
@@ -1091,9 +1106,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
 
     // ──── Extend segment ────
     {
-        const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
+        int page_idx_begin       = kargs.kv_indptr_extend[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
-        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        int valid_kv_len         = page_idx_end - page_idx_begin;
+        if constexpr (T::SPLIT) {
+            page_idx_begin += rows.extend_begin;
+            valid_kv_len = rows.extend_len;
+        }
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
@@ -1107,10 +1126,26 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
         }
     }
 
+    if constexpr (T::SPLIT) {
+        const auto& split = args.split;
+        scale_output_tile<T>(v_o, l_row > D_ACC(0.0f) ? D_ACC(1.0f) / l_row : D_ACC(0.0f));
+        const int64_t row = opus_mla_prefill_split_row(split, q_token_idx, block_id_z(), kargs.H, h_block_start);
+        auto g_po = make_gmem(split.partial_o + row * T::D_TILE_SIZE, (kargs.H - h_block_start) * T::D_TILE_SIZE * sizeof(D_ACC));
+        int lane_id_o = thread_id_x() % T::WARP_SIZE;
+        asm volatile("" : "+v"(lane_id_o));
+        int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+        store<T::VEC_O>(g_po, v_o, make_layout_o<T>(warp_id_o, lane_id_o, T::D_TILE_SIZE));
+        const int head = warp_id_o * T::Q_TILE_SIZE + lane_id_o;
+        if (lane_id_o < T::W_M && h_block_start + head < kargs.H)
+            opus_mla_prefill_split_store_ml(split, row + head, m_row, l_row);
+        return;
+    }
+
     // ──── Sink finalization, normalize O, and store to gmem ────
     const int sink_head_idx = h_block_start + warp_id * T::Q_TILE_SIZE + (lane_id % T::W_M);
-    auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
-    D_ACC sink_log2 = load(g_attn_sink, sink_head_idx)[0] * LOG2_E;
+    const bool has_sink = kargs.attn_sink_ptr != nullptr;
+    auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), has_sink ? kargs.H * sizeof(D_ACC) : 0);
+    D_ACC sink_log2 = has_sink ? load(g_attn_sink, sink_head_idx)[0] * LOG2_E : -opus::numeric_limits<D_ACC>::infinity();
     D_ACC m_final = max(m_row, sink_log2);
     D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_final);
     D_ACC l_final = l_row * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);

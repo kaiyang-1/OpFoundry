@@ -41,8 +41,8 @@ template<class T> constexpr int ACC_PER_TILE     = T::W_M * T::W_N / T::WARP_SIZ
 template<class T> constexpr int S_ELEMS          = T::GEMM0_E_N * ACC_PER_TILE<T>;
 template<class T> constexpr int O_ELEMS          = T::Q_TILE_SIZE * T::D_VO_SIZE / T::WARP_SIZE;
 
-constexpr int K_DEPTH = 4;
-constexpr int V_DEPTH = 4;
+constexpr int K_DEPTH = 3;
+constexpr int V_DEPTH = 3;
 
 template<class T> using v_q_t = opus::array<opus::vector_t<typename T::D_ATTN, T::VEC_Q>, Q_LOAD_INSTS<T>>;
 template<class T> using v_s_t = opus::vector_t<typename T::D_ACC, S_ELEMS<T>>;
@@ -50,6 +50,18 @@ template<class T> using v_p_t = opus::vector_t<typename T::D_ATTN, S_ELEMS<T>>;
 template<class T> using v_o_t = opus::vector_t<typename T::D_ACC, O_ELEMS<T>>;
 template<class T> using v_k_t = opus::vector_t<typename T::D_ATTN, T::VEC_KV>;
 template<class T> using v_v_t = opus::vector_t<typename T::D_ATTN, T::W_N * T::W_K / T::WARP_SIZE>;
+
+template<int REG, class V>
+__device__ inline V pin_vgpr(V v) {
+    __attribute__((amdgpu_pin_vgpr(REG))) V r = v;
+    return r;
+}
+
+template<int REG, class V>
+__device__ inline V pin_agpr(V v) {
+    __attribute__((amdgpu_pin_agpr(REG))) V r = v;
+    return r;
+}
 
 template<class T, int I> constexpr int kv_sub_tile_off = I * T::NUM_WARPS * T::smem_d_rpt * T::smem_brick;
 template<class T, int J> constexpr int kv_d_brick_off  = J * T::NUM_WARPS * T::smem_brick;
@@ -374,8 +386,7 @@ __device__ inline auto load_q_lds(char* smem_kv, int warp_off, const UQ& u_rq) {
     auto q_offsets = layout_to_offsets<T::VEC_Q>(u_rq);
     v_q_t<T> v_q;
     static_for<Q_LOAD_INSTS<T>>([&](auto i) {
-        [[clang::amdgpu_pin_agpr(Q_AGPR_BASE + i.value * Q_AGPR_PER_LOAD<T>)]]
-        v_q[i.value] = load<T::VEC_Q>(s_q, q_offsets[i.value]);
+        v_q[i.value] = pin_agpr<Q_AGPR_BASE + i.value * Q_AGPR_PER_LOAD<T>>(load<T::VEC_Q>(s_q, q_offsets[i.value]));
     });
     s_waitcnt_lgkmcnt(0_I);
     return v_q;
@@ -430,8 +441,8 @@ __device__ inline void load_k_step(char* smem_kv, const UK& u_rk, VK& v_k) {
     auto k_offsets = layout_to_offsets<T::VEC_KV>(u_rk);
 
     static_for<K_CHUNKS<T>>([&](auto i) {
-        [[clang::amdgpu_pin_agpr(K_AGPR_BASE<T> + BUF * K_AGPR_PER_BUF<T> + i.value * K_AGPR_PER_CHUNK<T>)]]
-        v_k[BUF][i.value] = load<T::VEC_KV>(s_sub, k_offsets[i.value] + kv_d_brick_off<T, ds>);
+        v_k[BUF][i.value] = pin_agpr<K_AGPR_BASE<T> + BUF * K_AGPR_PER_BUF<T> + i.value * K_AGPR_PER_CHUNK<T>>(
+            load<T::VEC_KV>(s_sub, k_offsets[i.value] + kv_d_brick_off<T, ds>));
     });
 }
 
@@ -477,18 +488,17 @@ __device__ inline void compute_qk(char* smem_kv, const UK& u_rk, const UV& u_rv,
         constexpr int ds   = step % T::smem_d_rpt;
 
         constexpr int k_last      = step + K_DEPTH - 2 < QK_STEPS - 1 ? step + K_DEPTH - 2 : QK_STEPS - 1;
-        constexpr int v_primed    = step > QK_STEPS - V_DEPTH ? step - (QK_STEPS - V_DEPTH) : 0;
         constexpr int k_in_flight = (k_last - step) * K_CHUNKS<T>;
-        constexpr int v_in_flight = v_primed * V_TR_PER_STEP<T>;
-        s_waitcnt_lgkmcnt(number<k_in_flight + v_in_flight>{});
+        s_waitcnt_lgkmcnt(number<k_in_flight>{});
         __builtin_amdgcn_sched_barrier(0);
 
         if constexpr (step + K_DEPTH - 1 < QK_STEPS) {
             load_k_step<T, SLOT, step + K_DEPTH - 1, (step + K_DEPTH - 1) % K_DEPTH>(smem_kv, u_rk, v_k);
         }
-        if constexpr (step >= QK_STEPS - V_DEPTH) {
-            constexpr int vs = step - (QK_STEPS - V_DEPTH);
-            load_v_step<T, SLOT, vs, vs>(smem_kv, u_rv, v_v);
+        if constexpr (step == QK_STEPS - 1) {
+            static_for<V_DEPTH - 1>([&](auto i) {
+                load_v_step<T, SLOT, i.value, i.value>(smem_kv, u_rv, v_v);
+            });
         }
         if constexpr (step < T::kv_async_load_insts) {
             issue_kv_load(number<step>{});
@@ -499,14 +509,13 @@ __device__ inline void compute_qk(char* smem_kv, const UK& u_rk, const UV& u_rv,
                 constexpr int e  = ns * N_TILES + e2.value;
                 constexpr int ik = e2.value * K_STEPS + kk.value;
                 constexpr int ek = ds * K_STEPS + kk.value;
-                [[clang::amdgpu_pin_vgpr(S_VGPR_BASE + e * ACC_PER_TILE<T>)]]
-                s_tiles[e] = mfma_qk(v_q[ek], v_k[b][ik], s_tiles[e]);
+                s_tiles[e] = pin_vgpr<S_VGPR_BASE + e * ACC_PER_TILE<T>>(mfma_qk(v_q[ek], v_k[b][ik], s_tiles[e]));
             });
         });
 
         constexpr int QK_MFMA = N_TILES * K_STEPS;
         constexpr int QK_DS   = (step + K_DEPTH - 1 < QK_STEPS ? K_CHUNKS<T> : 0)
-                              + (step >= QK_STEPS - V_DEPTH ? V_TR_PER_STEP<T> : 0);
+                              + (step == QK_STEPS - 1 ? (V_DEPTH - 1) * V_TR_PER_STEP<T> : 0);
         constexpr int QK_DS_HEAD = QK_DS / 2;
         __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, QK_DS_HEAD, 0);
         static_for<QK_MFMA>([&](auto j) {
@@ -537,9 +546,6 @@ __device__ inline void compute_pv(char* smem_kv, const UK& u_rk, const UV& u_rv,
     auto p_chunks = reinterpret_cast<p_tile_t*>(&v_p);
     auto o_tiles  = reinterpret_cast<o_tile_t*>(&v_o);
 
-    s_waitcnt_lgkmcnt(number<(V_DEPTH - 1) * V_TR_PER_STEP<T>>{});
-    __builtin_amdgcn_sched_barrier(0);
-
     constexpr int K_PRIME_STEPS = K_DEPTH - 1;
     constexpr int SLOT_SWAP_STEP = PV_STEPS - 1 - K_PRIME_STEPS;
 
@@ -548,38 +554,36 @@ __device__ inline void compute_pv(char* smem_kv, const UK& u_rk, const UV& u_rv,
         constexpr int b    = step % V_DEPTH;
         constexpr int ns   = step / T::smem_d_rpt_v;
         constexpr int ds   = step % T::smem_d_rpt_v;
+        constexpr int vn   = step + V_DEPTH - 1;
 
-        if constexpr (step > SLOT_SWAP_STEP) {
+        if constexpr (step <= SLOT_SWAP_STEP) {
+            constexpr int v_last = vn - 1 < PV_STEPS - 1 ? vn - 1 : PV_STEPS - 1;
+            s_waitcnt_lgkmcnt(number<(v_last - step) * V_TR_PER_STEP<T>>{});
+            __builtin_amdgcn_sched_barrier(0);
+            if constexpr (vn < PV_STEPS) {
+                load_v_step<T, SLOT, vn, vn % V_DEPTH>(smem_kv, u_rv, v_v);
+            }
+        } else {
             constexpr int kb = step - SLOT_SWAP_STEP - 1;
             load_k_step<T, 1 - SLOT, kb, kb>(smem_kv, u_rk, v_k);
         }
 
         static_for<V_N_TILES<T>>([&](auto en) {
             constexpr int ot = ds * V_N_TILES<T> + en.value;
-            [[clang::amdgpu_pin_vgpr(O_VGPR_BASE + ot * ACC_PER_TILE<T>)]]
-            o_tiles[ot] = mfma_pv(p_chunks[ns], v_v[b][en.value], o_tiles[ot]);
+            o_tiles[ot] = pin_vgpr<O_VGPR_BASE + ot * ACC_PER_TILE<T>>(mfma_pv(p_chunks[ns], v_v[b][en.value], o_tiles[ot]));
         });
 
-        if constexpr (step < SLOT_SWAP_STEP) {
-            constexpr int v_last = step + V_DEPTH < PV_STEPS ? step + V_DEPTH : PV_STEPS - 1;
-            if constexpr (step + V_DEPTH < PV_STEPS) {
-                load_v_step<T, SLOT, step + V_DEPTH, b>(smem_kv, u_rv, v_v);
-            }
-            s_waitcnt_lgkmcnt(number<(v_last - step - 1) * V_TR_PER_STEP<T>>{});
-            static_for<V_N_TILES<T>>([&](auto) {
-                __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, V_TR_PER_STEP<T> / V_N_TILES<T>, 0);
-            });
-        } else if constexpr (step == SLOT_SWAP_STEP) {
+        constexpr int PV_DS = step > SLOT_SWAP_STEP ? K_CHUNKS<T> : (vn < PV_STEPS ? V_TR_PER_STEP<T> : 0);
+        static_for<V_N_TILES<T>>([&](auto) {
+            __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, PV_DS / V_N_TILES<T>, 0);
+        });
+        if constexpr (step == SLOT_SWAP_STEP) {
+            __builtin_amdgcn_sched_barrier(0);
             s_waitcnt_lgkmcnt(0_I);
             __builtin_amdgcn_sched_barrier(0);
             s_waitcnt_vmcnt(0_I);
             __builtin_amdgcn_s_barrier();
-        } else {
-            static_for<V_N_TILES<T>>([&](auto) {
-                __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, 0);
-                __builtin_amdgcn_sched_group_barrier(DS_READ_MASK, K_CHUNKS<T> / V_N_TILES<T>, 0);
-            });
         }
         __builtin_amdgcn_sched_barrier(0);
     });
@@ -678,8 +682,7 @@ __device__ inline void attn_cast_p(const VS& v_s, VP& v_p) {
     auto p_pairs = reinterpret_cast<attn2_t*>(&v_p);
     opus::static_for<S_ELEMS<T> / 2>([&](auto i) {
         auto pair = opus::slice(v_s, opus::number<i.value * 2>{}, opus::number<i.value * 2 + 2>{});
-        [[clang::amdgpu_pin_vgpr(P_VGPR_BASE<T> + i.value)]]
-        p_pairs[i.value] = opus::cast<typename T::D_ATTN>(pair);
+        p_pairs[i.value] = pin_vgpr<P_VGPR_BASE<T> + i.value>(opus::cast<typename T::D_ATTN>(pair));
     });
 }
 
@@ -689,8 +692,7 @@ __device__ inline void scale_o_tile(VO& v_o, typename T::D_ACC scale) {
     using acc_tile_t = vector_t<typename T::D_ACC, ACC_PER_TILE<T>>;
     auto o_tiles = reinterpret_cast<acc_tile_t*>(&v_o);
     static_for<O_ELEMS<T> / ACC_PER_TILE<T>>([&](auto i) {
-        [[clang::amdgpu_pin_vgpr(O_VGPR_BASE + i.value * ACC_PER_TILE<T>)]]
-        o_tiles[i.value] = o_tiles[i.value] * scale;
+        o_tiles[i.value] = pin_vgpr<O_VGPR_BASE + i.value * ACC_PER_TILE<T>>(o_tiles[i.value] * scale);
     });
 }
 

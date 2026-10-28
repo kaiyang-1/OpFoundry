@@ -81,9 +81,7 @@ template<class T> constexpr int S_ELEMS          = T::GEMM0_E_M * T::GEMM0_E_N *
 constexpr int NUM_PREFETCH_BUFS = 3;
 constexpr int PREFETCH_DIST     = 1;
 // O is 256 accumulators, so the high-D tiles of each M row go to the AGPRs left over after Q
-// and the KV ring. The halves are separate objects so each has one register class; sharing an
-// array makes the allocator shuttle tiles between the files. Keep the count even so that
-// store_o_packed's tile pairs never straddle the split.
+// and the KV ring. Keep the count even so that store_o_packed's tile pairs never straddle the split.
 constexpr int O_AGPR_TILES      = 6;
 template<class T> constexpr int O_VGPR_TILES_PER_M = T::GEMM1_E_N - O_AGPR_TILES;
 template<class T> constexpr int O_AGPR_ELEMS       = T::GEMM1_E_M * O_AGPR_TILES * ACC_PER_TILE<T>;
@@ -108,11 +106,49 @@ template<class T> using v_oa_t = opus::vector_t<typename T::D_ACC, O_AGPR_ELEMS<
 template<class T> using v_ml_t = opus::vector_t<typename T::D_ACC, T::ML_ELEMS>;
 template<class T> using v_kv_t = opus::vector_t<typename T::D_ATTN, T::VEC_KV>;
 
+template<int REG, class V>
+__device__ inline V pin_vgpr(V v) {
+    __attribute__((amdgpu_pin_vgpr(REG))) V r = v;
+    return r;
+}
+
+template<int REG, class V>
+__device__ inline V pin_agpr(V v) {
+    __attribute__((amdgpu_pin_agpr(REG))) V r = v;
+    return r;
+}
+
 template<class T>
 struct o_acc_t {
     v_ov_t<T> v;
-    v_oa_t<T> a;
 };
+
+template<class T> using o_acc_tile_t = opus::vector_t<typename T::D_ACC, ACC_PER_TILE<T>>;
+
+template<class T, int SLOT, class F>
+__device__ inline void update_o_agpr(F f) {
+    __attribute__((amdgpu_pin_agpr(O_AGPR_BASE<T> + SLOT * ACC_PER_TILE<T>))) o_acc_tile_t<T> acc;
+    acc = f(acc);
+}
+
+template<class T, int SLOT>
+__device__ inline o_acc_tile_t<T> read_o_agpr() {
+    __attribute__((amdgpu_pin_agpr(O_AGPR_BASE<T> + SLOT * ACC_PER_TILE<T>))) o_acc_tile_t<T> acc;
+    return acc;
+}
+
+template<class T>
+__device__ inline v_oa_t<T> read_o_agpr_all() {
+    v_oa_t<T> a;
+    auto tiles = reinterpret_cast<o_acc_tile_t<T>*>(&a);
+    opus::static_for<T::GEMM1_E_M * O_AGPR_TILES>([&](auto s) { tiles[s.value] = read_o_agpr<T, s.value>(); });
+    return a;
+}
+
+template<class T>
+__device__ inline void clear_o_agpr() {
+    opus::static_for<T::GEMM1_E_M * O_AGPR_TILES>([&](auto s) { update_o_agpr<T, s.value>([](auto o) { return decltype(o){}; }); });
+}
 
 template<class T, int I> constexpr int kv_sub_tile_off = I * T::NUM_WARPS * T::smem_d_rpt * T::smem_brick;
 template<class T, int J> constexpr int kv_d_brick_off  = J * T::NUM_WARPS * T::smem_brick;
@@ -449,8 +485,7 @@ __device__ inline auto load_q_lds(char* smem_kv, int warp_off, const UQ& u_rq) {
     auto q_offsets = layout_to_offsets<T::VEC_Q>(u_rq);
     v_q_t<T> v_q;
     static_for<Q_LOAD_INSTS<T>>([&](auto i) {
-        [[clang::amdgpu_pin_agpr(Q_AGPR_BASE + i.value * Q_AGPR_PER_LOAD<T>)]]
-        v_q[i.value] = load<T::VEC_Q>(s_q, q_offsets[i.value]);
+        v_q[i.value] = pin_agpr<Q_AGPR_BASE + i.value * Q_AGPR_PER_LOAD<T>>(load<T::VEC_Q>(s_q, q_offsets[i.value]));
     });
     s_waitcnt_lgkmcnt(0_I);
     return v_q;
@@ -506,7 +541,7 @@ __device__ inline void store_o_packed(G& g_o, const VO& v_o, const VML& o_scale,
     auto o_offsets = opus::layout_to_offsets<VEC_O2<T>>(u_o);
     __builtin_amdgcn_sched_barrier(0);
     store_o_packed_half<T, false>(g_o, v_o.v, o_scale, o_offsets);
-    store_o_packed_half<T, true>(g_o, v_o.a, o_scale, o_offsets);
+    store_o_packed_half<T, true>(g_o, read_o_agpr_all<T>(), o_scale, o_offsets);
     __builtin_amdgcn_sched_barrier(0);
 }
 
@@ -531,7 +566,7 @@ __device__ inline void store_o_accum(G& g_o, const VO& v_o, const VML& o_scale, 
     static_assert(ACC_PER_TILE<T> == T::VEC_O);
     auto o_offsets = opus::layout_to_offsets<T::VEC_O>(u_o);
     store_o_accum_half<T, false>(g_o, v_o.v, o_scale, o_offsets);
-    store_o_accum_half<T, true>(g_o, v_o.a, o_scale, o_offsets);
+    store_o_accum_half<T, true>(g_o, read_o_agpr_all<T>(), o_scale, o_offsets);
 }
 
 // -------------------------------------------------------------------------------------- gemm
@@ -547,8 +582,8 @@ __device__ inline void load_k_step(char* smem_kv, const UK& u_rk, VK& v_kv) {
     auto k_offsets = layout_to_offsets<T::VEC_KV>(u_rk);
 
     static_for<K_CHUNKS<T>>([&](auto i) {
-        [[clang::amdgpu_pin_agpr(KV_AGPR_BASE<T> + BUF * KV_AGPR_PER_BUF<T> + i.value * KV_AGPR_PER_VEC<T>)]]
-        v_kv[BUF][i.value] = load<T::VEC_KV>(s_sub, k_offsets[i.value] + kv_d_brick_off<T, ds>);
+        v_kv[BUF][i.value] = pin_agpr<KV_AGPR_BASE<T> + BUF * KV_AGPR_PER_BUF<T> + i.value * KV_AGPR_PER_VEC<T>>(
+            load<T::VEC_KV>(s_sub, k_offsets[i.value] + kv_d_brick_off<T, ds>));
     });
 }
 
@@ -614,8 +649,8 @@ __device__ inline void compute_qk(char* smem_kv, const UK& u_rk,
                     constexpr int ik = e2.value * K_STEPS + kk.value;
                     constexpr int ek = ds * K_STEPS + kk.value;
                     constexpr int et = em.value * T::GEMM0_E_N + e;
-                    [[clang::amdgpu_pin_vgpr(S_VGPR_BASE<T> + et * ACC_PER_TILE<T>)]]
-                    s_tiles[et] = mfma_qk(v_q[em.value * T::GEMM0_E_K + ek], v_kv[b][ik], s_tiles[et]);
+                    s_tiles[et] = pin_vgpr<S_VGPR_BASE<T> + et * ACC_PER_TILE<T>>(
+                        mfma_qk(v_q[em.value * T::GEMM0_E_K + ek], v_kv[b][ik], s_tiles[et]));
                 });
             });
         });
@@ -658,7 +693,6 @@ __device__ inline void compute_pv(char* smem_kv, const UK& u_rk, const UV& u_rv,
 
     auto p_chunks = reinterpret_cast<p_tile_t*>(&v_p);
     auto o_vgpr   = reinterpret_cast<o_tile_t*>(&v_o.v);
-    auto o_agpr   = reinterpret_cast<o_tile_t*>(&v_o.a);
 
     static_assert(kv_ring_ok(PV_STEPS));
     static_assert(K_CHUNKS<T> == V_N_TILES<T>);
@@ -690,11 +724,9 @@ __device__ inline void compute_pv(char* smem_kv, const UK& u_rk, const UV& u_rv,
                 constexpr int eo = ds * V_N_TILES<T> + en.value;
                 constexpr int ot = o_slot<T, em.value, eo>;
                 if constexpr (o_in_agpr<T, eo>) {
-                    [[clang::amdgpu_pin_agpr(o_pin<T, em.value, eo>)]]
-                    o_agpr[ot] = mfma_pv(p_chunks[em.value], v_kv[b][en.value], o_agpr[ot]);
+                    update_o_agpr<T, ot>([&](auto o) { return mfma_pv(p_chunks[em.value], v_kv[b][en.value], o); });
                 } else {
-                    [[clang::amdgpu_pin_vgpr(o_pin<T, em.value, eo>)]]
-                    o_vgpr[ot] = mfma_pv(p_chunks[em.value], v_kv[b][en.value], o_vgpr[ot]);
+                    o_vgpr[ot] = pin_vgpr<o_pin<T, em.value, eo>>(mfma_pv(p_chunks[em.value], v_kv[b][en.value], o_vgpr[ot]));
                 }
             });
         });
@@ -816,8 +848,7 @@ __device__ inline void attn_cast_p(const VS& v_s, VP& v_p) {
     auto p_pairs = reinterpret_cast<attn2_t*>(&v_p);
     opus::static_for<S_ELEMS<T> / 2>([&](auto i) {
         auto pair = opus::slice(v_s, opus::number<i.value * 2>{}, opus::number<i.value * 2 + 2>{});
-        [[clang::amdgpu_pin_vgpr(P_VGPR_BASE<T> + i.value)]]
-        p_pairs[i.value] = opus::cast<typename T::D_ATTN>(pair);
+        p_pairs[i.value] = pin_vgpr<P_VGPR_BASE<T> + i.value>(opus::cast<typename T::D_ATTN>(pair));
     });
 }
 
@@ -826,13 +857,11 @@ __device__ inline void attn_cast_p(const VS& v_s, VP& v_p) {
 template<class T, int EM, class VO>
 __device__ inline void rescale_o_tiles(VO& v_o, typename T::D_ACC scale) {
     using namespace opus;
-    using acc_tile_t = vector_t<typename T::D_ACC, ACC_PER_TILE<T>>;
-    auto o_vgpr = reinterpret_cast<acc_tile_t*>(&v_o.v);
-    auto o_agpr = reinterpret_cast<acc_tile_t*>(&v_o.a);
+    auto o_vgpr = reinterpret_cast<o_acc_tile_t<T>*>(&v_o.v);
     static_for<T::GEMM1_E_N>([&](auto en) {
         constexpr int ot = o_slot<T, EM, en.value>;
         if constexpr (o_in_agpr<T, en.value>) {
-            o_agpr[ot] = o_agpr[ot] * scale;
+            update_o_agpr<T, ot>([&](auto o) { return o * scale; });
         } else {
             o_vgpr[ot] = o_vgpr[ot] * scale;
         }
@@ -1038,7 +1067,7 @@ __device__ void decode_one_work(const opus_mla_decode_kargs& kargs, int qo_start
     if (!is_producer) {
         v_q = load_q_lds<T>(smem_kv, q_lds_warp_off<T>(warp_id), u_rq);
         clear(v_o.v);
-        clear(v_o.a);
+        clear_o_agpr<T>();
         static_for<T::ML_ELEMS>([&](auto e) {
             m_row[e.value] = numeric_limits<D_ACC>::lowest();
             l_row[e.value] = D_ACC(0.0f);

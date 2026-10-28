@@ -1,7 +1,9 @@
 // Configuration traits for gfx1250 (wave32 / WMMA) MLA-v4 prefill kernels.
 #pragma once
 
+#include <type_traits>
 #include "common/mla_v4_kargs.h"
+#include "common/mla_prefill_split.h"
 
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
@@ -9,13 +11,17 @@ template<int Q_TILE_SIZE_ = 16,
          int NUM_WARPS_ = 4,
          int CLUSTER_Y_ = 1,
          typename D_ATTN_ = bf16_t,
-         typename D_OUT_ = bf16_t>
+         typename D_OUT_ = bf16_t,
+         bool SPLIT_ = false>
 struct opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
     static constexpr int D_HEAD_SIZE = D_TILE_SIZE;
     static constexpr int NUM_WARPS = NUM_WARPS_;
+    static constexpr bool SPLIT = SPLIT_;
+    using kargs_type = std::conditional_t<SPLIT_, opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>,
+                                          opus_mla_v4_prefill_kargs>;
     
     static constexpr int WARP_SIZE = 32;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
@@ -87,13 +93,17 @@ template<int Q_TILE_SIZE_ = 32,
          int D_TILE_SIZE_ = 512,
          int NUM_WARPS_ = 4,
          typename D_ATTN_ = bf16_t,
-         typename D_OUT_ = bf16_t>
+         typename D_OUT_ = bf16_t,
+         bool SPLIT_ = false>
 struct opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
     static constexpr int D_HEAD_SIZE = D_TILE_SIZE;
     static constexpr int NUM_WARPS = NUM_WARPS_;
+    static constexpr bool SPLIT = SPLIT_;
+    using kargs_type = std::conditional_t<SPLIT_, opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>,
+                                          opus_mla_v4_prefill_kargs>;
 
     static constexpr int WARP_SIZE = 32;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
@@ -181,13 +191,17 @@ template<int Q_TILE_SIZE_ = 16,
          int D_TILE_SIZE_ = 512,
          int NUM_WARPS_ = 4,
          typename D_ATTN_ = bf16_t,
-         typename D_OUT_ = bf16_t>
+         typename D_OUT_ = bf16_t,
+         bool SPLIT_ = false>
 struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
     static constexpr int D_HEAD_SIZE = D_TILE_SIZE;
     static constexpr int NUM_WARPS = NUM_WARPS_;
+    static constexpr bool SPLIT = SPLIT_;
+    using kargs_type = std::conditional_t<SPLIT_, opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>,
+                                          opus_mla_v4_prefill_kargs>;
 
     static constexpr int WARP_SIZE = 32;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
@@ -260,11 +274,15 @@ template<int Q_TILE_SIZE_ = 16,
          int CLUSTER_Y_ = 1,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
-         typename D_OUT_ = bf16_t>
+         typename D_OUT_ = bf16_t,
+         bool SPLIT_ = false>
 struct opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
+    static constexpr bool SPLIT = SPLIT_;
+    using kargs_type = std::conditional_t<SPLIT_, opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>,
+                                          opus_mla_v4_prefill_fp8_kargs>;
 
     static constexpr int WARP_SIZE = 32;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
@@ -360,11 +378,15 @@ template<int Q_TILE_SIZE_ = 32,
          int NUM_WARPS_ = 4,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
-         typename D_OUT_ = bf16_t>
+         typename D_OUT_ = bf16_t,
+         bool SPLIT_ = false>
 struct opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
+    static constexpr bool SPLIT = SPLIT_;
+    using kargs_type = std::conditional_t<SPLIT_, opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>,
+                                          opus_mla_v4_prefill_fp8_kargs>;
 
     static constexpr int WARP_SIZE = 32;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
@@ -463,11 +485,15 @@ template<int Q_TILE_SIZE_ = 16,
          int NUM_WARPS_ = 4,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
-         typename D_OUT_ = bf16_t>
+         typename D_OUT_ = bf16_t,
+         bool SPLIT_ = false>
 struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
+    static constexpr bool SPLIT = SPLIT_;
+    using kargs_type = std::conditional_t<SPLIT_, opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>,
+                                          opus_mla_v4_prefill_fp8_kargs>;
 
     static constexpr int WARP_SIZE = 32;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;

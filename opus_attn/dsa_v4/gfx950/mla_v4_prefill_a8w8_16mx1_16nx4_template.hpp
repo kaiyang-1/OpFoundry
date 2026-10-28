@@ -171,7 +171,34 @@ __device__ inline auto make_layout_rv(int warp_id, int lane_id) {
     return opus::make_layout(
         rv_block_shape,
         opus::unfold_x_stride(rv_block_dim, rv_block_shape, opus::tuple{opus::number<grp_n * lane_lo * T::VEC_TR_V>{}, opus::number<T::SMEM_KV_ROW>{}, 1_I}),
-        opus::unfold_p_coord(rv_block_dim, opus::tuple{warp_id, grp_id / grp_n, lane_in_grp / lane_lo, grp_id % grp_n, lane_in_grp % lane_lo}));
+        opus::unfold_p_coord(rv_block_dim, opus::tuple{warp_id, grp_id / grp_n, lane_in_grp / lane_lo, grp_id % grp_n,
+                                                      (lane_in_grp % lane_lo) ^ (2 * ((grp_id / grp_n) & 1))}));
+}
+
+// Rows 4..7 (mod 8) of the staged KV tile swap the 16 B halves of every 32 B column chunk; make_layout_rv
+// applies the same XOR, so both the row-per-lane writes here and the tr reads stay conflict-free.
+template<class T, class S, class VN, class VR, class UN, class UR>
+__device__ inline void store_kv_swizzled(S& s_kv, const VN& v_nope, const VR& v_rope,
+                                         const UN& u_sk_nope, const UR& u_sk_rope, int lane_id) {
+    using namespace opus;
+    constexpr int HALF = T::VEC_KV_NOPE / 2;
+    const int swz = ((lane_id % T::W_N) >> 2) & 1;
+
+    auto nope_offs = layout_to_offsets<T::VEC_KV_NOPE>(u_sk_nope);
+    static_for<sizeof(nope_offs) / sizeof(nope_offs[0])>([&](auto i) {
+        constexpr int b = i.value * T::VEC_KV_NOPE;
+        store<HALF>(s_kv, slice(v_nope, number<b>{}, number<b + HALF>{}), nope_offs[i.value] + HALF * swz);
+        store<HALF>(s_kv, slice(v_nope, number<b + HALF>{}, number<b + 2 * HALF>{}), nope_offs[i.value] + HALF - HALF * swz);
+    });
+
+    // A rope chunk is a single 16 B half, so the swizzle just moves it to its partner half.
+    const int rope_shift = swz * (((lane_id / T::W_N) & 1) ? -HALF : HALF);
+    auto rope_offs = layout_to_offsets<T::VEC_KV_ROPE>(u_sk_rope);
+    static_for<sizeof(rope_offs) / sizeof(rope_offs[0])>([&](auto i) {
+        constexpr int b = i.value * T::VEC_KV_ROPE;
+        store<T::VEC_KV_ROPE>(s_kv, slice(v_rope, number<b>{}, number<b + T::VEC_KV_ROPE>{}),
+                              rope_offs[i.value] + T::D_NOPE_SIZE + rope_shift);
+    });
 }
 
 template<class T>
@@ -475,8 +502,7 @@ __device__ void mla_v4_prefill_accum_pipelined(
         v_s = mma0_rope(v_q_rope, v_k_rope, v_s);
 
         // ──── Stage bf16 KV into smem ────
-        store<T::VEC_KV_NOPE>(s_kv, v_k_nope_bf16, u_sk_nope);
-        store<T::VEC_KV_ROPE>(s_kv, v_k_rope, u_sk_rope + T::D_NOPE_SIZE);
+        store_kv_swizzled<T>(s_kv, v_k_nope_bf16, v_k_rope, u_sk_nope, u_sk_rope, lane_id);
 
         // ──── Cross-warp online softmax ────
         attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, warp_id, lane_id);
@@ -513,9 +539,10 @@ __device__ void mla_v4_prefill_accum_pipelined(
 } // namespace opus_mla_v4_prefill_a8w8_16mx1_16nx4
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(typename Traits::kargs_type args) {
     using namespace opus;
     using namespace opus_mla_v4_prefill_a8w8_16mx1_16nx4;
+    const opus_mla_v4_prefill_fp8_kargs kargs = opus_mla_prefill_base(args);
     using T = opus::remove_cvref_t<Traits>;
     using D_NOPE = typename T::D_NOPE;
     using D_ROPE = typename T::D_ROPE;
@@ -564,11 +591,23 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
 
+    [[maybe_unused]] opus_mla_prefill_split_rows rows{};
+    if constexpr (T::SPLIT) {
+        rows = opus_mla_prefill_split_rows_of<T::KV_TILE_SIZE>(
+            kargs.kv_indptr_prefix[q_token_idx + 1] - kargs.kv_indptr_prefix[q_token_idx],
+            kargs.kv_indptr_extend[q_token_idx + 1] - kargs.kv_indptr_extend[q_token_idx],
+            args.split.num_splits, block_id_z());
+    }
+
     // ──── Prefix segment ────
     {
-        const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
+        int page_idx_begin       = kargs.kv_indptr_prefix[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
-        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        int valid_kv_len         = page_idx_end - page_idx_begin;
+        if constexpr (T::SPLIT) {
+            page_idx_begin += rows.prefix_begin;
+            valid_kv_len = rows.prefix_len;
+        }
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         mla_v4_prefill_accum_pipelined<Traits>(
@@ -583,9 +622,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
 
     // ──── Extend segment ────
     {
-        const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
+        int page_idx_begin       = kargs.kv_indptr_extend[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
-        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        int valid_kv_len         = page_idx_end - page_idx_begin;
+        if constexpr (T::SPLIT) {
+            page_idx_begin += rows.extend_begin;
+            valid_kv_len = rows.extend_len;
+        }
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         mla_v4_prefill_accum_pipelined<Traits>(
@@ -596,10 +639,23 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
             temperature_scale);
     }
 
+    if constexpr (T::SPLIT) {
+        const auto& split = args.split;
+        scale_output_tile<T>(v_o, l_row > D_ACC(0.0f) ? D_ACC(1.0f) / l_row : D_ACC(0.0f));
+        const int64_t row = opus_mla_prefill_split_row(split, q_token_idx, block_id_z(), kargs.H, h_block_start);
+        auto g_po = make_gmem(split.partial_o + row * T::D_HEAD_SIZE, (kargs.H - h_block_start) * T::D_HEAD_SIZE * sizeof(D_ACC));
+        int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+        store<T::VEC_O>(g_po, v_o, make_layout_o<T>(warp_id, lane_id, T::D_HEAD_SIZE));
+        if (warp_id == 0 && lane_id < T::W_M && h_block_start + lane_id < kargs.H)
+            opus_mla_prefill_split_store_ml(split, row + lane_id, m_row, l_row);
+        return;
+    }
+
     // ──── Sink finalization, normalize O, and store to gmem ────
     const int sink_head_idx = h_block_start + lane_id % T::W_M;
-    auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
-    D_ACC sink_log2 = load(g_attn_sink, sink_head_idx)[0] * LOG2_E;
+    const bool has_sink = kargs.attn_sink_ptr != nullptr;
+    auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), has_sink ? kargs.H * sizeof(D_ACC) : 0);
+    D_ACC sink_log2 = has_sink ? load(g_attn_sink, sink_head_idx)[0] * LOG2_E : -opus::numeric_limits<D_ACC>::infinity();
     D_ACC m_final = max(m_row, sink_log2);
     D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_final);
     D_ACC l_final = l_row * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);

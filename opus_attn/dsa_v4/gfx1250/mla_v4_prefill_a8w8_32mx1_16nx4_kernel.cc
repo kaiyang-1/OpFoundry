@@ -5,9 +5,10 @@
 #include "mla_v4_traits.h"
 
 #ifndef __HIP_DEVICE_COMPILE__
-template<typename Traits> __global__ void opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs) {}
+template<typename Traits> __global__ void opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel(typename Traits::kargs_type kargs) {}
 #else
 #include "mla_v4_prefill_a8w8_32mx1_16nx4_template.hpp"
 #endif
 
 template __global__ void opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel<opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<32, 64, 4, fp8_t, bf16_t, bf16_t>>(opus_mla_v4_prefill_fp8_kargs);
+template __global__ void opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel<opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<32, 64, 4, fp8_t, bf16_t, bf16_t, true>>(opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>);
