@@ -20,6 +20,8 @@ template<class Traits>
 __global__ void opus_mla_v41_prefill_a8w8_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
 __global__ void opus_mla_v41_prefill_a8w4_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
+template<class Traits>
+__global__ void opus_mla_v41_prefill_a8w4_16mx4_64nx1_kernel(typename Traits::kargs_type kargs);
 
 template<int Q, int KV, int NW, class DA, class DP, class DO>
 inline void mla_v41_prefill_launch(opus_mla_v41_prefill_a8w8_16mx4_64nx1_traits<Q, KV, NW, DA, DP, DO>,
@@ -35,6 +37,11 @@ template<int Q, int KV, int NW, class DA, class DP, class DO>
 inline void mla_v41_prefill_launch(opus_mla_v41_prefill_a8w4_16mx1_16nx4_traits<Q, KV, NW, DA, DP, DO>,
                                    const opus_mla_v41_prefill_kargs& kargs, dim3 grid, dim3 block) {
     opus_mla_v41_prefill_a8w4_16mx1_16nx4_kernel<opus_mla_v41_prefill_a8w4_16mx1_16nx4_traits<Q, KV, NW, DA, DP, DO>><<<grid, block>>>(kargs);
+}
+template<int Q, int KV, int NW, class DA, class DP, class DO>
+inline void mla_v41_prefill_launch(opus_mla_v41_prefill_a8w4_16mx4_64nx1_traits<Q, KV, NW, DA, DP, DO>,
+                                   const opus_mla_v41_prefill_kargs& kargs, dim3 grid, dim3 block) {
+    opus_mla_v41_prefill_a8w4_16mx4_64nx1_kernel<opus_mla_v41_prefill_a8w4_16mx4_64nx1_traits<Q, KV, NW, DA, DP, DO>><<<grid, block>>>(kargs);
 }
 
 // a8w4 kernels take an NVFP4 prefix pool.
@@ -679,8 +686,11 @@ int main(int argc, char** argv) {
                          "total_pages,total_tokens non-negative.\n";
             return 1;
         }
-        if (use_fp4)
+        if (use_fp4 && H <= 16)
             return run_mla_v41_prefill_case<opus_mla_v41_prefill_a8w4_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(
+                H, N, total_pages, total_tokens, topk, verify, with_sink);
+        if (use_fp4)
+            return run_mla_v41_prefill_case<opus_mla_v41_prefill_a8w4_16mx4_64nx1_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(
                 H, N, total_pages, total_tokens, topk, verify, with_sink);
         if (H <= 16)
             return run_mla_v41_prefill_case<opus_mla_v41_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(
