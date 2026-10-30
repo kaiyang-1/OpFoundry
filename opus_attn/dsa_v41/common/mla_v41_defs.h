@@ -42,6 +42,8 @@ __host__ __device__ constexpr int ceil_div(int a, int b) {
 
 #if defined(MLA_V41_ARCH_GFX950)
 #include "gfx950/mla_v41_traits.h"
+#elif defined(MLA_V41_ARCH_GFX1250)
+#include "gfx1250/mla_v41_traits.h"
 #else
 #error "no MLA_V41_ARCH_* defined; build through the Makefile"
 #endif

@@ -8,8 +8,13 @@ endif
 
 ARCH_MACRO := MLA_V41_ARCH_$(shell echo $(ARCH) | tr '[:lower:]' '[:upper:]')
 
+# The gfx1250 kernels depend on the expert mode and llvm scheduler
+SCHED_FLAGS_gfx1250 = -mllvm -amdgpu-expert-scheduling-mode \
+                      -mllvm -amdgpu-sched-strategy=coexec \
+                      -mllvm -amdgpu-anti-hints-for-va-vdst
+
 COMMON_FLAGS     = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -pthread -O3 -Wall -D$(ARCH_MACRO) --offload-arch=$(ARCH)
-KERNEL_FLAGS     = -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage
+KERNEL_FLAGS     = -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage $(SCHED_FLAGS_$(ARCH))
 KERNEL_OBJ_FLAGS = -fno-offload-lto
 LINK_FLAGS       = --offload-arch=$(ARCH) -pthread --rtlib=compiler-rt --unwindlib=libgcc
 
