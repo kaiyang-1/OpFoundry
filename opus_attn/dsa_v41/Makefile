@@ -8,10 +8,9 @@ endif
 
 ARCH_MACRO := MLA_V41_ARCH_$(shell echo $(ARCH) | tr '[:lower:]' '[:upper:]')
 
-# The gfx1250 kernels depend on the expert mode and llvm scheduler
+# gfx1250 needs the amdgpu-named-reg-pin-std LLVM (HIP_CLANG_PATH) for amdgpu_pin_vgpr
 SCHED_FLAGS_gfx1250 = -mllvm -amdgpu-expert-scheduling-mode \
-                      -mllvm -amdgpu-sched-strategy=coexec \
-                      -mllvm -amdgpu-anti-hints-for-va-vdst
+                      -mllvm -amdgpu-sched-strategy=coexec
 
 COMMON_FLAGS     = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -pthread -O3 -Wall -D$(ARCH_MACRO) --offload-arch=$(ARCH)
 KERNEL_FLAGS     = -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage $(SCHED_FLAGS_$(ARCH))
