@@ -103,3 +103,86 @@ struct opus_mla_v41_prefill_a8w8_16mx4_64nx1_traits {
     static constexpr size_t smem_size_bytes() { return (size_t)(FAC_OFF + FAC_BYTES); }
     static_assert(FAC_OFF + FAC_BYTES <= 5 * PARTITION_BYTES, "gfx1250 LDS is 320KB");
 };
+
+template<int Q_TILE_SIZE_ = 16,
+         int KV_TILE_SIZE_ = 64,
+         int NUM_WARPS_ = 4,
+         typename D_ATTN_ = fp8_t,
+         typename D_PV_ = bf16_t,
+         typename D_OUT_ = bf16_t,
+         bool SPLIT_ = false>
+struct opus_mla_v41_prefill_a8w8_16mx1_16nx4_traits {
+    static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int NUM_WARPS = NUM_WARPS_;
+    static constexpr bool SPLIT = SPLIT_;
+    using kargs_type = std::conditional_t<SPLIT_, opus_mla_prefill_split_kargs<opus_mla_v41_prefill_kargs>,
+                                          opus_mla_v41_prefill_kargs>;
+
+    static constexpr int WARP_SIZE = 32;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+
+    static constexpr int D_HEAD_SIZE = 512;
+    static constexpr int D_SCALE_BLOCK = 32;
+    static constexpr int D_SCALE_SIZE = D_HEAD_SIZE / D_SCALE_BLOCK;
+
+    using D_ATTN = D_ATTN_;
+    using D_PV   = D_PV_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    // Every wave holds all Q_TILE_SIZE heads: QK splits the KV rows across waves, PV splits the head dim.
+    static constexpr int T_M = 1;
+    static constexpr int T_N = NUM_WARPS;
+    static constexpr int T_K = 1;
+
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K_QK = 128;
+    static constexpr int W_K_PV = 32;
+
+    static constexpr int ROWS_PER_WAVE = KV_TILE_SIZE / NUM_WARPS;
+    static constexpr int GEMM0_E_K = D_HEAD_SIZE / W_K_QK;
+    static_assert(Q_TILE_SIZE == W_M && ROWS_PER_WAVE == W_N, "one 16x16 S tile per wave");
+
+    static constexpr int PV_GROUPS = 1;
+    static constexpr int PV_DV = D_HEAD_SIZE / NUM_WARPS;
+    static constexpr int PV_DV_TILES = PV_DV / W_N;
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K_PV;
+
+    static constexpr int VEC_KV    = 16;
+    static constexpr int VEC_SCALE = D_SCALE_SIZE;
+    static constexpr int VEC_PV    = 8;
+    static constexpr int VEC_O     = 8;
+
+    // Wave w gathers exactly the rows it reads, [w * ROWS_PER_WAVE, +ROWS_PER_WAVE).
+    static constexpr int INDICES_PER_TDM    = 8;
+    static constexpr int TDM_LOADS_PER_WAVE = ROWS_PER_WAVE / INDICES_PER_TDM;
+
+    static constexpr int K_ROW_LDS_BYTES = D_HEAD_SIZE * sizeof(D_ATTN) + 16;
+    static constexpr int K_ROW_LDS_ELEMS = K_ROW_LDS_BYTES / sizeof(D_ATTN);
+    static constexpr int V_ROW_LDS_BYTES = PV_DV * sizeof(D_PV) + 16;
+    static constexpr int V_ROW_LDS_ELEMS = V_ROW_LDS_BYTES / sizeof(D_PV);
+
+    // LDS: K/scale double buffer, one V tile as NUM_WARPS dim slices, P and the row maxes double buffered, Q.
+    static constexpr int NUM_K_BUFS    = 2;
+    static constexpr int K_SCALE_OFF   = KV_TILE_SIZE * K_ROW_LDS_BYTES;
+    static constexpr int K_BUF_BYTES   = K_SCALE_OFF + KV_TILE_SIZE * D_SCALE_SIZE;
+    static constexpr int V_OFF         = NUM_K_BUFS * K_BUF_BYTES;
+    static constexpr int V_SLICE_BYTES = KV_TILE_SIZE * V_ROW_LDS_BYTES;
+    static constexpr int XCHG_OFF      = V_OFF + NUM_WARPS * V_SLICE_BYTES;
+    static constexpr int P_CHUNK_BYTES = WARP_SIZE * VEC_PV * sizeof(D_PV);
+    static constexpr int MP_OFF        = NUM_WARPS * P_CHUNK_BYTES;            // [head][wave] within a buffer
+    static constexpr int XCHG_BYTES    = MP_OFF + W_M * NUM_WARPS * sizeof(D_ACC);
+    static constexpr int L_OFF         = XCHG_OFF + 2 * XCHG_BYTES;
+    static constexpr int Q_OFF         = L_OFF + W_M * NUM_WARPS * sizeof(D_ACC);
+    static constexpr int Q_TILE_BYTES  = Q_TILE_SIZE * K_ROW_LDS_BYTES;
+    static constexpr int QO_ROWS_PER_WAVE = Q_TILE_SIZE / NUM_WARPS;
+
+    static constexpr int O_ROW_LDS_ELEMS = D_HEAD_SIZE + 16 / sizeof(D_OUT);
+    static constexpr int O_ROW_LDS_BYTES = O_ROW_LDS_ELEMS * sizeof(D_OUT);
+    static_assert(Q_TILE_SIZE * O_ROW_LDS_BYTES <= V_OFF, "O staging reuses the K buffers");
+
+    static constexpr size_t smem_size_bytes() { return (size_t)(Q_OFF + Q_TILE_BYTES); }
+    static_assert(Q_OFF + Q_TILE_BYTES <= 160 * 1024, "two workgroups per CU");
+};
