@@ -1,5 +1,9 @@
+#if defined(MLA_V41_ARCH_GFX1250)
+#include <hip/hip_runtime.h>  // hipLaunchKernelEx
+#endif
 #include <opus/hip_minimal.hpp>
 #include <algorithm>
+#include <functional>
 #include <random>
 #include <iostream>
 #include <limits>
@@ -62,6 +66,27 @@ constexpr bool mla_v41_prefix_nvfp4 = requires { Traits::D_PREFIX_SCALE_BLOCK; }
     } while(0)
 
 #define CHECK_HIP_KERNEL_LAUNCH() CHECK_HIP(hipGetLastError())
+
+#if defined(MLA_V41_ARCH_GFX1250)
+template<class T>
+void mla_v41_launch_cluster(const typename T::kargs_type& kargs, dim3 grid, dim3 block, int splits) {
+    auto kernel = [] {
+        if constexpr (T::T_M > 1) return &opus_mla_v41_prefill_a8w8_16mx4_64nx1_kernel<T>;
+        else return &opus_mla_v41_prefill_a8w8_16mx1_16nx4_kernel<T>;
+    }();
+    hipLaunchAttribute attr{};
+    attr.id = hipLaunchAttributeClusterDimension;
+    attr.val.clusterDim.x = static_cast<unsigned>(splits);
+    attr.val.clusterDim.y = 1;
+    attr.val.clusterDim.z = 1;
+    hipLaunchConfig_t cfg{};
+    cfg.gridDim  = grid;
+    cfg.blockDim = block;
+    cfg.attrs    = &attr;
+    cfg.numAttrs = 1;
+    CHECK_HIP(hipLaunchKernelEx(&cfg, kernel, kargs));
+}
+#endif
 
 template<class T>
 struct dev_buf {
@@ -282,10 +307,10 @@ void poison_kv_rows(uint8_t* kv, size_t kv_stride, size_t data_bytes, uint8_t* k
 }
 
 template<class Traits>
-void benchmark_mla_v41_kernel(const opus_mla_v41_prefill_kargs& kargs, dim3 grid, dim3 block,
+void benchmark_mla_v41_kernel(const opus_mla_v41_prefill_kargs& kargs, const std::function<void()>& run,
                               int total_kv_rows, size_t kv_bytes, int warmup = 100, int iterations = 50) {
     for (int i = 0; i < warmup; ++i) {
-        mla_v41_prefill_launch(Traits{}, kargs, grid, block);
+        run();
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipDeviceSynchronize());
@@ -296,7 +321,7 @@ void benchmark_mla_v41_kernel(const opus_mla_v41_prefill_kargs& kargs, dim3 grid
 
     CHECK_HIP(hipEventRecord(start));
     for (int i = 0; i < iterations; ++i) {
-        mla_v41_prefill_launch(Traits{}, kargs, grid, block);
+        run();
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipEventRecord(stop));
@@ -320,7 +345,7 @@ void benchmark_mla_v41_kernel(const opus_mla_v41_prefill_kargs& kargs, dim3 grid
     const size_t o_bytes  = (size_t)kargs.N * kargs.H * D * sizeof(typename Traits::D_OUT);
     const double tbps = double(q_bytes + o_bytes + kv_bytes) / (avg_time * 1e-3) / 1e12;
 
-    printf("MLA-v4.1 Prefill Kernel Performance: avg_time=%.3f ms, %.2f TFlops, %.2f TB/s\n",
+    printf("MLA-v4.1 Prefill Kernel Performance: avg_time=%.4f ms, %.2f TFlops, %.2f TB/s\n",
            avg_time, tflops, tbps);
 }
 
@@ -486,13 +511,13 @@ void mla_v41_attention_ref(
 
 template<class Traits>
 int run_mla_v41_prefill_case(int H, int N, int total_pages, int total_tokens,
-                             int topk, bool verify, bool with_sink) {
+                             int topk, bool verify, bool with_sink, int splits) {
     using OType = typename Traits::D_OUT;
     constexpr int D     = Traits::D_HEAD_SIZE;
     constexpr int SCALE = Traits::D_SCALE_SIZE;
     constexpr bool PREFIX_FP4 = mla_v41_prefix_nvfp4<Traits>;
-    printf("MLA-v4.1 Prefill Attention: H_Q=%d, N=%d, D=%d, mxfp8%s, total_pages=%d, total_tokens=%d, topk=%d%s\n",
-           H, N, D, PREFIX_FP4 ? " (nvfp4 prefix)" : "", total_pages, total_tokens, topk, with_sink ? "" : ", no sink");
+    printf("MLA-v4.1 Prefill Attention: H_Q=%d, N=%d, D=%d, mxfp8%s, total_pages=%d, total_tokens=%d, topk=%d%s, splits=%d\n",
+           H, N, D, PREFIX_FP4 ? " (nvfp4 prefix)" : "", total_pages, total_tokens, topk, with_sink ? "" : ", no sink", splits);
 
     const size_t q_rows = (size_t)N * H;
     const size_t o_size = q_rows * D;
@@ -605,10 +630,27 @@ int run_mla_v41_prefill_case(int H, int N, int total_pages, int total_tokens,
     const int num_h_blocks = ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M);
     dim3 grid(N, num_h_blocks, 1);
     dim3 block(Traits::BLOCK_SIZE);
+    std::function<void()> run = [=] { mla_v41_prefill_launch(Traits{}, kargs, grid, block); };
+    std::unique_ptr<dev_buf<float>> partial_o, partial_max, partial_sum;
+    if (splits > 1) {
+#if defined(MLA_V41_ARCH_GFX1250)
+        const size_t rows = (size_t)N * splits * H;
+        partial_o   = std::make_unique<dev_buf<float>>(rows * D);
+        partial_max = std::make_unique<dev_buf<float>>(rows);
+        partial_sum = std::make_unique<dev_buf<float>>(rows);
+        const opus_mla_prefill_split_kargs<opus_mla_v41_prefill_kargs> split_kargs{
+            kargs, {partial_o->ptr, partial_max->ptr, partial_sum->ptr, splits}};
+        grid = dim3(N * splits, num_h_blocks, 1);
+        run = [=] { mla_v41_launch_cluster<typename Traits::cluster_traits>(split_kargs, grid, block, splits); };
+#else
+        std::cerr << "-splits is gfx1250 only\n";
+        return 1;
+#endif
+    }
     printf("MLA-v4.1 kernel launch config: grid=(%d,%d,%d), block=%d\n",
            grid.x, grid.y, grid.z, (int)block.x);
 
-    mla_v41_prefill_launch(Traits{}, kargs, grid, block);
+    run();
     CHECK_HIP_KERNEL_LAUNCH();
     if (verify) {
         printf("\nValidating GPU results against CPU reference...\n");
@@ -620,16 +662,16 @@ int run_mla_v41_prefill_case(int H, int N, int total_pages, int total_tokens,
     printf("\n");
     const size_t kv_bytes = host_kv_indices_prefix.size() * (PREFIX_DATA + PREFIX_SCALE)
                           + host_kv_indices_extend.size() * (D + SCALE);
-    benchmark_mla_v41_kernel<Traits>(kargs, grid, block, total_kv_rows, kv_bytes);
+    benchmark_mla_v41_kernel<Traits>(kargs, run, total_kv_rows, kv_bytes);
     printf("\n");
     return 0;
 }
 
 static constexpr int MLA_V41_DEFAULT_TOTAL_PAGES = 65536;
 
-// The size flags and -sink (1/0) take a comma-separated list; the cases run as their product in one process.
+// The size flags, -sink (1/0) and -splits take a comma-separated list; the cases run as their product in one process.
 int main(int argc, char** argv) {
-    std::vector<int> Hs{128}, Ns{4096}, topks{1024}, pages_list{-1}, tokens_list{-1}, sinks{1};
+    std::vector<int> Hs{128}, Ns{4096}, topks{1024}, pages_list{-1}, tokens_list{-1}, sinks{1}, splits_list{1};
     bool verify = false;
     bool use_fp4 = false;
 
@@ -676,11 +718,16 @@ int main(int argc, char** argv) {
         if (try_parse(pages_list, "-total_pages")) continue;
         if (try_parse(tokens_list, "-total_tokens")) continue;
         if (try_parse(sinks, "-sink")) continue;
+        if (try_parse(splits_list, "-splits")) continue;
         std::cerr << "unknown argument '" << arg << "'\n";
         return 1;
     }
 
-    auto run_case = [&](int H, int N, int topk, int total_pages, int total_tokens, bool with_sink) {
+    auto run_case = [&](int H, int N, int topk, int total_pages, int total_tokens, bool with_sink, int splits) {
+        if (splits != 1 && !opus_mla_prefill_cluster_size_ok(splits)) {
+            std::cerr << "-splits takes 1, 2, 4, 8 or 16\n";
+            return 1;
+        }
         if (total_pages < 0)
             total_pages = topk > 0 ? std::max({N, topk, MLA_V41_DEFAULT_TOTAL_PAGES}) : N;
         if (total_tokens < 0) total_tokens = N;
@@ -693,10 +740,10 @@ int main(int argc, char** argv) {
 #if defined(MLA_V41_ARCH_GFX950)
         if (use_fp4 && H <= 16)
             return run_mla_v41_prefill_case<opus_mla_v41_prefill_a8w4_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(
-                H, N, total_pages, total_tokens, topk, verify, with_sink);
+                H, N, total_pages, total_tokens, topk, verify, with_sink, splits);
         if (use_fp4)
             return run_mla_v41_prefill_case<opus_mla_v41_prefill_a8w4_16mx4_64nx1_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(
-                H, N, total_pages, total_tokens, topk, verify, with_sink);
+                H, N, total_pages, total_tokens, topk, verify, with_sink, splits);
         constexpr int narrow_h = 16;
 #else
         if (use_fp4) {
@@ -707,15 +754,15 @@ int main(int argc, char** argv) {
 #endif
         if (H <= narrow_h)
             return run_mla_v41_prefill_case<opus_mla_v41_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(
-                H, N, total_pages, total_tokens, topk, verify, with_sink);
+                H, N, total_pages, total_tokens, topk, verify, with_sink, splits);
         return run_mla_v41_prefill_case<opus_mla_v41_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(
-            H, N, total_pages, total_tokens, topk, verify, with_sink);
+            H, N, total_pages, total_tokens, topk, verify, with_sink, splits);
     };
 
     int cases = 0, failed = 0;
     for (int H : Hs) for (int N : Ns) for (int topk : topks) for (int pages : pages_list) for (int tokens : tokens_list)
-        for (int sink : sinks) {
-            failed += run_case(H, N, topk, pages, tokens, sink != 0) != 0;
+        for (int sink : sinks) for (int splits : splits_list) {
+            failed += run_case(H, N, topk, pages, tokens, sink != 0, splits) != 0;
             ++cases;
         }
     if (cases > 1) printf("[Summary] %d of %d cases failed\n", failed, cases);
