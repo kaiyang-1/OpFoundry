@@ -1,4 +1,3 @@
-#include <hip/hip_fp8.h>
 #include <opus/hip_minimal.hpp>
 #include <algorithm>
 #include <random>
@@ -24,7 +23,7 @@ __global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(typename Traits::k
 template<class Traits>
 __global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(typename Traits::kargs_type kargs);
+__global__ void opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel(typename Traits::kargs_type kargs);
 
 template<int Q, int KV, int D, int NW, class DT, class DO>
 inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>,
@@ -42,9 +41,9 @@ inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<Q,
     opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel<opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
-inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>,
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>,
                                   const opus_mla_v4_prefill_fp8_kargs& kargs, dim3 grid, dim3 block) {
-    opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel<opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
+    opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel<opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 
 #elif defined(MLA_V4_ARCH_GFX1250)
@@ -172,6 +171,49 @@ struct dev_buf {
     operator T*() const { return ptr; }
 };
 
+// Software e4m3 conversions: hip/hip_fp8.h does not build with the amdgpu-named-reg-pin-std LLVM.
+inline uint8_t float_to_fp8_e4m3(float f) {
+    const uint32_t bits = __builtin_bit_cast(uint32_t, f);
+    const uint8_t  sign = static_cast<uint8_t>((bits >> 24) & 0x80u);
+    const uint32_t mag  = bits & 0x7FFFFFFFu;
+
+    if (mag >= 0x7F800000u) return static_cast<uint8_t>(sign | 0x7Fu);
+    if (mag >= 0x43E00000u) return static_cast<uint8_t>(sign | 0x7Eu);
+
+    const int exp = static_cast<int>(mag >> 23) - 127;
+    uint8_t payload;
+    uint32_t dropped, halfway;
+    if (exp >= -6) {
+        const uint32_t mant = mag & 0x7FFFFFu;
+        payload = static_cast<uint8_t>(((exp + 7) << 3) | (mant >> 20));
+        dropped = mant & 0xFFFFFu;
+        halfway = 0x80000u;
+    } else {
+        const int shift = -exp - 6;
+        if (shift > 11) return sign;
+        const uint32_t mant  = (mag & 0x7FFFFFu) | 0x800000u;
+        const uint32_t width = 20 + shift;
+        payload = static_cast<uint8_t>(mant >> width);
+        dropped = mant & ((1u << width) - 1);
+        halfway = 1u << (width - 1);
+    }
+    if (dropped > halfway || (dropped == halfway && (payload & 1))) payload++;
+    return static_cast<uint8_t>(sign | payload);
+}
+
+inline float fp8_e4m3_to_float(uint8_t bits) {
+    const uint32_t sign = static_cast<uint32_t>(bits & 0x80u) << 24;
+    const uint32_t exp  = (bits >> 3) & 0x0Fu;
+    const uint32_t mant = bits & 0x07u;
+
+    if (exp == 0x0Fu && mant == 0x07u) return __builtin_bit_cast(float, sign | 0x7FC00000u);
+    if (exp == 0) {
+        const float m = static_cast<float>(mant) * 0x1p-9f;
+        return (bits & 0x80u) ? -m : m;
+    }
+    return __builtin_bit_cast(float, sign | ((exp + 120) << 23) | (mant << 20));
+}
+
 // Fixed grain, so a chunk spans the same elements at any MLA_V4_NUM_THREADS. Hashed
 // rather than seed+index, which would make Q rows bit-identical to KV rows.
 static constexpr size_t MLA_V4_INIT_GRAIN = 65536;
@@ -216,14 +258,13 @@ void init_fp8_dsa_split(typename Traits::D_NOPE* nope_ptr,
         std::uniform_int_distribution<int> scale_exp_dis(0, 3);
         for (size_t r = begin; r < end; r++) {
             unsigned char* nbase = reinterpret_cast<unsigned char*>(nope_ptr) + r * NOPE_PADDED;
-            auto* nope = reinterpret_cast<__hip_fp8_e4m3*>(nbase);
             unsigned char* scale = nbase + NOPE;
             for (int b = 0; b < SCALE; b++) {
                 const int e = scale_exp_dis(gen);
                 scale[b] = static_cast<unsigned char>(e + 127);
                 const float inv_scale = std::ldexp(1.0f, -e);
                 for (int i = 0; i < BLOCK; i++)
-                    nope[b * BLOCK + i] = static_cast<__hip_fp8_e4m3>(dis(gen) * inv_scale);
+                    nbase[b * BLOCK + i] = float_to_fp8_e4m3(dis(gen) * inv_scale);
             }
             // 0xFF is NaN as both e4m3 and E8M0: the kernel masks the pad off itself.
             for (int i = NOPE + SCALE; i < NOPE_PADDED; i++) nbase[i] = 0xFF;
@@ -431,10 +472,9 @@ inline void decode_dsa_row_fp8(const typename Traits::D_NOPE* nrow,
     constexpr int NOPE = Traits::D_NOPE_SIZE;
     constexpr int ROPE = Traits::D_ROPE_SIZE;
     const auto* base = reinterpret_cast<const unsigned char*>(nrow);
-    const auto* nope = reinterpret_cast<const __hip_fp8_e4m3*>(base);
     const unsigned char* scale = base + NOPE;
     for (int d = 0; d < NOPE; d++)
-        out[d] = static_cast<float>(nope[d]) * std::ldexp(1.0f, int(scale[d / 32]) - 127);
+        out[d] = fp8_e4m3_to_float(base[d]) * std::ldexp(1.0f, int(scale[d / 32]) - 127);
     for (int j = 0; j < ROPE; j++)
         out[NOPE + j] = static_cast<float>(rrow[j]);
 }
@@ -832,7 +872,7 @@ int main(int argc, char** argv) {
     if (use_fp8) {
         return H <= 32
             ? RUN_CASE(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>)
-            : RUN_CASE(opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>);
+            : RUN_CASE(opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<32, 32, 4, fp8_t, bf16_t, bf16_t>);
     }
     return H <= 32
         ? RUN_CASE(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>)
