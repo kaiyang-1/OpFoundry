@@ -43,12 +43,10 @@ __device__ inline V pin_vgpr(V v) {
 constexpr int K_VGPR = 512;
 constexpr int V_VGPR = 768;
 
-// VALU or trans ops placed after each WMMA. A bf16 WMMA has 4 co-execution slots, but 3 or 4 pack dependent ops
-// together and stall.
+// VALU or trans ops after each WMMA: filling more of a bf16 WMMA's 4 co-execution slots packs dependent ops and stalls.
 constexpr int VALU_PER_WMMA = 2;
 
-// Closes a scheduling region: one DS op, then a WMMA per even share of the rest, each followed by up to VALU VALU or
-// trans ops.
+// Closes a scheduling region: one DS op, then per WMMA an even share of the rest and up to VALU VALU or trans ops.
 template<int DS_OPS, int WMMAS, int VALU = 0>
 __device__ inline void interleave_ds_wmma() {
     constexpr int DS = 0x080, WMMA = 0x008, VALU_TRANS = 0x002 | 0x400;
@@ -337,8 +335,8 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
         return s_buffer_load_b512(tile < n_pre ? idx_rsrc_pre : idx_rsrc_ext, idx_byte_off);
     };
 
-    // Only the first extend tile and a segment's last tile take the branch: the first switches the TDM to the extend
-    // rows, the last points the rows past the segment's end at row kv_rows, which the TDM returns as zeros.
+    // The first extend tile switches the TDM to the extend rows; a segment's last tile points its rows past the end at
+    // row kv_rows, which the TDM returns as zeros.
     auto fix_ids = [&](u32x16_t& ids, int tile) {
         const int wave_valid = seg_len(tile) - (seg_tile(tile) * T::KV_TILE_SIZE + warp_id * T::ROWS_PER_WAVE);
         if (__builtin_expect(wave_valid < T::ROWS_PER_WAVE || tile == n_pre, 0)) {
@@ -374,7 +372,7 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
         issue_kv_tile(ids);
         row_ids = load_row_ids(tile + 1);
     };
-    // Its skip branch stays between QK and PV rather than splitting PV's first region.
+    // Keeps the skip branch out of PV's first scheduling region.
     auto mask = [&](auto buf, int tile) {
         attn_mask_oob_score<T>(v_s[buf.value], seg_len(tile), seg_tile(tile), seg_rot_rows);
         __builtin_amdgcn_sched_barrier(0);
@@ -385,7 +383,7 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
     constexpr int OP_VGPRS   = (int)sizeof(op_t) / 4;
     constexpr int K_OP_READS = (int)sizeof(v_k[0]) / 16;
     constexpr int V_OP_READS = (int)sizeof(v_v[0]) / 16;
-    // Split as dwords: bf16 element shuffles would leave no-op 16-bit moves on the pinned registers.
+    // As dwords: bf16 element copies leave no-op 16-bit moves on the pinned registers.
     using op_dw_t = vector_t<u32_t, OP_VGPRS>;
     auto pin_ops = [&](auto& dst, const auto& src, auto base) {
         static_for<(int)(sizeof(src) / sizeof(op_t))>([&](auto i) {
@@ -410,7 +408,7 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
 
     auto compute_qk = [&](auto dst, auto prev, auto fuse_softmax, int tile) __attribute__((always_inline)) {
         auto v_s_stages = reinterpret_cast<vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>*>(&v_s[dst.value]);
-        // The gather's branch runs under the PV WMMAs still queued in the XDL pipe.
+        // Its branch runs under the PV WMMAs still queued in the XDL pipe.
         issue_tile(tile);
         static_for<T::GEMM0_STAGE_N>([&](auto j) {
             constexpr int stage = j.value;
@@ -462,7 +460,7 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
                 __builtin_amdgcn_s_barrier();
                 load_k(0_I, 0_I);
             }
-            // One step of the head per stage, in the stage's region so it co-executes with its WMMAs.
+            // One softmax head step per stage, co-executing with the stage's WMMAs.
             if constexpr (fused && sg.value == 0) {
                 row_max = attn_row_max<T>(v_s[cur.value]) * temperature_scale;
                 all_below = __builtin_amdgcn_ballot_w32((row_max - m_row) <= RESCALE_THRESHOLD)
@@ -560,8 +558,8 @@ template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel(typename Traits::kargs_type args) {
     using namespace opus;
     using namespace opus_mla_v4_prefill_a16w16_16mx4_64nx1;
-    // SCHED_MODE bit 2 (DISABLE_XDL_ARB_STALL): with one wave per SIMD, let the wave queue WMMAs and keep issuing,
-    // so the XDL pipe does not drain at waits, barriers and branches. The compiler only sets bits [1:0].
+    // SCHED_MODE bit 2 (DISABLE_XDL_ARB_STALL), next to the compiler's bits [1:0]: the one wave per SIMD queues WMMAs
+    // and keeps issuing.
     asm volatile("s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1");
     const opus_mla_v4_prefill_kargs kargs = opus_mla_prefill_base(args);
     using T = opus::remove_cvref_t<Traits>;

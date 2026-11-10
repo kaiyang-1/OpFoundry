@@ -112,8 +112,7 @@ struct opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits {
     using D_OUT  = D_OUT_;
     using D_ACC  = float;
 
-    // Every wave holds all heads as M_BLOCKS 16-head blocks, so each K and V^T operand feeds M_BLOCKS WMMAs: QK splits
-    // the KV rows across waves, PV splits the head dim.
+    // Every wave holds all heads as M_BLOCKS 16-head blocks; QK splits the KV rows across waves, PV the head dim.
     static constexpr int T_M = 1;
     static constexpr int T_N = NUM_WARPS;
     static constexpr int T_K = 1;
@@ -140,9 +139,9 @@ struct opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits {
     static constexpr int KV_ROW_LDS_BYTES   = D_TILE_SIZE * sizeof(D_ATTN) + 16;
     static constexpr int KV_ROW_LDS_ELEMS   = KV_ROW_LDS_BYTES / sizeof(D_ATTN);
 
-    // A ring of KV tiles: V^T is read in place, so a slot is regathered only after every wave's PV read of it, two
-    // tiles later. Then P and the row maxes as [m-block][head][wave], double buffered. Q is staged in the last slot,
-    // which the first gather into it follows the first exchange.
+    // A ring of KV tiles with V^T read in place, so a slot is regathered two tiles after its PV; then P and the row
+    // maxes as [m-block][head][wave], double buffered. Q is staged in the last slot, first gathered after the first
+    // exchange.
     static constexpr int NUM_KV_BUFS    = 4;
     static constexpr int KV_BUF_BYTES   = KV_TILE_SIZE * KV_ROW_LDS_BYTES;
     static constexpr int XCHG_OFF       = NUM_KV_BUFS * KV_BUF_BYTES;
@@ -190,7 +189,7 @@ struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits {
     using D_OUT  = D_OUT_;
     using D_ACC  = float;
 
-    // Every wave holds all heads: QK splits the KV rows across waves, PV splits the head dim.
+    // Every wave holds all heads: QK splits the KV rows across waves, PV the head dim.
     static constexpr int T_M = 1;
     static constexpr int T_N = NUM_WARPS;
     static constexpr int T_K = 1;
@@ -217,9 +216,9 @@ struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits {
     static constexpr int KV_ROW_LDS_BYTES   = D_TILE_SIZE * sizeof(D_ATTN) + 16;
     static constexpr int KV_ROW_LDS_ELEMS   = KV_ROW_LDS_BYTES / sizeof(D_ATTN);
 
-    // KV double buffer: V^T is read in place, so a slot is regathered once every wave has read its V^T. Then P and the
-    // row maxes as [head][wave]: every wave reads them before that release, so one buffer does. Q is staged in slot 1,
-    // which the first gather into it follows the first release.
+    // KV double buffer with V^T read in place, so a slot is regathered once every wave has read its V^T; then P and the
+    // row maxes as [head][wave], read before that release so one buffer does. Q is staged in slot 1, first gathered
+    // after the first release.
     static constexpr int NUM_KV_BUFS    = 2;
     static constexpr int KV_BUF_BYTES   = KV_TILE_SIZE * KV_ROW_LDS_BYTES;
     static constexpr int XCHG_OFF       = NUM_KV_BUFS * KV_BUF_BYTES;
@@ -376,8 +375,7 @@ struct opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits {
     using D_OUT  = D_OUT_;
     using D_ACC  = float;
 
-    // Every wave holds all heads as M_BLOCKS 16-head blocks, so each K and V^T operand feeds M_BLOCKS WMMAs: QK splits
-    // the KV rows across waves, PV splits the head dim.
+    // Every wave holds all heads as M_BLOCKS 16-head blocks; QK splits the KV rows across waves, PV the head dim.
     static constexpr int W_M = 16;
     static constexpr int W_N = 16;
     static constexpr int W_K_NOPE = 128;
@@ -416,9 +414,8 @@ struct opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits {
     static constexpr int V_ROW_LDS_BYTES      = PV_DV * sizeof(D_PV) + 16;
     static constexpr int V_ROW_LDS_ELEMS      = V_ROW_LDS_BYTES / sizeof(D_PV);
 
-    // K double buffer, one V tile as NUM_WARPS dim slices, then P and the row maxes as [m-block][head][wave]. Every
-    // wave reads the exchange before the V tile is released, so one buffer does. Q is read once into registers before
-    // the V tile is first written, so it is staged there.
+    // K double buffer, one V tile as NUM_WARPS dim slices, then P and the row maxes as [m-block][head][wave], read
+    // before the V tile is released so one buffer does. Q is staged in the V tile, read before its first write.
     static constexpr int NUM_K_BUFS    = 2;
     static constexpr int K_ROPE_OFF    = KV_TILE_SIZE * K_NOPE_ROW_LDS_BYTES;
     static constexpr int K_BUF_BYTES   = K_ROPE_OFF + KV_TILE_SIZE * K_ROPE_ROW_LDS_BYTES;
@@ -477,7 +474,7 @@ struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits {
     using D_OUT  = D_OUT_;
     using D_ACC  = float;
 
-    // Every wave holds all heads: QK splits the KV rows across waves, PV splits the head dim.
+    // Every wave holds all heads: QK splits the KV rows across waves, PV the head dim.
     static constexpr int T_M = 1;
     static constexpr int T_N = NUM_WARPS;
     static constexpr int T_K = 1;
@@ -513,8 +510,8 @@ struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits {
     static constexpr int V_ROW_LDS_BYTES      = PV_DV * sizeof(D_PV) + 16;
     static constexpr int V_ROW_LDS_ELEMS      = V_ROW_LDS_BYTES / sizeof(D_PV);
 
-    // K double buffer, one V tile as NUM_WARPS dim slices, P and the row maxes double buffered. Q is read once into
-    // registers before the V tile is first written, so it is staged there.
+    // K double buffer, one V tile as NUM_WARPS dim slices, P and the row maxes double buffered. Q is staged in the V
+    // tile, read before its first write.
     static constexpr int NUM_K_BUFS    = 2;
     static constexpr int K_ROPE_OFF    = KV_TILE_SIZE * K_NOPE_ROW_LDS_BYTES;
     static constexpr int K_BUF_BYTES   = K_ROPE_OFF + KV_TILE_SIZE * K_ROPE_ROW_LDS_BYTES;
