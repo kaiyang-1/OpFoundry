@@ -19,7 +19,7 @@
 template<class Traits>
 __global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(typename Traits::kargs_type kargs);
+__global__ void opus_mla_v4_prefill_a16w16_32mx4_32nx1_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
 __global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
@@ -31,9 +31,9 @@ inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<
     opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel<opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int D, int NW, class DT, class DO>
-inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<Q, KV, D, NW, DT, DO>,
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_32mx4_32nx1_traits<Q, KV, D, NW, DT, DO>,
                                   const opus_mla_v4_prefill_kargs& kargs, dim3 grid, dim3 block) {
-    opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel<opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
+    opus_mla_v4_prefill_a16w16_32mx4_32nx1_kernel<opus_mla_v4_prefill_a16w16_32mx4_32nx1_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
 inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>,
@@ -876,7 +876,7 @@ int main(int argc, char** argv) {
     }
     return H <= 32
         ? RUN_CASE(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>)
-        : RUN_CASE(opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t, bf16_t>);
+        : RUN_CASE(opus_mla_v4_prefill_a16w16_32mx4_32nx1_traits<32, 32, 512, 4, bf16_t, bf16_t>);
 #elif defined(MLA_V4_ARCH_GFX1250)
     const int cluster_y = mla_v4_pick_cluster_y(ceil_div(H, 64));
     if (use_fp8) {

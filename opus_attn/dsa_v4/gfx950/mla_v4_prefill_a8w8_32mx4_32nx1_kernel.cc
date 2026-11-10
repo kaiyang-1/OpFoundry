@@ -11,3 +11,4 @@ template<typename Traits> __global__ void opus_mla_v4_prefill_a8w8_32mx4_32nx1_k
 #endif
 
 template __global__ void opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel<opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<32, 32, 4, fp8_t, bf16_t, bf16_t>>(opus_mla_v4_prefill_fp8_kargs);
+template __global__ void opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel<opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<32, 32, 4, fp8_t, bf16_t, bf16_t, true>>(opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>);

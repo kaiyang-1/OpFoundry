@@ -179,7 +179,7 @@ __device__ inline D lane_swap_max32(D x) {
 
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1)
-void opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel(typename Traits::kargs_type kargs) {
+void opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel(typename Traits::kargs_type args) {
     using namespace opus;
     using namespace opus_mla_v4_prefill_a8w8_32mx4_32nx1;
     using T      = remove_cvref_t<Traits>;
@@ -188,7 +188,8 @@ void opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel(typename Traits::kargs_type kar
     using D_ACC  = typename T::D_ACC;
     using D_OUT  = typename T::D_OUT;
     using u32x4  = vector_t<u32_t, 4>;
-    static_assert(!T::SPLIT && PV_STEPS<T> == 2 && T::V_SLOTS == 1);
+    static_assert(PV_STEPS<T> == 2 && T::V_SLOTS == 1);
+    const auto& kargs = opus_mla_prefill_base(args);
     static_assert(V_AGPR<T> + VO<T> * V_REGS<T> <= O_HI_AGPR<T>, "AGPR budget");
 
     constexpr int TILE = T::KV_TILE_SIZE;
@@ -225,11 +226,18 @@ void opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel(typename Traits::kargs_type kar
     D_ACC m_row = numeric_limits<D_ACC>::lowest();
     D_ACC l_row = D_ACC(0.0f);
 
-    // ---- one stream of KV tiles: prefix, then extend ----
-    const int pbeg = kargs.kv_indptr_prefix[tok];
-    const int plen = kargs.kv_indptr_prefix[tok + 1] - pbeg;
-    const int ebeg = kargs.kv_indptr_extend[tok];
-    const int elen = kargs.kv_indptr_extend[tok + 1] - ebeg;
+    // ---- one stream of KV tiles: prefix, then extend; a split takes its share of them ----
+    int pbeg = kargs.kv_indptr_prefix[tok];
+    int plen = kargs.kv_indptr_prefix[tok + 1] - pbeg;
+    int ebeg = kargs.kv_indptr_extend[tok];
+    int elen = kargs.kv_indptr_extend[tok + 1] - ebeg;
+    if constexpr (T::SPLIT) {
+        const auto rows = opus_mla_prefill_split_rows_of<TILE>(plen, elen, args.split.num_splits, block_id_z());
+        pbeg += rows.prefix_begin;
+        plen = rows.prefix_len;
+        ebeg += rows.extend_begin;
+        elen = rows.extend_len;
+    }
     const int PT = ceil_div(plen, TILE);
     const int NT = PT + ceil_div(elen, TILE);
 
@@ -564,7 +572,31 @@ void opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel(typename Traits::kargs_type kar
     constexpr int DMA_K   = 0;    // PV_rest MFMA issuing the next DMA (after the dequant stores)
     constexpr int X1_K    = SM_SPAN + 1;   // PV_rest MFMA after X1
     // Q goes out behind the first page indices (vmcnt retires in order), so waiting for them does not wait for Q.
-    if (NT > 0) {
+    // No keys: zero output (split: zero partials, empty m / l). Returning early keeps O out of a join RA spills at.
+    if (NT == 0) {
+        if constexpr (T::SPLIT) {
+            const auto& split = args.split;
+            const int64_t row = opus_mla_prefill_split_row(split, tok, block_id_z(), kargs.H, h_block_start);
+            auto g_po = make_gmem(split.partial_o + row * T::D_HEAD_SIZE, (kargs.H - h_block_start) * T::D_HEAD_SIZE * sizeof(D_ACC));
+            static_for<T::Q_TILE_SIZE * T::D_HEAD_SIZE / (T::WARP_SIZE * 4)>([&](auto i) {
+                store<4>(g_po, vector_t<D_ACC, 4>{0.0f, 0.0f, 0.0f, 0.0f},
+                         warp_id * T::Q_TILE_SIZE * T::D_HEAD_SIZE + (i.value * T::WARP_SIZE + lane_id) * 4);
+            });
+            if (g == 0 && h_block_start + head_rel < kargs.H) opus_mla_prefill_split_store_ml(split, row + head_rel, m_row, D_ACC(0.0f));
+        } else {
+            auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + static_cast<int64_t>(tok) * kargs.stride_o_n
+                                     + static_cast<int64_t>(h_block_start) * kargs.stride_o_h,
+                                 (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
+            vector_t<D_OUT, 8> z;
+            static_for<8>([&](auto k) { z[k.value] = D_OUT(0.0f); });
+            static_for<T::Q_TILE_SIZE * T::D_HEAD_SIZE / (T::WARP_SIZE * 8)>([&](auto i) {
+                const int e = (i.value * T::WARP_SIZE + lane_id) * 8;
+                store<8>(g_o, z, (warp_id * T::Q_TILE_SIZE + e / T::D_HEAD_SIZE) * kargs.stride_o_h + e % T::D_HEAD_SIZE);
+            });
+        }
+        return;
+    }
+    {
         constexpr int KS = T::smem_k_bytes;
         int pages[A + 1];
         pages[0] = next_page();
@@ -576,7 +608,8 @@ void opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel(typename Traits::kargs_type kar
             if constexpr (k.value + 2 <= A) pages[k.value + 2] = next_page();
             issue_dma(pages[k.value], k.value * KS);
         });
-        s_waitcnt_vmcnt(number<(A - 1) * VM_PER_STAGE>{});
+        // DMA(0) landed
+        s_waitcnt_vmcnt(number<(A - 1) * DMA_OPS>{});
         __builtin_amdgcn_s_barrier();
 
         int ks_off = 0;
@@ -666,6 +699,31 @@ void opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel(typename Traits::kargs_type kar
         for (int t = 1; t < NT; ++t) stage(t, true_type{}, true_type{});
         stage(NT, false_type{}, true_type{});
         s_waitcnt_vmcnt(0_I);
+    }
+
+    // ---- split-K epilogue: O normalized by the split's own sum (fp32), m and l per head ----
+    if constexpr (T::SPLIT) {
+        const auto& split = args.split;
+        const int64_t row = opus_mla_prefill_split_row(split, tok, block_id_z(), kargs.H, h_block_start);
+        auto g_po = make_gmem(split.partial_o + row * T::D_HEAD_SIZE, (kargs.H - h_block_start) * T::D_HEAD_SIZE * sizeof(D_ACC));
+        // the other head tiles' sums, exchanged like the output scales below
+        lds_store(xsm, X_OSC + warp_id * T::WARP_SIZE * 4 + lane_id * 4, l_row > D_ACC(0.0f) ? D_ACC(1.0f) / l_row : D_ACC(0.0f));
+        s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
+        static_for<NH>([&](auto j) {
+            const D_ACC inv = lds_load<1, D_ACC>(xsm + X_OSC + (warp_id ^ j.value) * T::WARP_SIZE * 4, lane_id * 4)[0];
+            const int head = (warp_id ^ j.value) * T::Q_TILE_SIZE + i32;
+            static_for<ND>([&](auto nt) {
+                constexpr int k = j.value * ND + nt.value;
+                const acc_t<T> v = pin_o<T, k>(o[k]) * inv;
+                static_for<ACC<T> / 4>([&](auto b) {
+                    store<4>(g_po, slice(v, number<4 * b.value>{}, number<4 * b.value + 4>{}),
+                             head * T::D_HEAD_SIZE + (warp_id * ND + nt.value) * T::W_N + 8 * b.value + 4 * g);
+                });
+            });
+        });
+        if (g == 0 && h_block_start + head_rel < kargs.H) opus_mla_prefill_split_store_ml(split, row + head_rel, m_row, l_row);
+        return;
     }
 
     // ---- epilogue: sink, normalize, store ----

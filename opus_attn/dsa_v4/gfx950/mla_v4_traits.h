@@ -399,3 +399,61 @@ struct opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits {
 
     static constexpr size_t smem_size_bytes() { return K_SLOTS * smem_k_bytes + V_SLOTS * smem_v_bytes + smem_x_bytes; }
 };
+
+// Configuration traits for the bf16 32mx4_32nx1 MLA-v4 kernel variant (T_M=NUM_WARPS, 32x32 MFMA, named-register pins).
+template<int Q_TILE_SIZE_ = 32,
+         int KV_TILE_SIZE_ = 32,
+         int D_TILE_SIZE_ = 512,
+         int NUM_WARPS_ = 4,
+         typename D_ATTN_ = bf16_t,
+         typename D_OUT_ = bf16_t,
+         bool SPLIT_ = false>
+struct opus_mla_v4_prefill_a16w16_32mx4_32nx1_traits {
+    static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
+    static constexpr int D_HEAD_SIZE = D_TILE_SIZE;
+    static constexpr int NUM_WARPS = NUM_WARPS_;
+    static constexpr bool SPLIT = SPLIT_;
+    using kargs_type = std::conditional_t<SPLIT_, opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>,
+                                          opus_mla_v4_prefill_kargs>;
+
+    static constexpr int WARP_SIZE = 64;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+
+    using D_ATTN = D_ATTN_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    static constexpr int T_M = NUM_WARPS;
+    static constexpr int T_N = 1;
+    static constexpr int T_K = 1;
+
+    // QK: S^T = K . Q^T, PV: O^T = V^T . P^T, both bf16 32x32x16.
+    static constexpr int W_M = 32;
+    static constexpr int W_N = 32;
+    static constexpr int W_K = 16;
+
+    static constexpr int GEMM0_E_K = D_TILE_SIZE / W_K;
+    static constexpr int GEMM1_E_N = D_HEAD_SIZE / W_N;
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
+    static_assert(Q_TILE_SIZE == W_M && KV_TILE_SIZE == W_N);
+
+    static constexpr int VEC_KV = 16 / sizeof(D_ATTN);
+    static constexpr int VEC_TR_V = 4;
+
+    // One KV tile serves as K and V. Per 128 B d-chunk: bricks of 8 rows x 128 B + 64 B, brick w holding rows
+    // 4r + w, 16 B pieces XOR-swizzled by r % 4. Both the QK row reads and the PV tr-reads are conflict-free.
+    static constexpr int smem_brick = 1088;
+    static constexpr int brick_rows = 8;
+    static constexpr int smem_n_rpt = KV_TILE_SIZE / brick_rows;
+    static constexpr int smem_d_rpt = D_TILE_SIZE * sizeof(D_ATTN) / 128;
+    static constexpr int smem_chunk = smem_n_rpt * smem_brick;
+    static constexpr int smem_kv_bytes = smem_d_rpt * smem_chunk;
+    static constexpr int KV_SLOTS = 4;   // the DMA runs 2 tiles ahead; the V reads of a tile may outlive its stage
+    // P and rescale factors exchanged between waves (PV is split by dv), double-buffered; output scales
+    static constexpr int smem_x_bytes = (2 * (GEMM1_E_K * WARP_SIZE * 16 + WARP_SIZE * 4) + WARP_SIZE * 4) * NUM_WARPS;
+    static_assert(smem_n_rpt == NUM_WARPS, "one brick per wave in each d-chunk");
+
+    static constexpr size_t smem_size_bytes() { return KV_SLOTS * smem_kv_bytes + smem_x_bytes; }
+};
