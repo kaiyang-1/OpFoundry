@@ -281,17 +281,15 @@ void init_kv_page_table(std::vector<int>& kv_indptr,
                         int N,
                         int pool_rows,
                         int topk,
-                        bool causal,
                         uint64_t seed) {
     assert(N >= 0);
     assert(pool_rows >= 0);
 
     const int budget = (topk <= 0 || topk > pool_rows) ? pool_rows : topk;
-    auto candidates = [&](int q) { return causal ? std::min(q + 1, pool_rows) : pool_rows; };
 
     kv_indptr.assign(N + 1, 0);
     for (int q = 0; q < N; ++q) {
-        const int nnz = std::min(budget, candidates(q));
+        const int nnz = budget;
         const size_t end = static_cast<size_t>(kv_indptr[q]) + static_cast<size_t>(nnz);
         assert(end <= static_cast<size_t>(std::numeric_limits<int>::max()));
         kv_indptr[q + 1] = static_cast<int>(end);
@@ -305,10 +303,9 @@ void init_kv_page_table(std::vector<int>& kv_indptr,
         for (size_t q = begin; q < end; ++q) {
             int* row = kv_indices.data() + kv_indptr[q];
             const int nnz = kv_indptr[q + 1] - kv_indptr[q];
-            const int range = candidates(static_cast<int>(q));
             std::mt19937 gen = mla_v4_rng(seed, static_cast<uint64_t>(q) + (1ull << 32));
             for (int i = 0; i < nnz; ++i) {
-                const int j = i + static_cast<int>(gen() % static_cast<uint32_t>(range - i));
+                const int j = i + static_cast<int>(gen() % static_cast<uint32_t>(pool_rows - i));
                 std::swap(perm[i], perm[j]);
                 row[i] = perm[i];
             }
@@ -317,6 +314,16 @@ void init_kv_page_table(std::vector<int>& kv_indptr,
             for (int i = 0; i < nnz; ++i) perm[row[i]] = row[i];
         }
     });
+}
+
+// Token q's extend rows: its last min(q + 1, window), ending at row q.
+void init_kv_window(std::vector<int>& kv_indptr, std::vector<int>& kv_indices, int N, int window) {
+    kv_indptr.assign(N + 1, 0);
+    kv_indices.clear();
+    for (int q = 0; q < N; ++q) {
+        for (int r = q - std::min(q + 1, window) + 1; r <= q; ++r) kv_indices.push_back(r);
+        kv_indptr[q + 1] = static_cast<int>(kv_indices.size());
+    }
 }
 
 inline std::vector<uint8_t> mla_v4_poison_mask(int pool_rows, const std::vector<int>& kv_indices) {
@@ -612,14 +619,15 @@ void mla_v4_attention_ref_fp8(
 }
 
 template<class Traits>
-int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
+int run_mla_v4_prefill_case(int H, int N, int total_pages, int window,
                             int topk, bool verify) {
     using DType = typename Traits::D_ATTN;
     using OType = typename Traits::D_OUT;
     constexpr bool is_fp8 = std::is_same_v<DType, fp8_t> || std::is_same_v<DType, bf8_t>;
     const char* precision = is_fp8 ? "NoPE=fp8, RoPE=bf16" : "NoPE=bf16, RoPE=bf16";
-    printf("MLA-v4 Prefill Attention: H_Q=%d, N=%d, D=%d, %s, total_pages=%d, total_tokens=%d, topk=%d\n",
-           H, N, Traits::D_HEAD_SIZE, precision, total_pages, total_tokens, topk);
+    printf("MLA-v4 Prefill Attention: H_Q=%d, N=%d, D=%d, %s, total_pages=%d, topk=%d, window=%d\n",
+           H, N, Traits::D_HEAD_SIZE, precision, total_pages, topk, window);
+    const int total_tokens = window > 0 ? N : 0;
 
     constexpr int D_HEAD = Traits::D_HEAD_SIZE;
     const size_t o_size = (size_t)N * H * D_HEAD;
@@ -628,16 +636,13 @@ int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
     auto host_o_ref = std::make_unique<OType[]>(o_size);
     auto host_o_gpu = std::make_unique<OType[]>(o_size);
     const uint64_t seed_sink = MLA_V4_SEED + 1, seed_q = MLA_V4_SEED + 2, seed_ukv = MLA_V4_SEED + 3,
-                   seed_kv = MLA_V4_SEED + 4, seed_idx_prefix = MLA_V4_SEED + 5,
-                   seed_idx_extend = MLA_V4_SEED + 6;
+                   seed_kv = MLA_V4_SEED + 4, seed_idx_prefix = MLA_V4_SEED + 5;
     rand_vector(host_attn_sink.get(), H, seed_sink);
 
     std::vector<int> host_kv_indptr_prefix, host_kv_indices_prefix;
     std::vector<int> host_kv_indptr_extend, host_kv_indices_extend;
-    init_kv_page_table(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages, topk,
-                       /*causal=*/false, seed_idx_prefix);
-    init_kv_page_table(host_kv_indptr_extend, host_kv_indices_extend, N, total_tokens, topk,
-                       /*causal=*/true, seed_idx_extend);
+    init_kv_page_table(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages, topk, seed_idx_prefix);
+    init_kv_window(host_kv_indptr_extend, host_kv_indices_extend, N, window);
     const size_t total_kv_indices = host_kv_indices_prefix.size() + host_kv_indices_extend.size();
     assert(total_kv_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
     const int total_kv_rows = static_cast<int>(total_kv_indices);
@@ -810,7 +815,7 @@ int main(int argc, char** argv) {
     int N = 4096;
     int topk = 1024;
     int total_pages = -1;
-    int total_tokens = -1;
+    int window = 128;
 
     bool verify = false;
     bool use_fp8 = false;
@@ -850,23 +855,22 @@ int main(int argc, char** argv) {
         if (try_parse(N, "-n")) continue;
         if (try_parse(topk, "-topk")) continue;
         if (try_parse(total_pages, "-total_pages")) continue;
-        if (try_parse(total_tokens, "-total_tokens")) continue;
+        if (try_parse(window, "-window")) continue;
         std::cerr << "unknown argument '" << arg << "'\n";
         return 1;
     }
     if (total_pages < 0)
         total_pages = topk > 0 ? std::max({N, topk, MLA_V4_DEFAULT_TOTAL_PAGES}) : N;
-    if (total_tokens < 0) total_tokens = N;
-    if (topk <= 0) topk = std::max(total_pages, total_tokens);
+    if (topk <= 0) topk = total_pages;
 
-    if (H <= 0 || N <= 0 || total_pages < 0 || total_tokens < 0) {
+    if (H <= 0 || N <= 0 || total_pages < 0 || window < 0) {
         std::cerr << "Invalid parameters. H_Q,N must be positive and "
-                     "total_pages,total_tokens non-negative.\n";
+                     "total_pages,window non-negative.\n";
         return 1;
     }
 
 #define RUN_CASE(...)                                                          \
-    run_mla_v4_prefill_case<__VA_ARGS__>(H, N, total_pages, total_tokens, topk, verify)
+    run_mla_v4_prefill_case<__VA_ARGS__>(H, N, total_pages, window, topk, verify)
 
 #if defined(MLA_V4_ARCH_GFX950)
     if (use_fp8) {
