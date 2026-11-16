@@ -61,51 +61,13 @@ template<class Traits>
 __global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
 __global__ void opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel(typename Traits::kargs_type kargs);
+template<class Traits>
+__global__ void opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel(typename Traits::kargs_type kargs);
 
-constexpr int mla_v4_max_cluster_y = 2;
-
-inline int mla_v4_pick_cluster_y(int num_h_blocks) {
-    for (int c = mla_v4_max_cluster_y; c > 1; c >>= 1)
-        if (num_h_blocks % c == 0) return c;
-    return 1;
-}
-
-template<int CY, class Kernel, class KArgs>
-inline void mla_v4_prefill_launch_clustered(Kernel kernel, const KArgs& kargs, dim3 grid, dim3 block) {
-    if constexpr (CY == 1) {
-        kernel<<<grid, block>>>(kargs);
-    } else {
-        if (grid.y % CY != 0) {
-            fprintf(stderr, "CLUSTER_Y=%d does not divide grid.y=%u; refusing to launch a masked gather\n",
-                    CY, grid.y);
-            exit(1);
-        }
-        hipLaunchAttribute attr{};
-        attr.id = hipLaunchAttributeClusterDimension;
-        attr.val.clusterDim.x = 1;
-        attr.val.clusterDim.y = CY;
-        attr.val.clusterDim.z = 1;
-
-        hipLaunchConfig_t cfg{};
-        cfg.gridDim          = grid;
-        cfg.blockDim         = block;
-        cfg.dynamicSmemBytes = 0;
-        cfg.stream           = nullptr;
-        cfg.attrs            = &attr;
-        cfg.numAttrs         = 1;
-        hipError_t e = hipLaunchKernelEx(&cfg, kernel, kargs);
-        if (e != hipSuccess) {
-            fprintf(stderr, "cluster launch (1,%d,1) failed: %s\n", CY, hipGetErrorString(e));
-            exit(1);
-        }
-    }
-}
-
-template<int Q, int KV, int D, int NW, int CY, class DT, class DO>
-inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>,
+template<int Q, int KV, int D, int NW, class DT, class DO>
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<Q, KV, D, NW, DT, DO>,
                                   const opus_mla_v4_prefill_kargs& kargs, dim3 grid, dim3 block) {
-    using Traits = opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>;
-    mla_v4_prefill_launch_clustered<CY>(opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel<Traits>, kargs, grid, block);
+    opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel<opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int D, int NW, class DT, class DO>
 inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>,
@@ -117,11 +79,10 @@ inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits<
                                   const opus_mla_v4_prefill_kargs& kargs, dim3 grid, dim3 block) {
     opus_mla_v4_prefill_a16w16_32mx1_16nx4_kernel<opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
 }
-template<int Q, int KV, int NW, int CY, class NOPE, class ROPE, class DO>
-inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<Q, KV, NW, CY, NOPE, ROPE, DO>,
+template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<Q, KV, NW, NOPE, ROPE, DO>,
                                   const opus_mla_v4_prefill_fp8_kargs& kargs, dim3 grid, dim3 block) {
-    using Traits = opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<Q, KV, NW, CY, NOPE, ROPE, DO>;
-    mla_v4_prefill_launch_clustered<CY>(opus_mla_v4_prefill_a8w8_16mx4_64nx1_kernel<Traits>, kargs, grid, block);
+    opus_mla_v4_prefill_a8w8_16mx4_64nx1_kernel<opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
 inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>,
@@ -132,6 +93,11 @@ template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
 inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>,
                                   const opus_mla_v4_prefill_fp8_kargs& kargs, dim3 grid, dim3 block) {
     opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel<opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
+}
+template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>,
+                                  const opus_mla_v4_prefill_fp8_kargs& kargs, dim3 grid, dim3 block) {
+    opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel<opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 #else
 #  error "No target arch defined. The Makefile passes MLA_V4_ARCH_<ARCH> from ARCH (e.g. ARCH=gfx950)."
@@ -882,7 +848,6 @@ int main(int argc, char** argv) {
         ? RUN_CASE(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>)
         : RUN_CASE(opus_mla_v4_prefill_a16w16_32mx4_32nx1_traits<32, 32, 512, 4, bf16_t, bf16_t>);
 #elif defined(MLA_V4_ARCH_GFX1250)
-    const int cluster_y = mla_v4_pick_cluster_y(ceil_div(H, 64));
     if (use_fp8) {
         if (H <= 16) {
             return RUN_CASE(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>);
@@ -890,10 +855,10 @@ int main(int argc, char** argv) {
         if (H <= 32) {
             return RUN_CASE(opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<32, 64, 4, fp8_t, bf16_t, bf16_t>);
         }
-        switch (cluster_y) {
-            case 2: return RUN_CASE(opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, 2, fp8_t, bf16_t, bf16_t>);
-            default: return RUN_CASE(opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, 1, fp8_t, bf16_t, bf16_t>);
+        if (H > 64) {
+            return RUN_CASE(opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<32, 32, 4, fp8_t, bf16_t, bf16_t>);
         }
+        return RUN_CASE(opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>);
     }
     if (H <= 16) {
         return RUN_CASE(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>);
@@ -901,9 +866,6 @@ int main(int argc, char** argv) {
     if (H <= 32) {
         return RUN_CASE(opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits<32, 64, 512, 4, bf16_t, bf16_t>);
     }
-    switch (cluster_y) {
-        case 2: return RUN_CASE(opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, 2, bf16_t, bf16_t>);
-        default: return RUN_CASE(opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, 1, bf16_t, bf16_t>);
-    }
+    return RUN_CASE(opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, bf16_t, bf16_t>);
 #endif
 }

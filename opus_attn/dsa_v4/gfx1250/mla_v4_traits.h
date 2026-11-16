@@ -9,7 +9,6 @@ template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
          int D_TILE_SIZE_ = 512,
          int NUM_WARPS_ = 4,
-         int CLUSTER_Y_ = 1,
          typename D_ATTN_ = bf16_t,
          typename D_OUT_ = bf16_t,
          bool SPLIT_ = false>
@@ -25,7 +24,6 @@ struct opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits {
     
     static constexpr int WARP_SIZE = 32;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
-    static constexpr int CLUSTER_Y = CLUSTER_Y_;
 
     using D_ATTN = D_ATTN_;
     using D_OUT  = D_OUT_;
@@ -243,7 +241,6 @@ struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits {
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 64,
          int NUM_WARPS_ = 4,
-         int CLUSTER_Y_ = 1,
          typename D_NOPE_ = fp8_t,
          typename D_ROPE_ = bf16_t,
          typename D_OUT_ = bf16_t,
@@ -258,7 +255,6 @@ struct opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits {
 
     static constexpr int WARP_SIZE = 32;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
-    static constexpr int CLUSTER_Y = CLUSTER_Y_;
     static constexpr int MXSCL_BLOCK_SIZE = 32;
 
     // Packed DSA hdim split
@@ -344,6 +340,113 @@ struct opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits {
 
     static constexpr size_t smem_size_bytes() { return (size_t)(Q_OFF + NUM_WARPS * Q_WAVE_BYTES); }
     static_assert(Q_OFF + NUM_WARPS * Q_WAVE_BYTES <= 5 * PARTITION_BYTES, "gfx1250 LDS is 320KB");
+};
+
+template<int Q_TILE_SIZE_ = 32,
+         int KV_TILE_SIZE_ = 32,
+         int NUM_WARPS_ = 4,
+         typename D_NOPE_ = fp8_t,
+         typename D_ROPE_ = bf16_t,
+         typename D_OUT_ = bf16_t,
+         bool SPLIT_ = false>
+struct opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits {
+    static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int NUM_WARPS = NUM_WARPS_;
+    static constexpr bool SPLIT = SPLIT_;
+    using kargs_type = std::conditional_t<SPLIT_, opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>,
+                                          opus_mla_v4_prefill_fp8_kargs>;
+
+    static constexpr int WARP_SIZE = 32;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+    static constexpr int MXSCL_BLOCK_SIZE = 32;
+
+    static constexpr int D_NOPE_SIZE = 448;
+    static constexpr int D_NOPE_PADDED_SIZE = 512;
+    static constexpr int D_ROPE_SIZE = 64;
+    static constexpr int D_HEAD_SIZE = D_NOPE_SIZE + D_ROPE_SIZE;
+
+    using D_NOPE = D_NOPE_;
+    using D_ROPE = D_ROPE_;
+    using D_ATTN = D_NOPE_;
+    using D_PV   = D_ROPE_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    // QK splits the heads across waves (M_BLOCKS 16-head blocks each), PV splits the head dim.
+    static constexpr int T_M = NUM_WARPS;
+    static constexpr int T_N = 1;
+    static constexpr int T_K = 1;
+
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K_NOPE = 128;
+    static constexpr int W_K_ROPE = 32;
+    static constexpr int W_K_PV = 32;
+    static constexpr int M_BLOCKS = Q_TILE_SIZE / W_M;
+    static constexpr int STAGES   = KV_TILE_SIZE / W_N;
+
+    static constexpr int GEMM0_NOPE_E_K = D_NOPE_PADDED_SIZE / W_K_NOPE;
+    static constexpr int GEMM0_ROPE_E_K = D_ROPE_SIZE / W_K_ROPE;
+
+    static constexpr int PV_GROUPS   = NUM_WARPS * M_BLOCKS;
+    static constexpr int PV_DV       = D_HEAD_SIZE / NUM_WARPS;
+    static constexpr int PV_DV_TILES = PV_DV / W_N;
+    static constexpr int GEMM1_E_K   = KV_TILE_SIZE / W_K_PV;
+    static_assert(M_BLOCKS == 2 && STAGES == 2 && GEMM1_E_K == 1 && NUM_WARPS == 4);
+
+    static constexpr int VEC_NOPE  = 16;
+    static constexpr int VEC_ROPE  = 8;
+    static constexpr int VEC_SCALE = 16;
+    static constexpr int VEC_PV    = 8;
+    static constexpr int VEC_O     = 8;
+
+    static constexpr int ROWS_PER_WAVE      = KV_TILE_SIZE / NUM_WARPS;
+    static constexpr int INDICES_PER_TDM    = 8;
+    static_assert(ROWS_PER_WAVE == INDICES_PER_TDM, "one gather per wave and stream");
+
+    static constexpr int K_NOPE_ROW_LDS_BYTES = D_NOPE_PADDED_SIZE * sizeof(D_NOPE) + 16;
+    static constexpr int K_NOPE_ROW_LDS_ELEMS = K_NOPE_ROW_LDS_BYTES / sizeof(D_NOPE);
+    static constexpr int K_ROPE_ROW_LDS_BYTES = D_ROPE_SIZE * sizeof(D_ROPE) + 16;
+    static constexpr int K_ROPE_ROW_LDS_ELEMS = K_ROPE_ROW_LDS_BYTES / sizeof(D_ROPE);
+    static constexpr int V_ROW_LDS_BYTES      = PV_DV * sizeof(D_PV) + 16;
+    static constexpr int V_ROW_LDS_ELEMS      = V_ROW_LDS_BYTES / sizeof(D_PV);
+
+    // A ring of KV tiles, each as two 16-row halves one partition apart, so the SIMD pairs, which start QK on
+    // different halves, read different partitions. V^T per dim slice with a buffer per ring slot, then P and the
+    // rescale factors double buffered. Q is staged in the V slices, read before their first write.
+    static constexpr int PARTITION_BYTES = 64 * 1024;
+    static constexpr int NUM_KV_BUFS     = 4;
+    static constexpr int ROWS_PER_HALF   = KV_TILE_SIZE / 2;
+    static constexpr int K_ROPE_OFF      = ROWS_PER_HALF * K_NOPE_ROW_LDS_BYTES;
+    // A NoPE row lands with dims [448, 512) zeroed and its scales in a 16-byte row of their own.
+    static constexpr int SCALE_ROW_BYTES = 16;
+    static constexpr int K_SCALE_OFF     = K_ROPE_OFF + ROWS_PER_HALF * K_ROPE_ROW_LDS_BYTES;
+    static constexpr int K_SLOT_BYTES    = K_SCALE_OFF + ROWS_PER_HALF * SCALE_ROW_BYTES;
+    static_assert(NUM_KV_BUFS * K_SLOT_BYTES <= PARTITION_BYTES);
+    static constexpr int V_OFF         = 2 * PARTITION_BYTES;
+    static constexpr int V_BUF_BYTES   = KV_TILE_SIZE * V_ROW_LDS_BYTES;
+    static constexpr int V_SLICE_BYTES = NUM_KV_BUFS * V_BUF_BYTES;
+    static constexpr int XCHG_OFF      = V_OFF + NUM_WARPS * V_SLICE_BYTES;
+    static constexpr int P_CHUNK_BYTES = WARP_SIZE * VEC_PV * sizeof(D_PV);
+    static constexpr int P_BUF_BYTES   = PV_GROUPS * STAGES * P_CHUNK_BYTES;
+    static constexpr int FAC_OFF       = XCHG_OFF + 2 * P_BUF_BYTES;
+    static constexpr int FAC_BUF_BYTES = W_M * PV_GROUPS * sizeof(D_ACC);
+
+    static constexpr int Q_OFF        = V_OFF;
+    static constexpr int Q_ROPE_OFF   = Q_TILE_SIZE * K_NOPE_ROW_LDS_BYTES;
+    static constexpr int Q_SCALE_OFF  = Q_ROPE_OFF + Q_TILE_SIZE * K_ROPE_ROW_LDS_BYTES;
+    static constexpr int Q_WAVE_BYTES = Q_SCALE_OFF + Q_TILE_SIZE * SCALE_ROW_BYTES;
+    static_assert(NUM_WARPS * Q_WAVE_BYTES <= NUM_WARPS * V_SLICE_BYTES);
+
+    static constexpr int O_ROW_LDS_ELEMS  = D_HEAD_SIZE + 16 / sizeof(D_OUT);
+    static constexpr int O_ROW_LDS_BYTES  = O_ROW_LDS_ELEMS * sizeof(D_OUT);
+    static constexpr int PO_ROW_LDS_ELEMS = D_HEAD_SIZE + 16 / sizeof(D_ACC);
+    static constexpr int PO_ROW_LDS_BYTES = PO_ROW_LDS_ELEMS * sizeof(D_ACC);
+    static_assert(NUM_WARPS * Q_TILE_SIZE * PO_ROW_LDS_BYTES <= XCHG_OFF, "fp32 O staging must not overlap the exchange");
+
+    static constexpr size_t smem_size_bytes() { return (size_t)(FAC_OFF + 2 * FAC_BUF_BYTES); }
+    static_assert(FAC_OFF + 2 * FAC_BUF_BYTES <= 320 * 1024, "gfx1250 LDS is 320KB");
 };
 
 template<int Q_TILE_SIZE_ = 32,

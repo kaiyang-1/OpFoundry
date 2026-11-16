@@ -292,10 +292,8 @@ __device__ __attribute__((always_inline)) void mla_v4_prefill_accum_pipelined(op
         smem_kv_buf + (warp_id / T::WAVES_PER_SEG) * T::SEG_BYTES + (warp_id % T::WAVES_PER_SEG) * T::WAVE_LDS_BYTES);
 
     auto make_tdm_kv = [&](const kv_segment& s) {
-        auto w = make_tdm<kv_window>(tdm_lds_base, reinterpret_cast<const D_ATTN*>(s.data), (u32_t)T::D_TILE_SIZE,
-                                     (u32_t)s.rows, (u64_t)kargs.stride_kv_page);
-        if constexpr (T::CLUSTER_Y > 1) w.set_workgroup_mask(tdm_traits::peers_along_y<1, T::CLUSTER_Y>());
-        return w;
+        return make_tdm<kv_window>(tdm_lds_base, reinterpret_cast<const D_ATTN*>(s.data), (u32_t)T::D_TILE_SIZE,
+                                   (u32_t)s.rows, (u64_t)kargs.stride_kv_page);
     };
     const kv_segment& first = n_pre > 0 ? pre : ext;
     auto tdm_kv  = make_tdm_kv(first);

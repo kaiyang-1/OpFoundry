@@ -314,7 +314,6 @@ __device__ __attribute__((always_inline)) void attention(
     const u32_t n_lds   = (u32_t)reinterpret_cast<uintptr_t>(smem + wave_part + wave_row * T::K_NOPE_ROW_LDS_BYTES);
     const u32_t r_lds   = (u32_t)reinterpret_cast<uintptr_t>(smem + wave_part + T::K_ROPE_OFF + wave_row * T::K_ROPE_ROW_LDS_BYTES);
     auto make_desc = [&](auto window) {
-        if constexpr (T::CLUSTER_Y > 1) window.set_workgroup_mask(tdm_traits::peers_along_y<1, T::CLUSTER_Y>());
         auto d = window.make_descriptor();
         d.set_tile_dim1(T::INDICES_PER_TDM);
         return d;
