@@ -8,7 +8,7 @@ endif
 
 ARCH_MACRO := MLA_V41_ARCH_$(shell echo $(ARCH) | tr '[:lower:]' '[:upper:]')
 
-# gfx1250 needs the amdgpu-named-reg-pin-std LLVM (HIP_CLANG_PATH) for amdgpu_pin_vgpr
+# Build with the amdgpu-named-reg-pin-std LLVM (HIP_CLANG_PATH): kernels pin registers with amdgpu_pin_vgpr/agpr.
 SCHED_FLAGS_gfx1250 = -mllvm -amdgpu-expert-scheduling-mode \
                       -mllvm -amdgpu-sched-strategy=coexec
 

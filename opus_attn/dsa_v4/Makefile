@@ -8,15 +8,14 @@ endif
 
 ARCH_MACRO := MLA_V4_ARCH_$(shell echo $(ARCH) | tr '[:lower:]' '[:upper:]')
 
-# The gfx1250 kernels depend on the expert mode and llvm scheduler
+# Build with the amdgpu-named-reg-pin-std LLVM (HIP_CLANG_PATH): kernels pin registers with amdgpu_pin_vgpr/agpr.
 SCHED_FLAGS_gfx1250 = -mllvm -amdgpu-expert-scheduling-mode \
-                      -mllvm -amdgpu-sched-strategy=coexec \
-                      -mllvm -amdgpu-anti-hints-for-va-vdst
+                      -mllvm -amdgpu-sched-strategy=coexec
 
 COMMON_FLAGS     = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -pthread -O3 -Wall -D$(ARCH_MACRO) --offload-arch=$(ARCH)
 KERNEL_FLAGS     = -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage $(SCHED_FLAGS_$(ARCH))
 KERNEL_OBJ_FLAGS = -fno-offload-lto
-LINK_FLAGS       = --offload-arch=$(ARCH) -pthread
+LINK_FLAGS       = --offload-arch=$(ARCH) -pthread --rtlib=compiler-rt --unwindlib=libgcc
 
 BUILD = build/$(ARCH)
 OUT   = $(BUILD)/mla_v4_prefill.exe
@@ -46,6 +45,11 @@ $(BUILD)/%_kernel.s: $(ARCH)/%_kernel.cc $(ARCH)/%_template.hpp $(SHARED_HDRS) |
 	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) --offload-device-only -S -o $@
 
 asm: $(KERNEL_ASMS)
+
+# gfx950 32mx4: SLP's v_pk_fma_f32 cannot co-issue with MFMA.
+ifeq ($(ARCH),gfx950)
+$(BUILD)/%_32mx4_32nx1_kernel.o $(BUILD)/%_32mx4_32nx1_kernel.s: KERNEL_FLAGS += -fno-slp-vectorize
+endif
 
 # Host object (no -D__HIPCC_RTC__ — needs full HIP runtime for <<<>>> syntax).
 $(HOST_OBJ): $(HOST_SRC) $(ARCH)/mla_v4_traits.h $(COMMON_HDRS) | $(BUILD)

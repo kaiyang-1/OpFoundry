@@ -4,7 +4,7 @@ Optimized sparse paged prefill attention using the [OPUS](https://github.com/ROC
 
 This directory targets the DeepSeek-V4 MLA prefill shape with configurable query-head count `H_Q` and `D = 512` head dimension. The kernel consumes two sparse K/V sources: a unified prefix cache with layout `[total_pages, D]` and a current extend K/V tensor with layout `[total_tokens, D]`.
 
-Each architecture ships its own kernel set: gfx950 uses wave64 MFMA with two wave layouts, gfx1250 uses wave32 WMMA with three wave layouts plus TDM gather and cluster launch. Both provide a BF16 and an MXFP8 path, and the host selects the variant at runtime from `-dtype` and `H_Q` (see [Kernel Variants and Dispatch](#kernel-variants-and-dispatch)).
+Each architecture ships its own kernel set: gfx950 uses wave64 MFMA with two wave layouts, gfx1250 uses wave32 WMMA with four wave layouts plus TDM gather. Both provide a BF16 and an MXFP8 path, and the host selects the variant at runtime from `-dtype` and `H_Q` (see [Kernel Variants and Dispatch](#kernel-variants-and-dispatch)).
 
 ## Features
 
@@ -15,7 +15,7 @@ Each architecture ships its own kernel set: gfx950 uses wave64 MFMA with two wav
   - `extend`: indices into `kv_ptr` / `[total_tokens, D]`.
 - Online softmax across both CSR ranges, plus a per-head attention sink in the denominator, with no materialized attention matrix.
 - gfx950 kernels: MFMA, double-buffered K/V shared-memory tiles, FP32 accumulation.
-- gfx1250 kernels: WMMA, TDM gather straight into LDS, multi-buffered K/V tiles, and an optional 2-workgroup cluster that multicasts the shared K/V tile.
+- gfx1250 kernels: WMMA, TDM gather straight into LDS, and multi-buffered K/V tiles.
 - MXFP8 variant: head dimension split into NoPE (448 fp8 elements with E8M0 block scales every 32) and RoPE (64 bf16). NoPE QK^T uses scaled `f8f6f4` 16x16x128 MFMA/WMMA; RoPE QK^T and PV use bf16 16x16x32.
 - Standalone host harness: seeded page-table and tensor generation, plus CPU reference validation for both BF16 and MXFP8 paths.
 
@@ -32,20 +32,21 @@ dsa_v4/
 |   |-- mla_v4_traits.h                              # The four gfx950 trait sets
 |   |-- mla_v4_global_load.hpp                       # 64-bit global load helpers shared by the gfx950 kernels
 |   |-- mla_v4_prefill_a16w16_16mx1_16nx4_kernel.cc  # + _template.hpp
-|   |-- mla_v4_prefill_a16w16_16mx8_32nx1_kernel.cc  # + _template.hpp
+|   |-- mla_v4_prefill_a16w16_32mx4_32nx1_kernel.cc  # + _template.hpp
 |   |-- mla_v4_prefill_a8w8_16mx1_16nx4_kernel.cc    # + _template.hpp
-|   `-- mla_v4_prefill_a8w8_16mx8_32nx1_kernel.cc    # + _template.hpp
-`-- gfx1250/                                         # wave32 / WMMA / TDM gather / cluster launch
-    |-- mla_v4_traits.h                              # The six gfx1250 trait sets
+|   `-- mla_v4_prefill_a8w8_32mx4_32nx1_kernel.cc    # + _template.hpp
+`-- gfx1250/                                         # wave32 / WMMA / TDM gather
+    |-- mla_v4_traits.h                              # The seven gfx1250 trait sets
     |-- mla_v4_prefill_a16w16_16mx1_16nx4_kernel.cc  # + _template.hpp
     |-- mla_v4_prefill_a16w16_32mx1_16nx4_kernel.cc  # + _template.hpp
     |-- mla_v4_prefill_a16w16_16mx4_64nx1_kernel.cc  # + _template.hpp
     |-- mla_v4_prefill_a8w8_16mx1_16nx4_kernel.cc    # + _template.hpp
     |-- mla_v4_prefill_a8w8_32mx1_16nx4_kernel.cc    # + _template.hpp
-    `-- mla_v4_prefill_a8w8_16mx4_64nx1_kernel.cc    # + _template.hpp
+    |-- mla_v4_prefill_a8w8_16mx4_64nx1_kernel.cc    # + _template.hpp
+    `-- mla_v4_prefill_a8w8_32mx4_32nx1_kernel.cc    # + _template.hpp
 ```
 
-The Makefile derives `-DMLA_V4_ARCH_<ARCH>` from `ARCH` and compiles only that architecture's directory. `mla_v4_host.cc` is the one host translation unit shared by both: the macro selects which `mla_v4_traits.h` it includes, which kernel symbols it forward-declares, which `mla_v4_prefill_launch` overloads exist (plain `<<<>>>` on gfx950, `hipLaunchKernelEx` with a cluster dimension on gfx1250), and the variant dispatch in `main`.
+The Makefile derives `-DMLA_V4_ARCH_<ARCH>` from `ARCH` and compiles only that architecture's directory. `mla_v4_host.cc` is the one host translation unit shared by both: the macro selects which `mla_v4_traits.h` it includes, which kernel symbols it forward-declares, which `mla_v4_prefill_launch` overloads exist (all plain `<<<>>>`), and the variant dispatch in `main`.
 
 Each kernel `.cc` includes only its own template header and emits a single explicit instantiation, so the implementations are compiled in separate translation units and `make -j` builds them in parallel. Each template additionally wraps its device helpers in a namespace named after its own variant, so the identically-named helpers cannot collide.
 
@@ -109,29 +110,30 @@ Trait names below are shown without their common `opus_mla_v4_prefill_` prefix.
 
 ### gfx950 (wave64, MFMA, `WARP_SIZE = 64`)
 
-Dispatch is by query-head count: `H_Q <= 32` favors `16mx1_16nx4`, otherwise `16mx8_32nx1`.
+Dispatch is by query-head count: `H_Q <= 32` favors `16mx1_16nx4`, otherwise `32mx4_32nx1`.
 
 | Trait | `T_M` × `T_N` | `KV_TILE` | `NUM_WARPS` | `BLOCK_SIZE` | Heads/WG | Used when |
 | --- | --- | --- | --- | --- | --- | --- |
 | `a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>` | `1 × 4` | `64` | `4` | `256` | `16` | `bf16`, `H_Q <= 32` |
-| `a16w16_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t, bf16_t>` | `8 × 1` | `32` | `8` | `512` | `128` | `bf16`, `H_Q > 32` |
+| `a16w16_32mx4_32nx1_traits<32, 32, 512, 4, bf16_t, bf16_t>` | `4 × 1` | `32` | `4` | `256` | `128` | `bf16`, `H_Q > 32` |
 | `a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>` | `1 × 4` | `64` | `4` | `256` | `16` | `fp8`, `H_Q <= 32` |
-| `a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>` | `8 × 1` | `32` | `8` | `512` | `128` | `fp8`, `H_Q > 32` |
+| `a8w8_32mx4_32nx1_traits<32, 32, 4, fp8_t, bf16_t, bf16_t>` | `4 × 1` | `32` | `4` | `256` | `128` | `fp8`, `H_Q > 32` |
 
 ### gfx1250 (wave32, WMMA, `WARP_SIZE = 32`)
 
-Three wave layouts per precision, again selected by `H_Q`: `<= 16` uses `16mx1_16nx4`, `<= 32` uses `32mx1_16nx4`, and above that `16mx4_64nx1`. Only `16mx4_64nx1` takes a `CLUSTER_Y` parameter: the host sets it to `2` when `ceil_div(H_Q, 64)` is even, otherwise `1`, and with `2` the two workgroups in a cluster share one TDM gather of the K/V tile.
+Wave layouts are again selected by `H_Q`: `<= 16` uses `16mx1_16nx4`, `<= 32` uses `32mx1_16nx4`, and above that `16mx4_64nx1`, except that MXFP8 with `H_Q > 64` uses `32mx4_32nx1`.
 
 | Trait | `T_M` × `T_N` | `KV_TILE` | `NUM_WARPS` | `BLOCK_SIZE` | Heads/WG | Used when |
 | --- | --- | --- | --- | --- | --- | --- |
 | `a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>` | `1 × 4` | `64` | `4` | `128` | `16` | `bf16`, `H_Q <= 16` |
 | `a16w16_32mx1_16nx4_traits<32, 64, 512, 4, bf16_t, bf16_t>` | `1 × 4` | `64` | `4` | `128` | `32` | `bf16`, `H_Q <= 32` |
-| `a16w16_16mx4_64nx1_traits<16, 64, 512, 4, CLUSTER_Y, bf16_t, bf16_t>` | `4 × 1` | `64` | `4` | `128` | `64` | `bf16`, `H_Q > 32` |
+| `a16w16_16mx4_64nx1_traits<16, 64, 512, 4, bf16_t, bf16_t>` | `4 × 1` | `64` | `4` | `128` | `64` | `bf16`, `H_Q > 32` |
 | `a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>` | `1 × 4` | `64` | `4` | `128` | `16` | `fp8`, `H_Q <= 16` |
 | `a8w8_32mx1_16nx4_traits<32, 64, 4, fp8_t, bf16_t, bf16_t>` | `1 × 4` | `64` | `4` | `128` | `32` | `fp8`, `H_Q <= 32` |
-| `a8w8_16mx4_64nx1_traits<16, 64, 4, CLUSTER_Y, fp8_t, bf16_t, bf16_t>` | `4 × 1` | `64` | `4` | `128` | `64` | `fp8`, `H_Q > 32` |
+| `a8w8_16mx4_64nx1_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>` | `4 × 1` | `64` | `4` | `128` | `64` | `fp8`, `32 < H_Q <= 64` |
+| `a8w8_32mx4_32nx1_traits<32, 32, 4, fp8_t, bf16_t, bf16_t>` | `4 × 1` | `32` | `4` | `128` | `128` | `fp8`, `H_Q > 64` |
 
-`Q_TILE_SIZE` is the leading trait parameter (`16`, or `32` for the `32mx1` layouts) and `D_TILE_SIZE = 512` is the head dimension. One workgroup covers one query token and up to `Q_TILE_SIZE * T_M` query heads, and the grid is sized as `grid = (N, ceil_div(H_Q, Q_TILE_SIZE * T_M), 1)`, so arbitrary `H_Q` is supported; values that fill a whole head tile give the best occupancy.
+`Q_TILE_SIZE` is the leading trait parameter (`16`, or `32` for the `32mx1` and `32mx4` layouts) and `D_TILE_SIZE = 512` is the head dimension. One workgroup covers one query token and up to `Q_TILE_SIZE * T_M` query heads, and the grid is sized as `grid = (N, ceil_div(H_Q, Q_TILE_SIZE * T_M), 1)`, so arbitrary `H_Q` is supported; values that fill a whole head tile give the best occupancy.
 
 ## Build
 
@@ -168,14 +170,14 @@ Useful options:
 | Option | Default | Description |
 | --- | --- | --- |
 | `-dtype` | `bf16` | Input precision: `bf16` or `fp8`. `fp8` selects the MXFP8 split variant. |
-| `-h_q` | `128` | Number of query heads. Supports arbitrary positive values; also selects the wave layout on both architectures, and the cluster size on gfx1250. |
+| `-h_q` | `128` | Number of query heads. Supports arbitrary positive values; also selects the wave layout on both architectures. |
 | `-n` | `4096` | Number of query tokens in the prefill chunk. |
-| `-topk` | `1024` | Rows each query token selects from each range. Clamped to that range; `0` selects all of it, giving a dense page table. |
+| `-topk` | `1024` | Prefix rows per query token, clamped to `total_pages`; `0` selects all. |
 | `-total_pages` | `max(N, topk, 65536)` | Prefix cache size, and the main control over how much of the KV gather cache can serve. Nothing derives it from the other options, hence the floor. |
-| `-total_tokens` | `N` | Extend rows in `KV`, tied to `N` because the extend range is the chunk's own K/V. Larger only adds rows the causal ramp cannot reach; smaller caps the ramp early. |
+| `-window` | `128` | Extend rows per query token: its last `min(i + 1, window)` rows of `KV` (`N` rows); `0` empties the range. |
 | `--verify` | off | Compare GPU output against the CPU reference implementation. |
 
-Prefix rows are visible to every token, so each one selects `min(topk, total_pages)`. Extend rows are the chunk's own K/V, so token `i` draws from `[0, i]` and gets `min(topk, i + 1)` — a ramp that walks every row length below the budget, and with it every KV-tile remainder the kernel masks. The budget applies per range, so a deep token gets up to `2 * topk` rows. Setting either range to `0` empties it, as in a sequence's first chunk.
+As in DeepSeek-V4 inference, each token selects `min(topk, total_pages)` scattered prefix rows and its last `min(i + 1, window)` extend rows; the window ramp walks every KV-tile remainder the kernel masks. `0` empties either range.
 
 Every element and index derives from a fixed seed and its own index, so a shape reproduces bit-exactly across runs, machines and worker counts. Selected pages stay scattered, since sorting would hand the gather a near-sequential read that no real page table provides. The CPU reference runs on `std::thread` workers rather than OpenMP; set `MLA_V4_NUM_THREADS` to override the worker count.
 

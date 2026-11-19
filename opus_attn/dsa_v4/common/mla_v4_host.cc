@@ -1,4 +1,3 @@
-#include <hip/hip_fp8.h>
 #include <opus/hip_minimal.hpp>
 #include <algorithm>
 #include <random>
@@ -20,11 +19,11 @@
 template<class Traits>
 __global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(typename Traits::kargs_type kargs);
+__global__ void opus_mla_v4_prefill_a16w16_32mx4_32nx1_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
 __global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
-__global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(typename Traits::kargs_type kargs);
+__global__ void opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel(typename Traits::kargs_type kargs);
 
 template<int Q, int KV, int D, int NW, class DT, class DO>
 inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>,
@@ -32,9 +31,9 @@ inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<
     opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel<opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int D, int NW, class DT, class DO>
-inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<Q, KV, D, NW, DT, DO>,
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_32mx4_32nx1_traits<Q, KV, D, NW, DT, DO>,
                                   const opus_mla_v4_prefill_kargs& kargs, dim3 grid, dim3 block) {
-    opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel<opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
+    opus_mla_v4_prefill_a16w16_32mx4_32nx1_kernel<opus_mla_v4_prefill_a16w16_32mx4_32nx1_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
 inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>,
@@ -42,9 +41,9 @@ inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<Q,
     opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel<opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
-inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>,
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>,
                                   const opus_mla_v4_prefill_fp8_kargs& kargs, dim3 grid, dim3 block) {
-    opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel<opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
+    opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel<opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 
 #elif defined(MLA_V4_ARCH_GFX1250)
@@ -62,51 +61,13 @@ template<class Traits>
 __global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template<class Traits>
 __global__ void opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel(typename Traits::kargs_type kargs);
+template<class Traits>
+__global__ void opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel(typename Traits::kargs_type kargs);
 
-constexpr int mla_v4_max_cluster_y = 2;
-
-inline int mla_v4_pick_cluster_y(int num_h_blocks) {
-    for (int c = mla_v4_max_cluster_y; c > 1; c >>= 1)
-        if (num_h_blocks % c == 0) return c;
-    return 1;
-}
-
-template<int CY, class Kernel, class KArgs>
-inline void mla_v4_prefill_launch_clustered(Kernel kernel, const KArgs& kargs, dim3 grid, dim3 block) {
-    if constexpr (CY == 1) {
-        kernel<<<grid, block>>>(kargs);
-    } else {
-        if (grid.y % CY != 0) {
-            fprintf(stderr, "CLUSTER_Y=%d does not divide grid.y=%u; refusing to launch a masked gather\n",
-                    CY, grid.y);
-            exit(1);
-        }
-        hipLaunchAttribute attr{};
-        attr.id = hipLaunchAttributeClusterDimension;
-        attr.val.clusterDim.x = 1;
-        attr.val.clusterDim.y = CY;
-        attr.val.clusterDim.z = 1;
-
-        hipLaunchConfig_t cfg{};
-        cfg.gridDim          = grid;
-        cfg.blockDim         = block;
-        cfg.dynamicSmemBytes = 0;
-        cfg.stream           = nullptr;
-        cfg.attrs            = &attr;
-        cfg.numAttrs         = 1;
-        hipError_t e = hipLaunchKernelEx(&cfg, kernel, kargs);
-        if (e != hipSuccess) {
-            fprintf(stderr, "cluster launch (1,%d,1) failed: %s\n", CY, hipGetErrorString(e));
-            exit(1);
-        }
-    }
-}
-
-template<int Q, int KV, int D, int NW, int CY, class DT, class DO>
-inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>,
+template<int Q, int KV, int D, int NW, class DT, class DO>
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<Q, KV, D, NW, DT, DO>,
                                   const opus_mla_v4_prefill_kargs& kargs, dim3 grid, dim3 block) {
-    using Traits = opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<Q, KV, D, NW, CY, DT, DO>;
-    mla_v4_prefill_launch_clustered<CY>(opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel<Traits>, kargs, grid, block);
+    opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel<opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int D, int NW, class DT, class DO>
 inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<Q, KV, D, NW, DT, DO>,
@@ -118,11 +79,10 @@ inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits<
                                   const opus_mla_v4_prefill_kargs& kargs, dim3 grid, dim3 block) {
     opus_mla_v4_prefill_a16w16_32mx1_16nx4_kernel<opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits<Q, KV, D, NW, DT, DO>><<<grid, block>>>(kargs);
 }
-template<int Q, int KV, int NW, int CY, class NOPE, class ROPE, class DO>
-inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<Q, KV, NW, CY, NOPE, ROPE, DO>,
+template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<Q, KV, NW, NOPE, ROPE, DO>,
                                   const opus_mla_v4_prefill_fp8_kargs& kargs, dim3 grid, dim3 block) {
-    using Traits = opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<Q, KV, NW, CY, NOPE, ROPE, DO>;
-    mla_v4_prefill_launch_clustered<CY>(opus_mla_v4_prefill_a8w8_16mx4_64nx1_kernel<Traits>, kargs, grid, block);
+    opus_mla_v4_prefill_a8w8_16mx4_64nx1_kernel<opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
 inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>,
@@ -133,6 +93,11 @@ template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
 inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>,
                                   const opus_mla_v4_prefill_fp8_kargs& kargs, dim3 grid, dim3 block) {
     opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel<opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
+}
+template<int Q, int KV, int NW, class NOPE, class ROPE, class DO>
+inline void mla_v4_prefill_launch(opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>,
+                                  const opus_mla_v4_prefill_fp8_kargs& kargs, dim3 grid, dim3 block) {
+    opus_mla_v4_prefill_a8w8_32mx4_32nx1_kernel<opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<Q, KV, NW, NOPE, ROPE, DO>><<<grid, block>>>(kargs);
 }
 #else
 #  error "No target arch defined. The Makefile passes MLA_V4_ARCH_<ARCH> from ARCH (e.g. ARCH=gfx950)."
@@ -171,6 +136,49 @@ struct dev_buf {
     }
     operator T*() const { return ptr; }
 };
+
+// Software e4m3 conversions: hip/hip_fp8.h does not build with the amdgpu-named-reg-pin-std LLVM.
+inline uint8_t float_to_fp8_e4m3(float f) {
+    const uint32_t bits = __builtin_bit_cast(uint32_t, f);
+    const uint8_t  sign = static_cast<uint8_t>((bits >> 24) & 0x80u);
+    const uint32_t mag  = bits & 0x7FFFFFFFu;
+
+    if (mag >= 0x7F800000u) return static_cast<uint8_t>(sign | 0x7Fu);
+    if (mag >= 0x43E00000u) return static_cast<uint8_t>(sign | 0x7Eu);
+
+    const int exp = static_cast<int>(mag >> 23) - 127;
+    uint8_t payload;
+    uint32_t dropped, halfway;
+    if (exp >= -6) {
+        const uint32_t mant = mag & 0x7FFFFFu;
+        payload = static_cast<uint8_t>(((exp + 7) << 3) | (mant >> 20));
+        dropped = mant & 0xFFFFFu;
+        halfway = 0x80000u;
+    } else {
+        const int shift = -exp - 6;
+        if (shift > 11) return sign;
+        const uint32_t mant  = (mag & 0x7FFFFFu) | 0x800000u;
+        const uint32_t width = 20 + shift;
+        payload = static_cast<uint8_t>(mant >> width);
+        dropped = mant & ((1u << width) - 1);
+        halfway = 1u << (width - 1);
+    }
+    if (dropped > halfway || (dropped == halfway && (payload & 1))) payload++;
+    return static_cast<uint8_t>(sign | payload);
+}
+
+inline float fp8_e4m3_to_float(uint8_t bits) {
+    const uint32_t sign = static_cast<uint32_t>(bits & 0x80u) << 24;
+    const uint32_t exp  = (bits >> 3) & 0x0Fu;
+    const uint32_t mant = bits & 0x07u;
+
+    if (exp == 0x0Fu && mant == 0x07u) return __builtin_bit_cast(float, sign | 0x7FC00000u);
+    if (exp == 0) {
+        const float m = static_cast<float>(mant) * 0x1p-9f;
+        return (bits & 0x80u) ? -m : m;
+    }
+    return __builtin_bit_cast(float, sign | ((exp + 120) << 23) | (mant << 20));
+}
 
 // Fixed grain, so a chunk spans the same elements at any MLA_V4_NUM_THREADS. Hashed
 // rather than seed+index, which would make Q rows bit-identical to KV rows.
@@ -216,14 +224,13 @@ void init_fp8_dsa_split(typename Traits::D_NOPE* nope_ptr,
         std::uniform_int_distribution<int> scale_exp_dis(0, 3);
         for (size_t r = begin; r < end; r++) {
             unsigned char* nbase = reinterpret_cast<unsigned char*>(nope_ptr) + r * NOPE_PADDED;
-            auto* nope = reinterpret_cast<__hip_fp8_e4m3*>(nbase);
             unsigned char* scale = nbase + NOPE;
             for (int b = 0; b < SCALE; b++) {
                 const int e = scale_exp_dis(gen);
                 scale[b] = static_cast<unsigned char>(e + 127);
                 const float inv_scale = std::ldexp(1.0f, -e);
                 for (int i = 0; i < BLOCK; i++)
-                    nope[b * BLOCK + i] = static_cast<__hip_fp8_e4m3>(dis(gen) * inv_scale);
+                    nbase[b * BLOCK + i] = float_to_fp8_e4m3(dis(gen) * inv_scale);
             }
             // 0xFF is NaN as both e4m3 and E8M0: the kernel masks the pad off itself.
             for (int i = NOPE + SCALE; i < NOPE_PADDED; i++) nbase[i] = 0xFF;
@@ -240,17 +247,15 @@ void init_kv_page_table(std::vector<int>& kv_indptr,
                         int N,
                         int pool_rows,
                         int topk,
-                        bool causal,
                         uint64_t seed) {
     assert(N >= 0);
     assert(pool_rows >= 0);
 
     const int budget = (topk <= 0 || topk > pool_rows) ? pool_rows : topk;
-    auto candidates = [&](int q) { return causal ? std::min(q + 1, pool_rows) : pool_rows; };
 
     kv_indptr.assign(N + 1, 0);
     for (int q = 0; q < N; ++q) {
-        const int nnz = std::min(budget, candidates(q));
+        const int nnz = budget;
         const size_t end = static_cast<size_t>(kv_indptr[q]) + static_cast<size_t>(nnz);
         assert(end <= static_cast<size_t>(std::numeric_limits<int>::max()));
         kv_indptr[q + 1] = static_cast<int>(end);
@@ -264,10 +269,9 @@ void init_kv_page_table(std::vector<int>& kv_indptr,
         for (size_t q = begin; q < end; ++q) {
             int* row = kv_indices.data() + kv_indptr[q];
             const int nnz = kv_indptr[q + 1] - kv_indptr[q];
-            const int range = candidates(static_cast<int>(q));
             std::mt19937 gen = mla_v4_rng(seed, static_cast<uint64_t>(q) + (1ull << 32));
             for (int i = 0; i < nnz; ++i) {
-                const int j = i + static_cast<int>(gen() % static_cast<uint32_t>(range - i));
+                const int j = i + static_cast<int>(gen() % static_cast<uint32_t>(pool_rows - i));
                 std::swap(perm[i], perm[j]);
                 row[i] = perm[i];
             }
@@ -276,6 +280,16 @@ void init_kv_page_table(std::vector<int>& kv_indptr,
             for (int i = 0; i < nnz; ++i) perm[row[i]] = row[i];
         }
     });
+}
+
+// Token q's extend rows: its last min(q + 1, window), ending at row q.
+void init_kv_window(std::vector<int>& kv_indptr, std::vector<int>& kv_indices, int N, int window) {
+    kv_indptr.assign(N + 1, 0);
+    kv_indices.clear();
+    for (int q = 0; q < N; ++q) {
+        for (int r = q - std::min(q + 1, window) + 1; r <= q; ++r) kv_indices.push_back(r);
+        kv_indptr[q + 1] = static_cast<int>(kv_indices.size());
+    }
 }
 
 inline std::vector<uint8_t> mla_v4_poison_mask(int pool_rows, const std::vector<int>& kv_indices) {
@@ -431,10 +445,9 @@ inline void decode_dsa_row_fp8(const typename Traits::D_NOPE* nrow,
     constexpr int NOPE = Traits::D_NOPE_SIZE;
     constexpr int ROPE = Traits::D_ROPE_SIZE;
     const auto* base = reinterpret_cast<const unsigned char*>(nrow);
-    const auto* nope = reinterpret_cast<const __hip_fp8_e4m3*>(base);
     const unsigned char* scale = base + NOPE;
     for (int d = 0; d < NOPE; d++)
-        out[d] = static_cast<float>(nope[d]) * std::ldexp(1.0f, int(scale[d / 32]) - 127);
+        out[d] = fp8_e4m3_to_float(base[d]) * std::ldexp(1.0f, int(scale[d / 32]) - 127);
     for (int j = 0; j < ROPE; j++)
         out[NOPE + j] = static_cast<float>(rrow[j]);
 }
@@ -572,14 +585,15 @@ void mla_v4_attention_ref_fp8(
 }
 
 template<class Traits>
-int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
+int run_mla_v4_prefill_case(int H, int N, int total_pages, int window,
                             int topk, bool verify) {
     using DType = typename Traits::D_ATTN;
     using OType = typename Traits::D_OUT;
     constexpr bool is_fp8 = std::is_same_v<DType, fp8_t> || std::is_same_v<DType, bf8_t>;
     const char* precision = is_fp8 ? "NoPE=fp8, RoPE=bf16" : "NoPE=bf16, RoPE=bf16";
-    printf("MLA-v4 Prefill Attention: H_Q=%d, N=%d, D=%d, %s, total_pages=%d, total_tokens=%d, topk=%d\n",
-           H, N, Traits::D_HEAD_SIZE, precision, total_pages, total_tokens, topk);
+    printf("MLA-v4 Prefill Attention: H_Q=%d, N=%d, D=%d, %s, total_pages=%d, topk=%d, window=%d\n",
+           H, N, Traits::D_HEAD_SIZE, precision, total_pages, topk, window);
+    const int total_tokens = window > 0 ? N : 0;
 
     constexpr int D_HEAD = Traits::D_HEAD_SIZE;
     const size_t o_size = (size_t)N * H * D_HEAD;
@@ -588,16 +602,13 @@ int run_mla_v4_prefill_case(int H, int N, int total_pages, int total_tokens,
     auto host_o_ref = std::make_unique<OType[]>(o_size);
     auto host_o_gpu = std::make_unique<OType[]>(o_size);
     const uint64_t seed_sink = MLA_V4_SEED + 1, seed_q = MLA_V4_SEED + 2, seed_ukv = MLA_V4_SEED + 3,
-                   seed_kv = MLA_V4_SEED + 4, seed_idx_prefix = MLA_V4_SEED + 5,
-                   seed_idx_extend = MLA_V4_SEED + 6;
+                   seed_kv = MLA_V4_SEED + 4, seed_idx_prefix = MLA_V4_SEED + 5;
     rand_vector(host_attn_sink.get(), H, seed_sink);
 
     std::vector<int> host_kv_indptr_prefix, host_kv_indices_prefix;
     std::vector<int> host_kv_indptr_extend, host_kv_indices_extend;
-    init_kv_page_table(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages, topk,
-                       /*causal=*/false, seed_idx_prefix);
-    init_kv_page_table(host_kv_indptr_extend, host_kv_indices_extend, N, total_tokens, topk,
-                       /*causal=*/true, seed_idx_extend);
+    init_kv_page_table(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages, topk, seed_idx_prefix);
+    init_kv_window(host_kv_indptr_extend, host_kv_indices_extend, N, window);
     const size_t total_kv_indices = host_kv_indices_prefix.size() + host_kv_indices_extend.size();
     assert(total_kv_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
     const int total_kv_rows = static_cast<int>(total_kv_indices);
@@ -770,7 +781,7 @@ int main(int argc, char** argv) {
     int N = 4096;
     int topk = 1024;
     int total_pages = -1;
-    int total_tokens = -1;
+    int window = 128;
 
     bool verify = false;
     bool use_fp8 = false;
@@ -810,35 +821,33 @@ int main(int argc, char** argv) {
         if (try_parse(N, "-n")) continue;
         if (try_parse(topk, "-topk")) continue;
         if (try_parse(total_pages, "-total_pages")) continue;
-        if (try_parse(total_tokens, "-total_tokens")) continue;
+        if (try_parse(window, "-window")) continue;
         std::cerr << "unknown argument '" << arg << "'\n";
         return 1;
     }
     if (total_pages < 0)
         total_pages = topk > 0 ? std::max({N, topk, MLA_V4_DEFAULT_TOTAL_PAGES}) : N;
-    if (total_tokens < 0) total_tokens = N;
-    if (topk <= 0) topk = std::max(total_pages, total_tokens);
+    if (topk <= 0) topk = total_pages;
 
-    if (H <= 0 || N <= 0 || total_pages < 0 || total_tokens < 0) {
+    if (H <= 0 || N <= 0 || total_pages < 0 || window < 0) {
         std::cerr << "Invalid parameters. H_Q,N must be positive and "
-                     "total_pages,total_tokens non-negative.\n";
+                     "total_pages,window non-negative.\n";
         return 1;
     }
 
 #define RUN_CASE(...)                                                          \
-    run_mla_v4_prefill_case<__VA_ARGS__>(H, N, total_pages, total_tokens, topk, verify)
+    run_mla_v4_prefill_case<__VA_ARGS__>(H, N, total_pages, window, topk, verify)
 
 #if defined(MLA_V4_ARCH_GFX950)
     if (use_fp8) {
         return H <= 32
             ? RUN_CASE(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>)
-            : RUN_CASE(opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>);
+            : RUN_CASE(opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<32, 32, 4, fp8_t, bf16_t, bf16_t>);
     }
     return H <= 32
         ? RUN_CASE(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>)
-        : RUN_CASE(opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<16, 32, 512, 8, bf16_t, bf16_t>);
+        : RUN_CASE(opus_mla_v4_prefill_a16w16_32mx4_32nx1_traits<32, 32, 512, 4, bf16_t, bf16_t>);
 #elif defined(MLA_V4_ARCH_GFX1250)
-    const int cluster_y = mla_v4_pick_cluster_y(ceil_div(H, 64));
     if (use_fp8) {
         if (H <= 16) {
             return RUN_CASE(opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>);
@@ -846,10 +855,10 @@ int main(int argc, char** argv) {
         if (H <= 32) {
             return RUN_CASE(opus_mla_v4_prefill_a8w8_32mx1_16nx4_traits<32, 64, 4, fp8_t, bf16_t, bf16_t>);
         }
-        switch (cluster_y) {
-            case 2: return RUN_CASE(opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, 2, fp8_t, bf16_t, bf16_t>);
-            default: return RUN_CASE(opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, 1, fp8_t, bf16_t, bf16_t>);
+        if (H > 64) {
+            return RUN_CASE(opus_mla_v4_prefill_a8w8_32mx4_32nx1_traits<32, 32, 4, fp8_t, bf16_t, bf16_t>);
         }
+        return RUN_CASE(opus_mla_v4_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>);
     }
     if (H <= 16) {
         return RUN_CASE(opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, bf16_t, bf16_t>);
@@ -857,9 +866,6 @@ int main(int argc, char** argv) {
     if (H <= 32) {
         return RUN_CASE(opus_mla_v4_prefill_a16w16_32mx1_16nx4_traits<32, 64, 512, 4, bf16_t, bf16_t>);
     }
-    switch (cluster_y) {
-        case 2: return RUN_CASE(opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, 2, bf16_t, bf16_t>);
-        default: return RUN_CASE(opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, 1, bf16_t, bf16_t>);
-    }
+    return RUN_CASE(opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, bf16_t, bf16_t>);
 #endif
 }

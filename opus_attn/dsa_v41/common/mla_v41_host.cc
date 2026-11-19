@@ -255,17 +255,15 @@ void init_kv_page_table(std::vector<int>& kv_indptr,
                         int N,
                         int pool_rows,
                         int topk,
-                        bool causal,
                         uint64_t seed) {
     assert(N >= 0);
     assert(pool_rows >= 0);
 
     const int budget = (topk <= 0 || topk > pool_rows) ? pool_rows : topk;
-    auto candidates = [&](int q) { return causal ? std::min(q + 1, pool_rows) : pool_rows; };
 
     kv_indptr.assign(N + 1, 0);
     for (int q = 0; q < N; ++q) {
-        const int nnz = std::min(budget, candidates(q));
+        const int nnz = budget;
         const size_t end = static_cast<size_t>(kv_indptr[q]) + static_cast<size_t>(nnz);
         assert(end <= static_cast<size_t>(std::numeric_limits<int>::max()));
         kv_indptr[q + 1] = static_cast<int>(end);
@@ -279,10 +277,9 @@ void init_kv_page_table(std::vector<int>& kv_indptr,
         for (size_t q = begin; q < end; ++q) {
             int* row = kv_indices.data() + kv_indptr[q];
             const int nnz = kv_indptr[q + 1] - kv_indptr[q];
-            const int range = candidates(static_cast<int>(q));
             std::mt19937 gen = mla_v41_rng(seed, static_cast<uint64_t>(q) + (1ull << 32));
             for (int i = 0; i < nnz; ++i) {
-                const int j = i + static_cast<int>(gen() % static_cast<uint32_t>(range - i));
+                const int j = i + static_cast<int>(gen() % static_cast<uint32_t>(pool_rows - i));
                 std::swap(perm[i], perm[j]);
                 row[i] = perm[i];
             }
@@ -290,6 +287,16 @@ void init_kv_page_table(std::vector<int>& kv_indptr,
             for (int i = 0; i < nnz; ++i) perm[row[i]] = row[i];
         }
     });
+}
+
+// Token q's extend rows: its last min(q + 1, window), ending at row q.
+void init_kv_window(std::vector<int>& kv_indptr, std::vector<int>& kv_indices, int N, int window) {
+    kv_indptr.assign(N + 1, 0);
+    kv_indices.clear();
+    for (int q = 0; q < N; ++q) {
+        for (int r = q - std::min(q + 1, window) + 1; r <= q; ++r) kv_indices.push_back(r);
+        kv_indptr[q + 1] = static_cast<int>(kv_indices.size());
+    }
 }
 
 // 0xFF is NaN as e4m3 and E8M0 (e2m1 has no NaN, its scale carries it), so a gather of an unselected row
@@ -510,14 +517,15 @@ void mla_v41_attention_ref(
 }
 
 template<class Traits>
-int run_mla_v41_prefill_case(int H, int N, int total_pages, int total_tokens,
+int run_mla_v41_prefill_case(int H, int N, int total_pages, int window,
                              int topk, bool verify, bool with_sink, int splits) {
     using OType = typename Traits::D_OUT;
     constexpr int D     = Traits::D_HEAD_SIZE;
     constexpr int SCALE = Traits::D_SCALE_SIZE;
     constexpr bool PREFIX_FP4 = mla_v41_prefix_nvfp4<Traits>;
-    printf("MLA-v4.1 Prefill Attention: H_Q=%d, N=%d, D=%d, mxfp8%s, total_pages=%d, total_tokens=%d, topk=%d%s, splits=%d\n",
-           H, N, D, PREFIX_FP4 ? " (nvfp4 prefix)" : "", total_pages, total_tokens, topk, with_sink ? "" : ", no sink", splits);
+    printf("MLA-v4.1 Prefill Attention: H_Q=%d, N=%d, D=%d, mxfp8%s, total_pages=%d, topk=%d, window=%d%s, splits=%d\n",
+           H, N, D, PREFIX_FP4 ? " (nvfp4 prefix)" : "", total_pages, topk, window, with_sink ? "" : ", no sink", splits);
+    const int total_tokens = window > 0 ? N : 0;
 
     const size_t q_rows = (size_t)N * H;
     const size_t o_size = q_rows * D;
@@ -538,8 +546,7 @@ int run_mla_v41_prefill_case(int H, int N, int total_pages, int total_tokens,
     auto host_o_ref            = std::make_unique<OType[]>(o_size);
     auto host_o_gpu            = std::make_unique<OType[]>(o_size);
     const uint64_t seed_sink = MLA_V41_SEED + 1, seed_q = MLA_V41_SEED + 2, seed_ukv = MLA_V41_SEED + 3,
-                   seed_kv = MLA_V41_SEED + 4, seed_idx_prefix = MLA_V41_SEED + 5,
-                   seed_idx_extend = MLA_V41_SEED + 6;
+                   seed_kv = MLA_V41_SEED + 4, seed_idx_prefix = MLA_V41_SEED + 5;
     rand_vector(host_attn_sink.get(), H, seed_sink);
     init_mxfp8_rows<Traits>(host_q.get(), D, host_q_scale.get(), SCALE, q_rows, seed_q);
     if constexpr (PREFIX_FP4)
@@ -552,10 +559,8 @@ int run_mla_v41_prefill_case(int H, int N, int total_pages, int total_tokens,
 
     std::vector<int> host_kv_indptr_prefix, host_kv_indices_prefix;
     std::vector<int> host_kv_indptr_extend, host_kv_indices_extend;
-    init_kv_page_table(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages, topk,
-                       /*causal=*/false, seed_idx_prefix);
-    init_kv_page_table(host_kv_indptr_extend, host_kv_indices_extend, N, total_tokens, topk,
-                       /*causal=*/true, seed_idx_extend);
+    init_kv_page_table(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages, topk, seed_idx_prefix);
+    init_kv_window(host_kv_indptr_extend, host_kv_indices_extend, N, window);
     const size_t total_kv_indices = host_kv_indices_prefix.size() + host_kv_indices_extend.size();
     assert(total_kv_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
     const int total_kv_rows = static_cast<int>(total_kv_indices);
@@ -671,7 +676,7 @@ static constexpr int MLA_V41_DEFAULT_TOTAL_PAGES = 65536;
 
 // The size flags, -sink (1/0) and -splits take a comma-separated list; the cases run as their product in one process.
 int main(int argc, char** argv) {
-    std::vector<int> Hs{128}, Ns{4096}, topks{1024}, pages_list{-1}, tokens_list{-1}, sinks{1}, splits_list{1};
+    std::vector<int> Hs{64}, Ns{4096}, topks{512}, pages_list{-1}, windows{128}, sinks{1}, splits_list{1};
     bool verify = false;
     bool use_fp4 = false;
 
@@ -716,34 +721,33 @@ int main(int argc, char** argv) {
         if (try_parse(Ns, "-n")) continue;
         if (try_parse(topks, "-topk")) continue;
         if (try_parse(pages_list, "-total_pages")) continue;
-        if (try_parse(tokens_list, "-total_tokens")) continue;
+        if (try_parse(windows, "-window")) continue;
         if (try_parse(sinks, "-sink")) continue;
         if (try_parse(splits_list, "-splits")) continue;
         std::cerr << "unknown argument '" << arg << "'\n";
         return 1;
     }
 
-    auto run_case = [&](int H, int N, int topk, int total_pages, int total_tokens, bool with_sink, int splits) {
+    auto run_case = [&](int H, int N, int topk, int total_pages, int window, bool with_sink, int splits) {
         if (splits != 1 && !opus_mla_prefill_cluster_size_ok(splits)) {
             std::cerr << "-splits takes 1, 2, 4, 8 or 16\n";
             return 1;
         }
         if (total_pages < 0)
             total_pages = topk > 0 ? std::max({N, topk, MLA_V41_DEFAULT_TOTAL_PAGES}) : N;
-        if (total_tokens < 0) total_tokens = N;
-        if (topk <= 0) topk = std::max(total_pages, total_tokens);
-        if (H <= 0 || N <= 0 || total_pages < 0 || total_tokens < 0) {
+        if (topk <= 0) topk = total_pages;
+        if (H <= 0 || N <= 0 || total_pages < 0 || window < 0) {
             std::cerr << "Invalid parameters. H_Q,N must be positive and "
-                         "total_pages,total_tokens non-negative.\n";
+                         "total_pages,window non-negative.\n";
             return 1;
         }
 #if defined(MLA_V41_ARCH_GFX950)
         if (use_fp4 && H <= 16)
             return run_mla_v41_prefill_case<opus_mla_v41_prefill_a8w4_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(
-                H, N, total_pages, total_tokens, topk, verify, with_sink, splits);
+                H, N, total_pages, window, topk, verify, with_sink, splits);
         if (use_fp4)
             return run_mla_v41_prefill_case<opus_mla_v41_prefill_a8w4_16mx4_64nx1_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(
-                H, N, total_pages, total_tokens, topk, verify, with_sink, splits);
+                H, N, total_pages, window, topk, verify, with_sink, splits);
         constexpr int narrow_h = 16;
 #else
         if (use_fp4) {
@@ -754,15 +758,15 @@ int main(int argc, char** argv) {
 #endif
         if (H <= narrow_h)
             return run_mla_v41_prefill_case<opus_mla_v41_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(
-                H, N, total_pages, total_tokens, topk, verify, with_sink, splits);
+                H, N, total_pages, window, topk, verify, with_sink, splits);
         return run_mla_v41_prefill_case<opus_mla_v41_prefill_a8w8_16mx4_64nx1_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>>(
-            H, N, total_pages, total_tokens, topk, verify, with_sink, splits);
+            H, N, total_pages, window, topk, verify, with_sink, splits);
     };
 
     int cases = 0, failed = 0;
-    for (int H : Hs) for (int N : Ns) for (int topk : topks) for (int pages : pages_list) for (int tokens : tokens_list)
+    for (int H : Hs) for (int N : Ns) for (int topk : topks) for (int pages : pages_list) for (int window : windows)
         for (int sink : sinks) for (int splits : splits_list) {
-            failed += run_case(H, N, topk, pages, tokens, sink != 0, splits) != 0;
+            failed += run_case(H, N, topk, pages, window, sink != 0, splits) != 0;
             ++cases;
         }
     if (cases > 1) printf("[Summary] %d of %d cases failed\n", failed, cases);

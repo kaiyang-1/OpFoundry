@@ -4,22 +4,13 @@
 #include <opus/hip_minimal.hpp>
 #include "mla_v4_traits.h"
 
-#define MLA_V4_FOR_EACH_CLUSTER_Y(X) X(1) X(2)
-
 #ifndef __HIP_DEVICE_COMPILE__
 template<typename Traits> __global__ void opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel(typename Traits::kargs_type kargs) {}
 #else
 #include "mla_v4_prefill_a16w16_16mx4_64nx1_template.hpp"
 #endif
 
-#define MLA_V4_INSTANTIATE(CY)                                              \
-    template __global__ void opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel< \
-        opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, CY, bf16_t, bf16_t>>(opus_mla_v4_prefill_kargs);
-MLA_V4_FOR_EACH_CLUSTER_Y(MLA_V4_INSTANTIATE)
-#undef MLA_V4_INSTANTIATE
-
-#define MLA_V4_INSTANTIATE_SPLIT(CY)                                        \
-    template __global__ void opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel< \
-        opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, CY, bf16_t, bf16_t, true>>(opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>);
-MLA_V4_FOR_EACH_CLUSTER_Y(MLA_V4_INSTANTIATE_SPLIT)
-#undef MLA_V4_INSTANTIATE_SPLIT
+template __global__ void opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel<
+    opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, bf16_t, bf16_t>>(opus_mla_v4_prefill_kargs);
+template __global__ void opus_mla_v4_prefill_a16w16_16mx4_64nx1_kernel<
+    opus_mla_v4_prefill_a16w16_16mx4_64nx1_traits<16, 64, 512, 4, bf16_t, bf16_t, true>>(opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>);
