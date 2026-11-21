@@ -1,7 +1,5 @@
-// Host harness of the GQA forward kernels: varlen inputs, the opus kernel of the arch and aiter's asm code object (where
-// there is one) on the same inputs, a CPU reference, A/B comparison and timing. The traits of the opus kernel give its
-// kernel arguments, grid and the problems it supports.
-#include <hip/hip_runtime.h>
+// Host harness of the GQA forward kernels: varlen inputs, the opus kernel of the arch, a CPU reference and timing.
+#include <opus/hip_minimal.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -9,26 +7,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 #include <thread>
-#include <tuple>
-#include <type_traits>
-#include <utility>
 #include <vector>
 
 #if defined(GQA_ARCH_GFX950)
 #include "gfx950/gqa_traits.h"
-template <class Traits>
-__global__ void gqa_d128_kernel(opus_gqa_kargs kargs);
-template <class Traits>
-__global__ void gqa_d512_kernel(opus_gqa_kargs kargs);
 #elif defined(GQA_ARCH_GFX1250)
 #include "gfx1250/gqa_traits.h"
-template <class Traits>
-__global__ void gqa_d128_kernel(opus_gqa_varlen_kargs kargs);
 #else
 #error "No target arch defined. The Makefile passes GQA_ARCH_<ARCH> from ARCH (e.g. ARCH=gfx950)."
 #endif
+
+template <class Traits>
+__global__ void gqa_d128_kernel(opus_gqa_varlen_kargs kargs);
+template <class Traits>
+__global__ void gqa_d512_kernel(opus_gqa_varlen_kargs kargs);  // gfx950
 
 #define CHECK_HIP(x)                                                                                \
     do {                                                                                            \
@@ -40,6 +33,35 @@ __global__ void gqa_d128_kernel(opus_gqa_varlen_kargs kargs);
     } while (0)
 
 namespace {
+
+// ---- Problem and inputs ----
+
+// Q/O [total_q, H, D], K/V [total_k, H_KV, D], bf16; batch b has sq[b] Q rows and sk[b] KV rows.
+struct Problem {
+    std::vector<int> sq, sk;
+    int hq = 64, hkv = 8, d = 128;
+    bool causal = true;
+    bool sink = false;
+    float qscale = 1.0f;  // input Q scale: 8 makes row maxes jump by more than the kernels' rescale threshold
+    int opt = OPUS_GQA_OPT_DOUBLE_Q | OPUS_GQA_OPT_REMAP_XY;
+
+    float scale() const { return 1.0f / std::sqrt(float(d)); }
+    int batch() const { return int(sq.size()); }
+    int64_t total_q() const { int64_t t = 0; for (int x : sq) t += x; return t; }
+    int64_t total_k() const { int64_t t = 0; for (int x : sk) t += x; return t; }
+    int max_q() const { return *std::max_element(sq.begin(), sq.end()); }
+    // Keys row i of batch b sees: [0, kv_end(b, i)).
+    int kv_end(int b, int i) const {
+        if (!causal) return sk[b];
+        return std::clamp(i + (sk[b] - sq[b]) + 1, 0, sk[b]);
+    }
+    double pairs() const {
+        double p = 0;
+        for (int b = 0; b < batch(); ++b)
+            for (int i = 0; i < sq[b]; ++i) p += kv_end(b, i);
+        return p;
+    }
+};
 
 uint16_t f2bf(float f) {
     uint32_t u;
@@ -77,83 +99,25 @@ void parallel_for(int64_t n, F f) {
     for (auto& x : th) x.join();
 }
 
-std::vector<int> parse_list(const char* s) {
-    std::vector<int> v;
-    for (const char* p = s; *p;) {
-        v.push_back(std::atoi(p));
-        while (*p && *p != ',') ++p;
-        if (*p == ',') ++p;
-    }
-    return v;
-}
-
-std::string aiter_dir() {
-    if (const char* a = std::getenv("AITER_DIR")) return a;
-    const char* h = std::getenv("HOME");
-    return std::string(h ? h : ".") + "/develop/aiter";
-}
-
-// Q/O [total_q, H, D], K/V [total_k, H_KV, D], bf16; batch b has sq[b] Q rows and sk[b] KV rows.
-struct Problem {
-    std::vector<int> sq, sk;
-    int hq = 64, hkv = 8, d = 128;
-    bool causal = true;
-    bool sink = false;
-    float scale = 0.0f;
-    float qscale = 1.0f;  // input Q scale: large values exercise the row-max rescale
-    uint64_t seed = 1;
-
-    int batch() const { return int(sq.size()); }
-    int64_t total_q() const { int64_t t = 0; for (int x : sq) t += x; return t; }
-    int64_t total_k() const { int64_t t = 0; for (int x : sk) t += x; return t; }
-    int max_q() const { return *std::max_element(sq.begin(), sq.end()); }
-    bool fixed_len() const {  // one length for every batch, sq == sk
-        for (int b = 0; b < batch(); ++b)
-            if (sq[b] != sq[0] || sk[b] != sq[0]) return false;
-        return true;
-    }
-    // Keys row i of batch b sees: [0, kv_end(b, i)).
-    int kv_end(int b, int i) const {
-        if (!causal) return sk[b];
-        return std::clamp(i + (sk[b] - sq[b]) + 1, 0, sk[b]);
-    }
-    double pairs() const {
-        double p = 0;
-        for (int b = 0; b < batch(); ++b)
-            for (int i = 0; i < sq[b]; ++i) p += kv_end(b, i);
-        return p;
-    }
-};
-
-struct Options {
-    std::string kernels;
-    std::string asm_dir;  // empty: from aiter_dir()
-    int opt = 0x7;        // OPUS_GQA_OPT_* bits of the varlen kernel arguments
-    bool verify = false, perf = false;
-    int iters = 20, warmup = 5;
-    double ref_budget = 4e9;
-};
-
 struct HostData {
     std::vector<uint16_t> q, k, v;
     std::vector<int> cu_q, cu_k;
-    std::vector<float> sink;
+    std::vector<float> sink;  // scaled-logit domain
 };
 
 HostData make_data(const Problem& p) {
     HostData h;
-    const int64_t tq = p.total_q(), tk = p.total_k();
-    h.q.resize(tq * p.hq * p.d);
-    h.k.resize(tk * p.hkv * p.d);
-    h.v.resize(tk * p.hkv * p.d);
+    h.q.resize(p.total_q() * p.hq * p.d);
+    h.k.resize(p.total_k() * p.hkv * p.d);
+    h.v.resize(h.k.size());
     parallel_for(int64_t(h.q.size() >> 12) + 1, [&](int64_t c) {
         for (int64_t i = c << 12; i < std::min<int64_t>(h.q.size(), (c + 1) << 12); ++i)
-            h.q[i] = f2bf(p.qscale * uniform(p.seed, i));
+            h.q[i] = f2bf(p.qscale * uniform(1, i));
     });
     parallel_for(int64_t(h.k.size() >> 12) + 1, [&](int64_t c) {
         for (int64_t i = c << 12; i < std::min<int64_t>(h.k.size(), (c + 1) << 12); ++i) {
-            h.k[i] = f2bf(uniform(p.seed + 1, i));
-            h.v[i] = f2bf(uniform(p.seed + 2, i));
+            h.k[i] = f2bf(uniform(2, i));
+            h.v[i] = f2bf(uniform(3, i));
         }
     });
     h.cu_q.assign(1, 0);
@@ -163,55 +127,56 @@ HostData make_data(const Problem& p) {
         h.cu_k.push_back(h.cu_k.back() + p.sk[b]);
     }
     h.sink.resize(p.hq);
-    for (int i = 0; i < p.hq; ++i) h.sink[i] = 2.0f * uniform(p.seed + 3, i);  // scaled-logit domain
+    for (int i = 0; i < p.hq; ++i) h.sink[i] = 2.0f * uniform(4, i);
     return h;
 }
 
+// ---- CPU reference ----
+
 struct RefRow {
-    int b, i, h;
+    int64_t row;  // (Q row) * H + head, the row of O [total_q * H, D]
     std::vector<float> o;
     float lse;
 };
 
-// Reference rows: every row for small problems, an even sample (always including each batch's first and last rows)
-// otherwise.
-std::vector<RefRow> cpu_reference(const Problem& p, const HostData& d, double budget) {
-    std::vector<std::tuple<int, int, int>> rows;
+// Every row for small problems, else an even sample with each batch's first and last rows.
+std::vector<RefRow> cpu_reference(const Problem& p, const HostData& d) {
+    constexpr double BUDGET = 4e9;  // multiply-adds at D = 128
     const double cost = p.pairs() * p.hq * p.d / 128.0;
     const int64_t total_rows = p.total_q() * p.hq;
-    const int64_t want = cost <= budget ? total_rows : std::max<int64_t>(64, int64_t(total_rows * budget / cost));
+    const int64_t want = cost <= BUDGET ? total_rows : std::max<int64_t>(64, int64_t(total_rows * BUDGET / cost));
     const int64_t step = std::max<int64_t>(1, total_rows / want);
+    std::vector<int64_t> rows;
     for (int b = 0; b < p.batch(); ++b)
-        for (int h = 0; h < p.hq; ++h) {
-            rows.emplace_back(b, 0, h);
-            if (p.sq[b] > 1) rows.emplace_back(b, p.sq[b] - 1, h);
-        }
-    for (int64_t r = 0; r < total_rows; r += step) {
-        int64_t t = r / p.hq;
-        int h = int(r % p.hq), b = 0;
-        while (t >= d.cu_q[b + 1]) ++b;
-        rows.emplace_back(b, int(t - d.cu_q[b]), h);
-    }
+        for (int h = 0; h < p.hq; ++h)
+            if (p.sq[b] > 0) {
+                rows.push_back(int64_t(d.cu_q[b]) * p.hq + h);
+                rows.push_back(int64_t(d.cu_q[b + 1] - 1) * p.hq + h);
+            }
+    for (int64_t r = 0; r < total_rows; r += step) rows.push_back(r);
     std::sort(rows.begin(), rows.end());
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+
     std::vector<RefRow> out(rows.size());
     const int gqa = p.hq / p.hkv, D = p.d;
+    const float scale = p.scale();
     parallel_for(int64_t(rows.size()), [&](int64_t r) {
-        auto [b, i, h] = rows[r];
         RefRow& rr = out[r];
-        rr.b = b, rr.i = i, rr.h = h;
+        rr.row = rows[r];
+        const int64_t t = rr.row / p.hq;
+        const int h = int(rr.row % p.hq), kh = h / gqa;
+        const int b = int(std::upper_bound(d.cu_q.begin(), d.cu_q.end(), t) - d.cu_q.begin()) - 1;
+        const int n = p.kv_end(b, int(t - d.cu_q[b]));
         rr.o.assign(D, 0.0f);
-        const int kh = h / gqa, n = p.kv_end(b, i);
-        const uint16_t* qp = &d.q[((int64_t(d.cu_q[b]) + i) * p.hq + h) * D];
         std::vector<float> qf(D);
-        for (int x = 0; x < D; ++x) qf[x] = bf2f(qp[x]);
+        for (int x = 0; x < D; ++x) qf[x] = bf2f(d.q[rr.row * D + x]);
         std::vector<float> s(n);
         float m = -INFINITY;
         for (int j = 0; j < n; ++j) {
             const uint16_t* kp = &d.k[((int64_t(d.cu_k[b]) + j) * p.hkv + kh) * D];
             float acc = 0;
             for (int x = 0; x < D; ++x) acc += qf[x] * bf2f(kp[x]);
-            s[j] = acc * p.scale;
+            s[j] = acc * scale;
             m = std::max(m, s[j]);
         }
         if (p.sink) m = std::max(m, d.sink[h]);
@@ -229,47 +194,47 @@ std::vector<RefRow> cpu_reference(const Problem& p, const HostData& d, double bu
     return out;
 }
 
+// ---- Device buffers and launch ----
+
+// Bytes of each tensor, and of the GUARD rows after it: NaN after Q, K and V (rows past a sequence read as 0),
+// untouched after O and the LSE.
+struct Sizes {
+    static constexpr int64_t GUARD = 256;
+    size_t q, k, lse, q_guard, k_guard, lse_guard;
+    explicit Sizes(const Problem& p)
+        : q(p.total_q() * p.hq * p.d * 2), k(p.total_k() * p.hkv * p.d * 2), lse(p.total_q() * p.hq * 4),
+          q_guard(GUARD * p.hq * p.d * 2), k_guard(GUARD * p.hkv * p.d * 2), lse_guard(GUARD * p.hq * 4) {}
+};
+
 struct DevBufs {
     void *q, *k, *v, *o, *lse, *cuq, *cuk, *sink;
 };
 
-// A kernel to run: aiter's asm code object (fn) or the opus kernel of the traits.
-struct Kernel {
-    std::string name;
-    hipFunction_t fn = nullptr;
-    int threads = 0, q_tile = 0;  // asm only
-    bool lse = true;              // writes the LSE
-};
-
-// aiter's asm code object for a problem, run on the varlen kernel arguments; dir is relative to aiter_dir().
-struct AsmKernel {
-    const char *dir, *co, *sym;
-    int threads, q_tile;
-};
-bool find_asm(const Problem& p, AsmKernel& a) {
-#if defined(GQA_ARCH_GFX1250)
-    if (p.d != 128) return false;
-    a = p.causal ? AsmKernel{"hsa/gfx1250/fmha_fwd_bf16_varlen", "fmha_bf16_pertokenBf16_hd128_128x256_mask_varlen.co",
-                             "_ZN5aiter48fmha_bf16_pertokenBf16_hd128_128x256_mask_varlenE", 128, 128}
-                 : AsmKernel{"hsa/gfx1250/fmha_fwd_bf16_varlen", "fmha_bf16_pertokenBf16_hd128_128x256_varlen.co",
-                             "_ZN5aiter43fmha_bf16_pertokenBf16_hd128_128x256_varlenE", 128, 128};
-    return true;
-#else
-    (void)p;
-    (void)a;
-    return false;
-#endif
+template <class X>
+void* upload(const std::vector<X>& h, size_t guard = 0) {
+    void* d;
+    const size_t bytes = h.size() * sizeof(X);
+    CHECK_HIP(hipMalloc(&d, bytes + guard));
+    CHECK_HIP(hipMemcpy(d, h.data(), bytes, hipMemcpyHostToDevice));
+    if (guard) CHECK_HIP(hipMemset(static_cast<char*>(d) + bytes, 0xff, guard));
+    return d;
 }
 
-dim3 varlen_grid(const Problem& p, int q_tile, int opt) {
-    const int tiles = (p.max_q() + q_tile - 1) / q_tile;
-    int gx = (opt & OPUS_GQA_OPT_DOUBLE_Q) ? (tiles + 1) / 2 : tiles;
-    int gy = p.hq, gz = p.batch();
-    if (opt & OPUS_GQA_OPT_REMAP_XY) std::swap(gx, gy);
-    return dim3(gx, gy, gz);
+DevBufs upload(const HostData& h, const Sizes& z) {
+    DevBufs b;
+    b.q = upload(h.q, z.q_guard);
+    b.k = upload(h.k, z.k_guard);
+    b.v = upload(h.v, z.k_guard);
+    b.cuq = upload(h.cu_q);
+    b.cuk = upload(h.cu_k);
+    b.sink = upload(h.sink);
+    CHECK_HIP(hipMalloc(&b.o, z.q + z.q_guard));
+    CHECK_HIP(hipMalloc(&b.lse, z.lse + z.lse_guard));
+    return b;
 }
 
-opus_gqa_varlen_kargs varlen_kargs(const Problem& p, const DevBufs& b, int opt) {
+template <class T>
+void launch(const Problem& p, const DevBufs& b) {
     opus_gqa_varlen_kargs a{};
     a.d_addr = b.o;
     a.q_addr = b.q;
@@ -278,278 +243,131 @@ opus_gqa_varlen_kargs varlen_kargs(const Problem& p, const DevBufs& b, int opt) 
     a.lse_addr = b.lse;
     a.qseq_addr = b.cuq;
     a.kseq_addr = b.cuk;
-    a.scalar = p.scale;
+    a.scalar = p.scale();
     a.gqa = p.hq / p.hkv;
     a.q_head_num = p.hq;
-    a.opt = opt;
+    a.opt = p.opt;
     a.lse = 1;
-    a.max_q_len = p.max_q();
     a.sink_addr = p.sink ? b.sink : nullptr;
-    return a;
-}
-
-// [B, N, H, D] with strides: the buffers of a problem with one length N for every batch.
-[[maybe_unused]] opus_gqa_kargs fixed_kargs(const Problem& p, const DevBufs& b) {
-    const int n = p.sq[0];
-    opus_gqa_kargs a{};
-    a.ptr_q = b.q;
-    a.ptr_k = b.k;
-    a.ptr_v = b.v;
-    a.ptr_o = b.o;
-    a.B = p.batch();
-    a.N = n;
-    a.H = p.hq;
-    a.H_KV = p.hkv;
-    a.D = p.d;
-    a.stride_q_b = n * p.hq * p.d;
-    a.stride_q_n = p.hq * p.d;
-    a.stride_q_h = p.d;
-    a.stride_kv_b = n * p.hkv * p.d;
-    a.stride_kv_n = p.hkv * p.d;
-    a.stride_kv_h = p.d;
-    return a;
-}
-
-// Why the opus kernel cannot run a problem, from the limits its traits declare; empty if it can.
-template <class T>
-std::string unsupported(const Problem& p) {
-    if (!T::VARLEN && !p.fixed_len()) return "needs one length for every batch and sq == sk";
-    if (!T::HAS_SINK && p.sink) return "has no sink";
-    for (int n : p.sq)
-        if (n % T::SEQ_ALIGN || n < T::MIN_KV_TILES * T::KV_TILE_SIZE)
-            return "needs lengths that are multiples of " + std::to_string(T::SEQ_ALIGN) + " and at least " +
-                   std::to_string(T::MIN_KV_TILES * T::KV_TILE_SIZE);
-    return "";
-}
-
-template <class T>
-void launch(const Kernel& k, const Problem& p, const DevBufs& b, int opt, hipStream_t s) {
-    if (k.fn) {
-        opus_gqa_varlen_kargs a = varlen_kargs(p, b, opt);
-        const dim3 g = varlen_grid(p, k.q_tile, opt);
-        size_t sz = sizeof(a);
-        void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &a, HIP_LAUNCH_PARAM_BUFFER_SIZE, &sz, HIP_LAUNCH_PARAM_END};
-        CHECK_HIP(hipModuleLaunchKernel(k.fn, g.x, g.y, g.z, k.threads, 1, 1, 0, s, nullptr, cfg));
-        return;
-    }
-    typename T::kargs_type a;
-    dim3 g;
-    if constexpr (std::is_same_v<typename T::kargs_type, opus_gqa_varlen_kargs>) {
-        a = varlen_kargs(p, b, opt);
-        g = varlen_grid(p, T::WG_Q_ROWS, opt);
-    } else {
-        a = fixed_kargs(p, b);
-        g = dim3(p.hq, (p.sq[0] + T::WG_Q_ROWS - 1) / T::WG_Q_ROWS, p.batch());
-    }
-    if constexpr (T::D_TILE_SIZE == 128) gqa_d128_kernel<T><<<g, T::BLOCK_SIZE, 0, s>>>(a);
-#if defined(GQA_ARCH_GFX950)
-    else gqa_d512_kernel<T><<<g, T::BLOCK_SIZE, 0, s>>>(a);
-#endif
+    int tiles = (p.max_q() + T::WG_Q_ROWS - 1) / T::WG_Q_ROWS;
+    if (p.opt & OPUS_GQA_OPT_DOUBLE_Q) tiles = (tiles + 1) / 2;
+    const dim3 g = (p.opt & OPUS_GQA_OPT_REMAP_XY) ? dim3(p.hq, tiles, p.batch()) : dim3(tiles, p.hq, p.batch());
+    if constexpr (T::D_TILE_SIZE == 128) gqa_d128_kernel<T><<<g, T::BLOCK_SIZE>>>(a);
+    else gqa_d512_kernel<T><<<g, T::BLOCK_SIZE>>>(a);
     CHECK_HIP(hipGetLastError());
 }
 
-struct Check {
+// ---- Verify and perf ----
+
+// O within 1e-2 + 1e-2 |ref| and the LSE within 1e-3 + 1e-3 |ref| for all but 1% of the values; no write past O or the
+// LSE.
+template <class T>
+bool verify(const Problem& p, const HostData& h, const DevBufs& b, const Sizes& z) {
+    const std::vector<RefRow> ref = cpu_reference(p, h);
+    CHECK_HIP(hipMemset(b.o, 0xff, z.q + z.q_guard));
+    CHECK_HIP(hipMemset(b.lse, 0xff, z.lse + z.lse_guard));
+    launch<T>(p, b);
+    CHECK_HIP(hipDeviceSynchronize());
+    std::vector<uint16_t> o(z.q / 2);
+    std::vector<float> lse(z.lse / 4);
+    CHECK_HIP(hipMemcpy(o.data(), b.o, z.q, hipMemcpyDeviceToHost));
+    CHECK_HIP(hipMemcpy(lse.data(), b.lse, z.lse, hipMemcpyDeviceToHost));
+
     double maxdiff = 0, lse_maxdiff = 0;
     int64_t bad = 0, n = 0, nonfinite = 0;
-    bool pass(double tol) const { return nonfinite == 0 && bad <= int64_t(tol * n); }
-};
-
-Check check_ref(const Problem& p, const HostData& d, const std::vector<RefRow>& ref, const std::vector<uint16_t>& o,
-                const std::vector<float>& lse, bool with_lse) {
-    Check c;
     for (const RefRow& r : ref) {
-        const int64_t row = (int64_t(d.cu_q[r.b]) + r.i) * p.hq + r.h;
         for (int x = 0; x < p.d; ++x) {
-            const float g = bf2f(o[row * p.d + x]), e = r.o[x];
-            if (!std::isfinite(g)) ++c.nonfinite;
+            const float g = bf2f(o[r.row * p.d + x]), e = r.o[x];
+            if (!std::isfinite(g)) ++nonfinite;
             const double df = std::fabs(double(g) - e);
-            c.maxdiff = std::max(c.maxdiff, df);
-            c.bad += df > 1e-2 + 1e-2 * std::fabs(e);
-            ++c.n;
+            maxdiff = std::max(maxdiff, df);
+            bad += df > 1e-2 + 1e-2 * std::fabs(e);
+            ++n;
         }
-        if (!with_lse) continue;
-        const float gl = lse[row];
-        if (std::isinf(r.lse) ? !(std::isinf(gl) && gl < 0) : std::fabs(gl - r.lse) > 1e-3 + 1e-3 * std::fabs(r.lse)) ++c.bad;
-        if (!std::isinf(r.lse)) c.lse_maxdiff = std::max(c.lse_maxdiff, double(std::fabs(gl - r.lse)));
-        ++c.n;
+        const float gl = lse[r.row];
+        if (std::isinf(r.lse) ? !(std::isinf(gl) && gl < 0) : std::fabs(gl - r.lse) > 1e-3 + 1e-3 * std::fabs(r.lse)) ++bad;
+        if (!std::isinf(r.lse)) lse_maxdiff = std::max(lse_maxdiff, double(std::fabs(gl - r.lse)));
+        ++n;
     }
-    return c;
+    auto written = [](const void* guard, size_t bytes) {  // bytes changed in guard rows
+        std::vector<uint8_t> g(bytes);
+        CHECK_HIP(hipMemcpy(g.data(), guard, bytes, hipMemcpyDeviceToHost));
+        return int64_t(std::count_if(g.begin(), g.end(), [](uint8_t x) { return x != 0xff; }));
+    };
+    const int64_t guard = written(static_cast<char*>(b.o) + z.q, z.q_guard) +
+                          written(static_cast<char*>(b.lse) + z.lse, z.lse_guard);
+    const bool ok = nonfinite == 0 && guard == 0 && bad <= n / 100;
+    printf("VERIFY rows=%zu maxdiff=%.4g lse_maxdiff=%.4g mismatch=%.4f%% nonfinite=%lld guard=%lld %s\n", ref.size(),
+           maxdiff, lse_maxdiff, 100.0 * bad / std::max<int64_t>(1, n), (long long)nonfinite, (long long)guard,
+           ok ? "PASS" : "FAIL");
+    return ok;
 }
 
-Check check_pair(const std::vector<uint16_t>& a, const std::vector<uint16_t>& b, const std::vector<float>& la,
-                 const std::vector<float>& lb, bool with_lse) {
-    Check c;
-    for (size_t i = 0; i < a.size(); ++i) {
-        const float x = bf2f(a[i]), y = bf2f(b[i]);
-        if (!std::isfinite(x)) ++c.nonfinite;
-        const double df = std::fabs(double(x) - y);
-        c.maxdiff = std::max(c.maxdiff, df);
-        c.bad += df > 1e-2 + 1e-2 * std::fabs(y);
-        ++c.n;
-    }
-    for (size_t i = 0; with_lse && i < la.size(); ++i) {
-        if (std::isinf(la[i]) && std::isinf(lb[i])) continue;
-        const double df = std::fabs(double(la[i]) - lb[i]);
-        c.lse_maxdiff = std::max(c.lse_maxdiff, df);
-    }
-    return c;
+// The launches cycle through the input sets, so that they do not hit a warm last-level cache.
+template <class T>
+void perf(const Problem& p, const std::vector<DevBufs>& sets) {
+    constexpr int WARMUP = 5, ITERS = 30;
+    hipEvent_t e0, e1;
+    CHECK_HIP(hipEventCreate(&e0));
+    CHECK_HIP(hipEventCreate(&e1));
+    for (int i = 0; i < WARMUP; ++i) launch<T>(p, sets[i % sets.size()]);
+    CHECK_HIP(hipEventRecord(e0));
+    for (int i = 0; i < ITERS; ++i) launch<T>(p, sets[i % sets.size()]);
+    CHECK_HIP(hipEventRecord(e1));
+    CHECK_HIP(hipEventSynchronize(e1));
+    float ms = 0;
+    CHECK_HIP(hipEventElapsedTime(&ms, e0, e1));
+    const double us = 1e3 * ms / ITERS;
+    printf("PERF us=%.2f tflops=%.1f\n", us, 4.0 * p.pairs() * p.hq * p.d / (us * 1e6));
 }
+
+// --verify: the CPU reference check; else timing.
+template <class T>
+int run(const Problem& p, bool check) {
+    const HostData h = make_data(p);
+    const Sizes z(p);
+    const int nsets = check ? 1 : int(std::clamp<int64_t>((1ll << 30) / int64_t(2 * z.q + 2 * z.k + 1), 1, 8));
+    std::vector<DevBufs> sets;
+    for (int i = 0; i < nsets; ++i) sets.push_back(upload(h, z));
+
+    printf("CASE b=%d sq=[", p.batch());
+    for (int i = 0; i < p.batch() && i < 8; ++i) printf(i ? ",%d" : "%d", p.sq[i]);
+    printf("%s] max_q=%d total_k=%lld h_q=%d h_kv=%d d=%d causal=%d sink=%d opt=0x%x qscale=%g\n",
+           p.batch() > 8 ? ",..." : "", p.max_q(), (long long)p.total_k(), p.hq, p.hkv, p.d, p.causal, p.sink, p.opt,
+           p.qscale);
+
+    if (check) return verify<T>(p, h, sets[0], z) ? 0 : 1;
+    perf<T>(p, sets);
+    return 0;
+}
+
+// ---- Command line ----
 
 void usage() {
     printf(
-        "gqa_fwd [-b B -n N | -sq l0,l1,..] [-sk l0,l1,..|-nk N] [-h_q H] [-h_kv H] [-d D] [--causal|--no-causal]\n"
-        "        [--sink] [-qscale F] [-opt X] [-kernel K[,K..]] [--verify] [--perf] [-iters N] [-warmup N]\n"
-        "        [-asm_dir DIR] [-seed S] [-ref_budget F]\n"
-        "  kernels: opus, asm (aiter's code object; gfx1250 D=128)\n");
+        "gqa_fwd [-b B -n N | -sq l0,l1,..] [-sk l0,l1,..] [-h_q H] [-h_kv H] [-d D] [--causal|--no-causal] [--sink]\n"
+        "        [-qscale F] [-opt X] [--verify]\n");
 }
 
-template <class T>
-int run(const Problem& p, const Options& o) {
-    std::vector<Kernel> kernels;
-    hipModule_t mod = nullptr;
-    for (size_t s = 0, e; s <= o.kernels.size(); s = e + 1) {
-        e = o.kernels.find(',', s);
-        if (e == std::string::npos) e = o.kernels.size();
-        if (e == s) continue;
-        Kernel k;
-        k.name = o.kernels.substr(s, e - s);
-        if (k.name == "asm") {
-            AsmKernel a;
-            if (!find_asm(p, a)) {
-                fprintf(stderr, "no asm code object for this arch and D=%d\n", p.d);
-                return 2;
-            }
-            const std::string dir = o.asm_dir.empty() ? aiter_dir() + "/" + a.dir : o.asm_dir;
-            CHECK_HIP(hipModuleLoad(&mod, (dir + "/" + a.co).c_str()));
-            CHECK_HIP(hipModuleGetFunction(&k.fn, mod, a.sym));
-            k.threads = a.threads;
-            k.q_tile = a.q_tile;
-        } else if (k.name == "opus") {
-            const std::string why = unsupported<T>(p);
-            if (!why.empty()) {
-                fprintf(stderr, "the opus kernel %s\n", why.c_str());
-                return 2;
-            }
-            k.lse = T::HAS_LSE;
-        } else {
-            fprintf(stderr, "unknown kernel %s\n", k.name.c_str());
-            usage();
-            return 2;
-        }
-        kernels.push_back(k);
+std::vector<int> parse_list(const char* s) {
+    std::vector<int> v;
+    for (const char* p = s; *p;) {
+        v.push_back(std::atoi(p));
+        while (*p && *p != ',') ++p;
+        if (*p == ',') ++p;
     }
-    if (kernels.empty()) { usage(); return 2; }
-
-    const HostData hd = make_data(p);
-    const int64_t tq = p.total_q(), tk = p.total_k();
-    const size_t qbytes = tq * p.hq * p.d * 2, kbytes = tk * p.hkv * p.d * 2;
-    // Rotate input sets so timed launches do not hit a warm last-level cache.
-    const int sets = o.perf ? int(std::clamp<int64_t>((1ll << 30) / int64_t(2 * qbytes + 2 * kbytes + 1), 1, 8)) : 1;
-    std::vector<DevBufs> bufs(sets);
-    for (auto& x : bufs) {
-        CHECK_HIP(hipMalloc(&x.q, qbytes));
-        CHECK_HIP(hipMalloc(&x.k, kbytes));
-        CHECK_HIP(hipMalloc(&x.v, kbytes));
-        CHECK_HIP(hipMalloc(&x.o, qbytes));
-        CHECK_HIP(hipMalloc(&x.lse, tq * p.hq * 4));
-        CHECK_HIP(hipMalloc(&x.cuq, hd.cu_q.size() * 4));
-        CHECK_HIP(hipMalloc(&x.cuk, hd.cu_k.size() * 4));
-        CHECK_HIP(hipMalloc(&x.sink, p.hq * 4));
-        CHECK_HIP(hipMemcpy(x.q, hd.q.data(), qbytes, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(x.k, hd.k.data(), kbytes, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(x.v, hd.v.data(), kbytes, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(x.cuq, hd.cu_q.data(), hd.cu_q.size() * 4, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(x.cuk, hd.cu_k.data(), hd.cu_k.size() * 4, hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(x.sink, hd.sink.data(), p.hq * 4, hipMemcpyHostToDevice));
-    }
-
-    std::string lens;
-    for (int i = 0; i < p.batch() && i < 8; ++i) lens += (i ? "," : "") + std::to_string(p.sq[i]);
-    if (p.batch() > 8) lens += ",...";
-    printf("CASE b=%d sq=[%s] max_q=%d total_k=%lld h_q=%d h_kv=%d d=%d causal=%d sink=%d opt=0x%x qscale=%g\n",
-           p.batch(), lens.c_str(), p.max_q(), (long long)tk, p.hq, p.hkv, p.d, p.causal, p.sink, o.opt, p.qscale);
-
-    hipStream_t s;
-    CHECK_HIP(hipStreamCreate(&s));
-    std::vector<std::vector<uint16_t>> outs(kernels.size());
-    std::vector<std::vector<float>> lses(kernels.size());
-    std::vector<RefRow> ref;
-    if (o.verify) ref = cpu_reference(p, hd, o.ref_budget);
-    bool all_pass = true;
-    for (size_t ki = 0; ki < kernels.size(); ++ki) {
-        const Kernel& k = kernels[ki];
-        CHECK_HIP(hipMemset(bufs[0].o, 0xff, qbytes));
-        CHECK_HIP(hipMemset(bufs[0].lse, 0xff, tq * p.hq * 4));
-        launch<T>(k, p, bufs[0], o.opt, s);
-        CHECK_HIP(hipStreamSynchronize(s));
-        outs[ki].resize(tq * p.hq * p.d);
-        lses[ki].resize(tq * p.hq);
-        CHECK_HIP(hipMemcpy(outs[ki].data(), bufs[0].o, qbytes, hipMemcpyDeviceToHost));
-        CHECK_HIP(hipMemcpy(lses[ki].data(), bufs[0].lse, tq * p.hq * 4, hipMemcpyDeviceToHost));
-        if (!o.verify) continue;
-        if (k.fn && p.sink) {  // the asm code objects are built without the sink
-            printf("VERIFY %s skipped: the asm code object ignores the sink\n", k.name.c_str());
-            continue;
-        }
-        const Check c = check_ref(p, hd, ref, outs[ki], lses[ki], k.lse);
-        const bool ok = c.pass(0.01);
-        all_pass &= ok;
-        printf("VERIFY %s rows=%zu maxdiff=%.4g lse_maxdiff=%.4g mismatch=%.4f%% nonfinite=%lld %s\n", k.name.c_str(),
-               ref.size(), c.maxdiff, c.lse_maxdiff, 100.0 * c.bad / std::max<int64_t>(1, c.n), (long long)c.nonfinite,
-               ok ? "PASS" : "FAIL");
-    }
-    for (size_t x = 0; x < kernels.size(); ++x)
-        for (size_t y = 0; y < x; ++y)
-            if (!(kernels[y].fn && p.sink)) {
-                const Check c = check_pair(outs[x], outs[y], lses[x], lses[y], kernels[x].lse && kernels[y].lse);
-                printf("AB %s_vs_%s maxdiff=%.4g lse_maxdiff=%.4g mismatch=%.4f%% nonfinite=%lld\n", kernels[x].name.c_str(),
-                       kernels[y].name.c_str(), c.maxdiff, c.lse_maxdiff, 100.0 * c.bad / std::max<int64_t>(1, c.n),
-                       (long long)c.nonfinite);
-            }
-    if (o.perf) {
-        const double flops = 4.0 * p.pairs() * p.hq * p.d;
-        std::vector<double> us(kernels.size());
-        hipEvent_t e0, e1;
-        CHECK_HIP(hipEventCreate(&e0));
-        CHECK_HIP(hipEventCreate(&e1));
-        for (size_t ki = 0; ki < kernels.size(); ++ki) {
-            for (int i = 0; i < o.warmup; ++i) launch<T>(kernels[ki], p, bufs[i % sets], o.opt, s);
-            CHECK_HIP(hipEventRecord(e0, s));
-            for (int i = 0; i < o.iters; ++i) launch<T>(kernels[ki], p, bufs[i % sets], o.opt, s);
-            CHECK_HIP(hipEventRecord(e1, s));
-            CHECK_HIP(hipEventSynchronize(e1));
-            float ms = 0;
-            CHECK_HIP(hipEventElapsedTime(&ms, e0, e1));
-            us[ki] = 1e3 * ms / o.iters;
-            printf("PERF %s us=%.2f tflops=%.1f\n", kernels[ki].name.c_str(), us[ki], flops / (us[ki] * 1e6));
-        }
-        for (size_t ki = 1; ki < kernels.size(); ++ki)
-            printf("RATIO %s/%s=%.4f\n", kernels[ki].name.c_str(), kernels[0].name.c_str(), us[ki] / us[0]);
-    }
-    if (mod) CHECK_HIP(hipModuleUnload(mod));
-    return o.verify && !all_pass ? 1 : 0;
+    return v;
 }
 
-}  // namespace
-
-int main(int argc, char** argv) {
-    Problem p;
-    Options o;
-#if defined(GQA_ARCH_GFX1250)
-    o.kernels = "asm,opus";
-#else
-    o.kernels = "opus";
-#endif
-    int b = 1, n = 1024, nk = -1;
-    std::vector<int> sq, sk;
+bool parse_args(int argc, char** argv, Problem& p, bool& check) {
+    int b = 1, n = 1024;
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         auto next = [&] { return i + 1 < argc ? argv[++i] : (usage(), exit(2), ""); };
         if (!strcmp(a, "-b")) b = atoi(next());
         else if (!strcmp(a, "-n")) n = atoi(next());
-        else if (!strcmp(a, "-nk")) nk = atoi(next());
-        else if (!strcmp(a, "-sq")) sq = parse_list(next());
-        else if (!strcmp(a, "-sk")) sk = parse_list(next());
+        else if (!strcmp(a, "-sq")) p.sq = parse_list(next());
+        else if (!strcmp(a, "-sk")) p.sk = parse_list(next());
         else if (!strcmp(a, "-h_q")) p.hq = atoi(next());
         else if (!strcmp(a, "-h_kv")) p.hkv = atoi(next());
         else if (!strcmp(a, "-d")) p.d = atoi(next());
@@ -557,30 +375,26 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--no-causal")) p.causal = false;
         else if (!strcmp(a, "--sink")) p.sink = true;
         else if (!strcmp(a, "-qscale")) p.qscale = float(atof(next()));
-        else if (!strcmp(a, "-opt")) o.opt = int(strtol(next(), nullptr, 0));
-        else if (!strcmp(a, "-kernel")) o.kernels = next();
-        else if (!strcmp(a, "--verify")) o.verify = true;
-        else if (!strcmp(a, "--perf")) o.perf = true;
-        else if (!strcmp(a, "-iters")) o.iters = atoi(next());
-        else if (!strcmp(a, "-warmup")) o.warmup = atoi(next());
-        else if (!strcmp(a, "-asm_dir")) o.asm_dir = next();
-        else if (!strcmp(a, "-seed")) p.seed = strtoull(next(), nullptr, 0);
-        else if (!strcmp(a, "-ref_budget")) o.ref_budget = atof(next());
-        else { usage(); return 2; }
+        else if (!strcmp(a, "-opt")) p.opt = int(strtol(next(), nullptr, 0));
+        else if (!strcmp(a, "--verify")) check = true;
+        else { usage(); return false; }
     }
-    if (sq.empty()) sq.assign(b, n);
-    if (sk.empty()) sk = nk > 0 ? std::vector<int>(sq.size(), nk) : sq;
-    if (sk.size() != sq.size()) { fprintf(stderr, "-sq and -sk need the same batch\n"); return 2; }
-    p.sq = sq;
-    p.sk = sk;
-    p.scale = 1.0f / std::sqrt(float(p.d));
-    if (p.hq % p.hkv) { fprintf(stderr, "h_q must be a multiple of h_kv\n"); return 2; }
+    if (p.sq.empty()) p.sq.assign(b, n);
+    if (p.sk.empty()) p.sk = p.sq;
+    if (p.sk.size() != p.sq.size()) { fprintf(stderr, "-sq and -sk need the same batch\n"); return false; }
+    if (p.hq % p.hkv) { fprintf(stderr, "h_q must be a multiple of h_kv\n"); return false; }
+    return true;
+}
 
-#define RUN_CASE(Q, KV, D, NW) \
-    (p.causal ? run<opus_gqa_traits<Q, KV, D, NW, true>>(p, o) : run<opus_gqa_traits<Q, KV, D, NW, false>>(p, o))
-    if (p.d == 128) return RUN_CASE(32, 64, 128, 8);
+}  // namespace
+
+int main(int argc, char** argv) {
+    Problem p;
+    bool check = false;
+    if (!parse_args(argc, argv, p, check)) return 2;
+    if (p.d == 128) return p.causal ? run<gqa_d128_traits<true>>(p, check) : run<gqa_d128_traits<false>>(p, check);
 #if defined(GQA_ARCH_GFX950)
-    if (p.d == 512) return RUN_CASE(16, 32, 512, 8);
+    if (p.d == 512) return p.causal ? run<gqa_d512_traits<true>>(p, check) : run<gqa_d512_traits<false>>(p, check);
 #endif
     fprintf(stderr, "-d %d: no kernel for this arch\n", p.d);
     return 2;

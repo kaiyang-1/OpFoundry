@@ -22,12 +22,7 @@ struct opus_gqa_traits {
     static constexpr int WARP_SIZE = 32;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
     static constexpr int WG_Q_ROWS = Q_TILE_SIZE * NUM_WARPS;
-
-    // What the host may run: any lengths, sq != sk, LSE and sink.
-    using kargs_type = opus_gqa_varlen_kargs;
-    static constexpr bool VARLEN = true;
-    static constexpr bool HAS_LSE = true;
-    static constexpr bool HAS_SINK = true;
-    static constexpr int SEQ_ALIGN = 1;
-    static constexpr int MIN_KV_TILES = 0;
 };
+
+// The instantiated kernels
+template <bool CAUSAL> using gqa_d128_traits = opus_gqa_traits<32, 64, 128, 8, CAUSAL>;

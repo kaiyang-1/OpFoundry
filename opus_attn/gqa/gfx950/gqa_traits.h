@@ -5,10 +5,7 @@
 
 using bf16_t = __bf16;
 
-// Configuration traits for GQA kernel (tile sizes, data types, vector lengths, MFMA config).
-// D_TILE_SIZE selects between two kernel families:
-//   D=128: MFMA 32x32x16 bf16, K/V loaded in one shot (no D slicing)
-//   D=512: MFMA 16x16x32 bf16, D iterated in SLICE_D=32 chunks
+// D=128: MFMA 32x32x16, whole D per tile. D=512: MFMA 16x16x32, D in slices of 32.
 template<int Q_TILE_SIZE_ = 16,
         int KV_TILE_SIZE_ = 32,
         int D_TILE_SIZE_ = 512,
@@ -24,37 +21,22 @@ struct opus_gqa_traits {
     static constexpr int NUM_WARPS = NUM_WARPS_;
     static constexpr bool CAUSAL = CAUSAL_;
 
-    static constexpr int WARP_SIZE = 64; // AMD wavefront size
+    static constexpr int WARP_SIZE = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
     static constexpr int WG_Q_ROWS = Q_TILE_SIZE * NUM_WARPS;
 
-    // What the host may run: one N for every batch (sq == sk), a multiple of SEQ_ALIGN of at least MIN_KV_TILES KV
-    // tiles; the scale is 1/sqrt(D); no LSE, no sink.
-    using kargs_type = opus_gqa_kargs;
-    static constexpr bool VARLEN = false;
-    static constexpr bool HAS_LSE = false;
-    static constexpr bool HAS_SINK = false;
-    static constexpr int SEQ_ALIGN = WG_Q_ROWS > KV_TILE_SIZE ? WG_Q_ROWS : KV_TILE_SIZE;
-    static_assert(SEQ_ALIGN % WG_Q_ROWS == 0 && SEQ_ALIGN % KV_TILE_SIZE == 0);
-    static constexpr int MIN_KV_TILES = 6;
-
-    // Data types: Q/K/V/O share one bf16 type; accumulation fp32
     using D_ATTN = bf16_t;
     using D_ACC  = float;
 
-    // MFMA wave layout
-    static constexpr int T_M = NUM_WARPS; // waves along M
-    static constexpr int T_N = 1;         // waves along N
-    static constexpr int T_K = 1;         // waves along K
+    // waves along M, N, K
+    static constexpr int T_M = NUM_WARPS;
+    static constexpr int T_N = 1;
+    static constexpr int T_K = 1;
 
-    // MFMA base tile depends on D
-    //   D=128: bf16 32x32x16
-    //   D=512: bf16 16x16x32
     static constexpr int W_M = (D_TILE_SIZE == 128) ? 32 : 16;
     static constexpr int W_N = (D_TILE_SIZE == 128) ? 32 : 16;
     static constexpr int W_K = (D_TILE_SIZE == 128) ? 16 : 32;
 
-    // D slicing: only D=512 iterates D in chunks; D=128 covers full D in one MMA
     static constexpr int SLICE_D = (D_TILE_SIZE == 512) ? 32 : D_TILE_SIZE;
     static constexpr int NUM_D_SLICES = D_TILE_SIZE / SLICE_D;
     static_assert(D_TILE_SIZE % SLICE_D == 0);
@@ -69,13 +51,12 @@ struct opus_gqa_traits {
     static constexpr int GEMM1_E_N = SLICE_D / W_N;
     static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
 
-    // Vector lengths for global load/store
     static constexpr int VEC_Q    = 8;
     static constexpr int VEC_KV   = 8;
     static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O    = 4;
 
-    // Minimal compact pixels for async copy for one wave
+    // LDS: one wave's async copy is 16 bytes per lane
     static constexpr int D_128B_SIZE = 128 / sizeof(D_ATTN);
     static_assert(VEC_KV == 16 / sizeof(D_ATTN));
     static constexpr int smem_linear_wave = WARP_SIZE * 16 / sizeof(D_ATTN);
@@ -87,9 +68,7 @@ struct opus_gqa_traits {
     static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
     static constexpr int smem_padding_64B = 64 / sizeof(D_ATTN);
 
-    // K/V smem padding differs across the two kernel families:
-    //   D=128: K uses 16B padding, V uses 64B padding
-    //   D=512: K and V both use 32B padding
+    // K/V row padding: D=128 16 / 64 bytes, D=512 32 bytes
     static constexpr int smem_k_padding = (D_TILE_SIZE == 128) ? smem_padding_16B : smem_padding_32B;
     static constexpr int smem_v_padding = (D_TILE_SIZE == 128) ? smem_padding_64B : smem_padding_32B;
 
@@ -101,11 +80,11 @@ struct opus_gqa_traits {
     static constexpr int v_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
     static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
-
-    static constexpr size_t smem_size_bytes() {
-        return 2 * smem_buffer_elems * sizeof(D_ATTN);
-    }
 };
+
+// The instantiated kernels
+template <bool CAUSAL> using gqa_d128_traits = opus_gqa_traits<32, 64, 128, 8, CAUSAL>;
+template <bool CAUSAL> using gqa_d512_traits = opus_gqa_traits<16, 32, 512, 8, CAUSAL>;
 
 __host__ __device__ inline int ceil_div(int a, int b) {
     return (a + b - 1) / b;

@@ -67,8 +67,7 @@ $(BUILD)/%.dis.s: $(ARCH)/%.cc $(ARCH_HDRS) $(COMMON_HDRS) | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) $(KERNEL_FLAGS) --offload-device-only --no-gpu-bundle-output -c -o $(BUILD)/$*.co
 	$(OBJDUMP) -d --mcpu=$(ARCH) $(BUILD)/$*.co > $@
 
-# Host object: no -D__HIPCC_RTC__ (the <<<>>> launches need the full HIP runtime), no fast math (the checks test for
-# inf and NaN).
+# Host object: no -D__HIPCC_RTC__.
 $(HOST_OBJ): $(HOST_SRC) $(ARCH)/gqa_traits.h $(COMMON_HDRS) | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) -c -o $@
 

@@ -8,4 +8,4 @@ template<typename Traits> __global__ void gqa_d128_kernel(opus_gqa_varlen_kargs 
 #else
 #include "gqa_d128_kernel_template.hpp"
 #endif
-template __global__ void gqa_d128_kernel<opus_gqa_traits<32, 64, 128, 8, true>>(opus_gqa_varlen_kargs);
+template __global__ void gqa_d128_kernel<gqa_d128_traits<true>>(opus_gqa_varlen_kargs);

@@ -1,12 +1,11 @@
-// GQA flash attention D=512 kernel — causal variant
+// GQA forward D=512 kernel (gfx950) — causal variant
 // Host pass: empty stub for __device_stub__ generation
 // Device pass: includes full kernel template
 #include <opus/hip_minimal.hpp>
 #include "gqa_traits.h"
 #ifndef __HIP_DEVICE_COMPILE__
-template<typename Traits> __global__ void gqa_d512_kernel(opus_gqa_kargs kargs) {}
-template __global__ void gqa_d512_kernel<opus_gqa_traits<16, 32, 512, 8, true>>(opus_gqa_kargs);
+template<typename Traits> __global__ void gqa_d512_kernel(opus_gqa_varlen_kargs kargs) {}
 #else
 #include "gqa_d512_kernel_template.hpp"
-template __global__ void gqa_d512_kernel<opus_gqa_traits<16, 32, 512, 8, true>>(opus_gqa_kargs);
 #endif
+template __global__ void gqa_d512_kernel<gqa_d512_traits<true>>(opus_gqa_varlen_kargs);

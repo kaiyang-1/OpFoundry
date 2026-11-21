@@ -1,5 +1,5 @@
-// GQA flash attention kernel template for D=512 on gfx950
-// Include this header from per-variant .cc files that instantiate specific traits.
+// GQA forward D=512 kernel (gfx950), varlen. 8 waves of 16 Q rows, KV tiles of 32 rows, D in slices of 32, one phase
+// per KV tile; waves 4-7 run a cluster behind waves 0-3.
 #pragma once
 
 #include <opus/opus.hpp>
@@ -10,6 +10,107 @@
 namespace gqa_d512 {
 
 using opus::operator""_I;
+
+constexpr float LOG2E = 1.44269504088896340736f, LN2 = 0.69314718055994530942f;
+// Fast math assumes no infinities: -inf only as bits. A finite M_INIT makes exp2 of a masked logit 0, not NaN.
+constexpr float M_INIT = -1.0e30f;
+constexpr float NO_SINK = -3.0e38f;  // exp2(NO_SINK - m) = 0
+constexpr unsigned NEG_INF_BITS = 0xff800000u;
+
+// s_load through the constant address space
+template <class T>
+__device__ inline T sload(const void* p, int i) {
+    return reinterpret_cast<const __attribute__((address_space(4))) T*>(reinterpret_cast<uintptr_t>(p))[i];
+}
+
+// Buffer size: reads past it return 0, writes are dropped
+__device__ inline unsigned int buffer_bytes(int64_t bytes) {
+    return bytes >= int64_t(0xffffffffu) ? 0xffffffffu : unsigned(bytes);
+}
+
+// The workgroup's batch, head and Q tile. Q/O [total_q, H, D], K/V [total_k, H_KV, D], LSE [total_q, H].
+struct seq_ctx {
+    int sq, sk, q0;
+    int q_stride, kv_stride, lse_stride;  // H D, H_KV D, H
+    const bf16_t* q;                      // row q0, head h
+    bf16_t* o;
+    float* lse;                           // null: no LSE
+    const bf16_t* k;                      // row 0, KV head
+    const bf16_t* v;
+    float c;                              // scale log2(e)
+    float sink;                           // sink log2(e), or NO_SINK
+
+    __device__ seq_ctx at(int row) const {
+        seq_ctx s = *this;
+        s.q0 = row;
+        s.q += int64_t(row) * q_stride;
+        s.o += int64_t(row) * q_stride;
+        if (s.lse) s.lse += int64_t(row) * lse_stride;
+        return s;
+    }
+};
+
+// Grid (tiles, H, B), (H, tiles, B) with OPUS_GQA_OPT_REMAP_XY. f(seq_ctx) for Q tile gx, and with
+// OPUS_GQA_OPT_DOUBLE_Q (half the tiles) for tile tiles - 1 - gx after it.
+template <int D, int Q_ROWS, class F>
+__device__ inline void for_each_tile(const opus_gqa_varlen_kargs& kargs, F&& f) {
+    int gx = opus::block_id_x(), gy = opus::block_id_y();
+    if (kargs.opt & OPUS_GQA_OPT_REMAP_XY) {
+        const int t = gx;
+        gx = gy;
+        gy = t;
+    }
+    const int b = opus::block_id_z();
+    const int q_start = sload<int>(kargs.qseq_addr, b), k_start = sload<int>(kargs.kseq_addr, b);
+    seq_ctx s;
+    s.sq = sload<int>(kargs.qseq_addr, b + 1) - q_start;
+    s.sk = sload<int>(kargs.kseq_addr, b + 1) - k_start;
+    const int tiles = (s.sq + Q_ROWS - 1) / Q_ROWS;
+    const bool double_q = kargs.opt & OPUS_GQA_OPT_DOUBLE_Q;
+    if (gx >= (double_q ? (tiles + 1) / 2 : tiles)) return;
+
+    const int gqa = kargs.gqa, hq = kargs.q_head_num, hkv = hq / gqa;
+    // neighbouring workgroups take different KV heads: those of an XCD share theirs
+    const int h = (gy % hkv) * gqa + gy / hkv, h_kv = h / gqa;
+    s.q0 = 0;
+    s.q_stride = hq * D;
+    s.kv_stride = hkv * D;
+    s.lse_stride = hq;
+    const int64_t q_row = int64_t(q_start) * hq + h;
+    s.q = reinterpret_cast<const bf16_t*>(kargs.q_addr) + q_row * D;
+    s.o = reinterpret_cast<bf16_t*>(kargs.d_addr) + q_row * D;
+    s.lse = kargs.lse ? reinterpret_cast<float*>(kargs.lse_addr) + q_row : nullptr;
+    const int64_t kv_row = int64_t(k_start) * hkv + h_kv;
+    s.k = reinterpret_cast<const bf16_t*>(kargs.k_addr) + kv_row * D;
+    s.v = reinterpret_cast<const bf16_t*>(kargs.v_addr) + kv_row * D;
+    s.c = kargs.scalar * LOG2E;
+    s.sink = kargs.sink_addr ? sload<float>(kargs.sink_addr, h) * LOG2E : NO_SINK;
+
+    // two calls, not a loop: a loop shares the tiles' invariant VGPRs and spills
+    f(s.at(gx * Q_ROWS));
+    if (double_q && tiles - 1 - gx != gx) {
+        __builtin_amdgcn_sched_barrier(0);
+        __builtin_amdgcn_s_barrier();  // the first tile's LDS reads are done
+        __builtin_amdgcn_sched_barrier(0);
+        f(s.at((tiles - 1 - gx) * Q_ROWS));
+    }
+}
+
+// m and l of a row with the sink logit x
+struct row_final {
+    float m, l, o_scale;
+    __device__ row_final(float m_acc, float l_acc, float x) {
+        m = __builtin_fmaxf(m_acc, x);
+        const float alpha = __builtin_amdgcn_exp2f(m_acc - m);
+        l = l_acc * alpha + __builtin_amdgcn_exp2f(x - m);
+        o_scale = l > 0.0f ? alpha / l : 0.0f;
+    }
+    // natural log, -inf if l = 0
+    __device__ float lse() const {
+        const float x = (m + __builtin_amdgcn_logf(l)) * LN2;
+        return __builtin_bit_cast(float, l > 0.0f ? __builtin_bit_cast(unsigned, x) : NEG_INF_BITS);
+    }
+};
 
 constexpr int MFMA_MASK    = 0x08;
 constexpr int VALU_MASK    = 0x02;
@@ -195,14 +296,14 @@ template<typename T, typename V>
 __device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
     using D_ACC = typename T::D_ACC;
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    D_ACC row_max = -1e30f;
+    D_ACC row_max = gqa_d512::M_INIT;
     opus::static_for<s_len>([&](auto i) {
         row_max = max(row_max, v_s[i.value]);
     });
-    // swap lanes 32 apart (i <-> i+32).
+    // lanes i, i + 32
     opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
     row_max = max(std::bit_cast<float>(res32.x), std::bit_cast<float>(res32.y));
-    // swap lanes 16 apart (i <-> i+16).
+    // lanes i, i + 16
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
     return max(std::bit_cast<float>(res16.x), std::bit_cast<float>(res16.y));
 }
@@ -231,10 +332,10 @@ __device__ inline typename T::D_ACC attn_row_sum(const V& v_s) {
     opus::static_for<s_len>([&](auto i) {
         row_sum += v_s[i.value];
     });
-    // swap lanes 32 apart (i <-> i+32).
+    // lanes i, i + 32
     opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
     row_sum = std::bit_cast<float>(res32.x) + std::bit_cast<float>(res32.y);
-    // swap lanes 16 apart (i <-> i+16).
+    // lanes i, i + 16
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
     return std::bit_cast<float>(res16.x) + std::bit_cast<float>(res16.y);
 }
@@ -243,18 +344,6 @@ template<typename T, typename V>
 __device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
     constexpr opus::index_t o_len = opus::vector_traits<V>::size();
     opus::static_for<o_len>([&](auto i) { v_o[i.value] *= scale;});
-}
-
-template<typename V>
-__device__ inline void pin_output_tile(V& v_o) {
-    using chunk_t = opus::vector_t<float, 8>;
-    constexpr int num_chunks = opus::vector_traits<V>::size() / opus::vector_traits<chunk_t>::size();
-    static_assert(opus::vector_traits<V>::size() % opus::vector_traits<chunk_t>::size() == 0);
-    auto& chunks = reinterpret_cast<chunk_t(&)[num_chunks]>(v_o);
-    #pragma unroll
-    for (int i = 0; i < num_chunks; i++) {
-        asm volatile("" : "+v"(chunks[i]) ::);
-    }
 }
 
 template<int THR_X, int THR_Y>
@@ -275,8 +364,9 @@ __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr, opus::u32_t neg_
     );
 }
 
+// -inf at the columns of KV tile kv_tile_idx past last_key: the causal diagonal or the end of the sequence
 template<typename T, typename V>
-__device__ inline void attn_mask_causal_tile(V& v_s, int q_start_pos, int kv_tile_idx, opus::u32_t neg_inf_v, int lane_id) {
+__device__ inline void attn_mask_tile(V& v_s, int last_key, int kv_tile_idx, opus::u32_t neg_inf_v, int lane_id) {
     using D_ACC = typename T::D_ACC;
     using D_ACC_X2 = opus::vector_t<D_ACC, 2>;
     using U32_X2 = opus::vector_t<opus::u32_t, 2>;
@@ -286,14 +376,13 @@ __device__ inline void attn_mask_causal_tile(V& v_s, int q_start_pos, int kv_til
     constexpr int c_rept = elems_per_wave_tile / c_pack;
     constexpr int c_rept_stride = (T::WARP_SIZE / T::W_M) * c_pack;
 
-    const int q_pos = q_start_pos + (lane_id % T::W_M);
     const int k_start_pos = kv_tile_idx * T::KV_TILE_SIZE;
     const int lane_group = lane_id / T::W_M;
 
     opus::static_for<T::GEMM0_E_N>([&](auto i_n) {
         constexpr int base_idx = i_n.value * elems_per_wave_tile;
         const int k_pos = k_start_pos + i_n.value * T::W_N + lane_group * c_pack;
-        const opus::u32_t rel = static_cast<opus::u32_t>(q_pos - k_pos);
+        const opus::u32_t rel = static_cast<opus::u32_t>(last_key - k_pos);
 
         opus::static_for<c_rept>([&](auto i_rept) {
             constexpr int rept_base_idx = base_idx + i_rept.value * c_pack;
@@ -318,46 +407,35 @@ __device__ inline void attn_mask_causal_tile(V& v_s, int q_start_pos, int kv_til
 
 } // namespace gqa_d512
 
-// ─── GQA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
+// One Q tile
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d512_kernel(opus_gqa_kargs kargs) {
+__device__ __attribute__((always_inline)) void gqa_d512_tile(const gqa_d512::seq_ctx& sc, char* smem_buf) {
     using namespace opus;
     using namespace gqa_d512;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
 
-    const int workgroup_x = block_id_x();
-    const int q_block_idx = block_id_y();
-    const int b = block_id_z();
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     const int lane_id = thread_id_x() % T::WARP_SIZE;
     const int stagger = warp_id / 4;
 
-    const int group_size = kargs.H / kargs.H_KV;
-    const int h = (workgroup_x % kargs.H_KV) * group_size + (workgroup_x / kargs.H_KV);
-    const int h_kv = h / group_size;
     const int q_block_size = T::NUM_WARPS * T::Q_TILE_SIZE;
-    const int q_block_start = q_block_idx * q_block_size;
-    const int64_t qo_gmem_offset = (int64_t)b * kargs.stride_q_b + (int64_t)q_block_start * kargs.stride_q_n + (int64_t)h * kargs.stride_q_h;
-    const int64_t kv_gmem_offset = (int64_t)b * kargs.stride_kv_b + (int64_t)h_kv * kargs.stride_kv_h;
+    const int seqlen_q = sc.sq, seqlen_kv = sc.sk;
+    const int q_block_start = sc.q0;
+    const int q_rows = seqlen_q - q_block_start;  // rows of the tile in the sequence
 
-    // Global memory tensors
-    auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_q) + qo_gmem_offset);
-    auto g_k = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k) + kv_gmem_offset);
-    auto g_v = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v) + kv_gmem_offset);
-    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.ptr_o) + qo_gmem_offset);
+    // Buffers of the sequence's rows: rows past the end read 0, O rows there are not written
+    auto g_q = make_gmem(sc.q, gqa_d512::buffer_bytes(int64_t(q_rows) * sc.q_stride * sizeof(D_ATTN)));
+    auto g_k = make_gmem(sc.k, gqa_d512::buffer_bytes(int64_t(seqlen_kv) * sc.kv_stride * sizeof(D_ATTN)));
+    auto g_v = make_gmem(sc.v, gqa_d512::buffer_bytes(int64_t(seqlen_kv) * sc.kv_stride * sizeof(D_ATTN)));
+    auto g_o = make_gmem(sc.o, gqa_d512::buffer_bytes(int64_t(q_rows) * sc.q_stride * sizeof(D_ATTN)));
 
-    // Shared memory for K and V tiles
-    __shared__ char smem_buf[T::smem_size_bytes()];
-    smem<D_ATTN> s_k[2] = {
-        make_smem(reinterpret_cast<D_ATTN*>(smem_buf)),
-        make_smem(reinterpret_cast<D_ATTN*>(smem_buf) + T::smem_buffer_elems)
-    };
-    smem<D_ATTN> s_v[2] = {
-        make_smem(reinterpret_cast<D_ATTN*>(smem_buf) + T::smem_k_tile_elems),
-        make_smem(reinterpret_cast<D_ATTN*>(smem_buf) + T::smem_buffer_elems + T::smem_k_tile_elems)
-    };
+    // K/V double buffer. Selected by address: a run-time indexed array of smem objects is placed in LDS.
+    D_ATTN* const k_buf0 = reinterpret_cast<D_ATTN*>(smem_buf);
+    D_ATTN* const k_buf1 = k_buf0 + T::smem_buffer_elems;
+    auto s_k = [&](int i) { return make_smem(i ? k_buf1 : k_buf0); };
+    auto s_v = [&](int i) { return make_smem((i ? k_buf1 : k_buf0) + T::smem_k_tile_elems); };
 
     // GEMM0: S = Q @ K^T
     auto mma0 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
@@ -373,8 +451,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d512_kernel(opus_gq
         mfma_adaptor_swap_ab{});
 
     // Partition layouts
-    auto u_q  = make_layout_q<T>(warp_id, lane_id, kargs.stride_q_n);
-    auto u_gkv = make_layout_gk_gv<T>(warp_id, lane_id, kargs.stride_kv_n);
+    auto u_q  = make_layout_q<T>(warp_id, lane_id, sc.q_stride);
+    auto u_gkv = make_layout_gk_gv<T>(warp_id, lane_id, sc.kv_stride);
     auto u_skv = make_layout_sk_sv<T>(warp_id);
     auto u_rk = make_layout_rk<T>(lane_id);
     auto u_rv = make_layout_rv<T>(lane_id);
@@ -397,25 +475,23 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d512_kernel(opus_gq
     constexpr index_t s_half_len = s_len / 2;
     constexpr index_t o_len = vector_traits<decltype(v_o)>::size();
 
-    // Scaling constants and online softmax state
+    // Online softmax, log2 domain; O and l are rescaled when a row max grows by more than RESCALE_THRESHOLD
     constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
-    constexpr float LOG2_E = 1.44269504089f;
-    const float temperature_scale = (1.0f / sqrtf(static_cast<float>(kargs.D))) * LOG2_E;
-
-    D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
+    D_ACC m_row = gqa_d512::M_INIT;
     D_ACC l_row = 0.0f;
     D_ACC rescale_m = 1.0f;
 
-    // Tile traversal helpers
-    const int kv_tile_stride = T::KV_TILE_SIZE * kargs.stride_kv_n;
-    const int num_kv_tiles = ceil_div(kargs.N, T::KV_TILE_SIZE);
-    int max_num_tiles = num_kv_tiles;
+    // Causal, bottom-right: row i sees keys [0, i + sk - sq]
+    const int kv_tile_stride = T::KV_TILE_SIZE * sc.kv_stride;
+    [[maybe_unused]] const int causal_offset = seqlen_kv - seqlen_q;
+    int max_num_tiles = ceil_div(seqlen_kv, T::KV_TILE_SIZE);
     if constexpr (T::CAUSAL) {
-        const int q_block_end = q_block_start + q_block_size;
-        const int causal_num_tiles = ceil_div(q_block_end, T::KV_TILE_SIZE);
-        max_num_tiles = causal_num_tiles < max_num_tiles ? causal_num_tiles : max_num_tiles;
+        const int q_end = q_rows < q_block_size ? seqlen_q : q_block_start + q_block_size;
+        max_num_tiles = ceil_div(q_end + causal_offset, T::KV_TILE_SIZE);  // <= 0 without keys
     }
     auto kv_tile = [&](int tile_idx) { return tile_idx * kv_tile_stride; };
+    // prefetches past the last tile load it again: constant vmcnt waits
+    auto clamp_tile = [&](int x) { return x < max_num_tiles ? x : max_num_tiles - 1; };
     auto skv_slice = [](auto slice_idx) {
         constexpr int s = decltype(slice_idx)::value;
         return opus::number<(s / 2) * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B) + (s % 2) * T::SLICE_D>{};
@@ -450,370 +526,164 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d512_kernel(opus_gq
         o[T::NUM_D_SLICES - 1] = mma1(p, v[(T::NUM_D_SLICES - 1) & 1], o[T::NUM_D_SLICES - 1]);
     };
 
-    // Causal masking helpers
-    [[maybe_unused]] const int q_start_pos = q_block_start + warp_id * T::Q_TILE_SIZE;
-    [[maybe_unused]] const opus::u32_t neg_inf_v = std::bit_cast<opus::u32_t>(-opus::numeric_limits<D_ACC>::infinity());
+    // the wave's first row in KV coordinates
+    [[maybe_unused]] const int q_start_pos_c = q_block_start + warp_id * T::Q_TILE_SIZE + causal_offset;
+    const opus::u32_t neg_inf_v = gqa_d512::NEG_INF_BITS;
+    [[maybe_unused]] const bool kv_tail = seqlen_kv % T::KV_TILE_SIZE != 0;
+    auto mask = [&](auto& s, int t) {
+        if constexpr (T::CAUSAL) {
+            if (q_start_pos_c < (t + 1) * T::KV_TILE_SIZE)
+                attn_mask_tile<T>(s, q_start_pos_c + lane_id % T::W_M, t, neg_inf_v, lane_id);
+        } else {
+            if (kv_tail && t == max_num_tiles - 1) attn_mask_tile<T>(s, seqlen_kv - 1, t, neg_inf_v, lane_id);
+        }
+    };
 
-    // Prologue
-    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gkv, u_skv, kv_tile(0));
+    // O and the LSE with the sink
+    auto store_result = [&]() {
+        const gqa_d512::row_final r(m_row, l_row, sc.sink);
+        if (sc.lse != nullptr && lane_id < T::W_M) {
+            auto g_lse = make_gmem(sc.lse, gqa_d512::buffer_bytes(int64_t(q_rows) * sc.lse_stride * sizeof(float)));
+            g_lse.store(r.lse(), (warp_id * T::Q_TILE_SIZE + lane_id) * sc.lse_stride);
+        }
+        static_for<o_len>([&](auto i) { v_o[i.value] *= r.o_scale; });
+        auto u_o = make_layout_o<T>(warp_id, lane_id, sc.q_stride);
+        auto v_o_bf16 = opus::cast<D_ATTN>(v_o);
+        store<T::VEC_O>(g_o, v_o_bf16, u_o);
+    };
+
+    // no keys for the tile: O = 0
+    if (max_num_tiles <= 0) {
+        store_result();
+        return;
+    }
+
+    auto stage_end = [&]() {
+        __builtin_amdgcn_sched_barrier(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
+    };
+
+    // Phase t: QK(t) and softmax head of t; softmax tail and PV of t - 1. K and V prefetched one tile ahead.
+    auto run_phase = [&](auto& vs_cur, auto& vs_prev, int cur, int prev, int t) {
+        auto sk_cur = s_k(cur), sv_cur = s_v(cur), sv_prev = s_v(prev);
+        // cluster 0 [mem]: read K(t), load K(t + 1)
+        async_load<T::VEC_KV>(g_k, s_k(prev).ptr, u_gkv, u_skv, kv_tile(clamp_tile(t + 1)));
+        v_k[0] = load<T::VEC_KV>(sk_cur, u_rk);
+        v_k[1] = load<T::VEC_KV>(sk_cur, u_rk + skv_slice(1_I));
+        s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
+        s_waitcnt_vmcnt(number<T::k_buffer_load_insts>{});
+        stage_end();
+
+        // cluster 1 [compute]: QK(t); softmax tail of t - 1
+        __builtin_amdgcn_s_setprio(1);
+        compute_qk(vs_cur, v_q_slices, v_k, sk_cur);
+        attn_exp2_slice<T, s_half_len, s_half_len>(vs_prev);
+        l_row += attn_row_sum<T>(vs_prev);
+        v_p = opus::cast<D_ATTN>(vs_prev);
+        asm volatile("" : "+v"(v_p) ::);
+        sched_compute_qk<0>();
+        __builtin_amdgcn_s_setprio(0);
+        stage_end();
+
+        // cluster 2 [mem]: read V(t - 1), load V(t); mask of t
+        async_load<T::VEC_KV>(g_v, sv_cur.ptr, u_gkv, u_skv, kv_tile(t));
+        v_v[0] = tr_load<T::VEC_TR_V>(sv_prev, u_rv);
+        v_v[1] = tr_load<T::VEC_TR_V>(sv_prev, u_rv + skv_slice(1_I));
+        mask(vs_cur, t);
+        s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
+        s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
+        stage_end();
+
+        // cluster 3 [compute]: PV(t - 1); softmax head of t
+        __builtin_amdgcn_s_setprio(1);
+        compute_pv(v_p, v_v, v_o_slices, sv_prev);
+        D_ACC row_max = attn_row_max<T>(vs_cur);
+        bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
+        bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
+        row_max = all_below ? m_row : max(m_row, row_max);
+        attn_sub_row<T>(vs_cur, row_max);
+        attn_exp2_slice<T, 0, s_half_len>(vs_cur);
+        asm volatile("" : "+v"(vs_cur) ::);
+        __builtin_amdgcn_sched_barrier(0);
+        if (!all_below) {
+            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+            l_row *= rescale_m;
+            m_row = row_max;
+            scale_output_tile<T>(v_o, rescale_m);
+        }
+        __builtin_amdgcn_s_setprio(0);
+        stage_end();
+    };
+
+    // Prologue: QK(0) and its softmax head
+    auto sk0 = s_k(0);
+    async_load<T::VEC_KV>(g_k, sk0.ptr, u_gkv, u_skv, kv_tile(0));
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
     v_q = load<T::VEC_Q>(g_q, u_q);
     auto v_q_f32 = opus::cast<float>(v_q);
-    static_for<q_len>([&](auto i) { v_q_f32[i.value] *= temperature_scale; });
+    static_for<q_len>([&](auto i) { v_q_f32[i.value] *= sc.c; });
     v_q = opus::cast<D_ATTN>(v_q_f32);
 
-    async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gkv, u_skv, kv_tile(1));
-    async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gkv, u_skv, kv_tile(0));
-    v_k[0] = load<T::VEC_KV>(s_k[0], u_rk);
-    v_k[1] = load<T::VEC_KV>(s_k[0], u_rk + skv_slice(1_I));
+    async_load<T::VEC_KV>(g_k, s_k(1).ptr, u_gkv, u_skv, kv_tile(clamp_tile(1)));
+    async_load<T::VEC_KV>(g_v, s_v(0).ptr, u_gkv, u_skv, kv_tile(0));
+    v_k[0] = load<T::VEC_KV>(sk0, u_rk);
+    v_k[1] = load<T::VEC_KV>(sk0, u_rk + skv_slice(1_I));
     __builtin_amdgcn_sched_barrier(0);
     s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
-    s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
+    s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});  // K(1)
 
-    compute_qk(v_s[0], v_q_slices, v_k, s_k[0]);
-    
+    compute_qk(v_s[0], v_q_slices, v_k, sk0);
+
+    // stagger: one barrier more now, the other group one more at the end
     if (stagger) {
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
     }
 
-    if constexpr (T::CAUSAL) {
-        constexpr int tile_idx = 0;
-        constexpr int kv_end_pos = (tile_idx + 1) * T::KV_TILE_SIZE;
-        if (q_start_pos < kv_end_pos) {
-            attn_mask_causal_tile<T>(v_s[0], q_start_pos, tile_idx, neg_inf_v, lane_id);
-        }
-    }
+    mask(v_s[0], 0);
     m_row = attn_row_max<T>(v_s[0]);
     attn_sub_row<T>(v_s[0], m_row);
     attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
     asm volatile("" : "+v"(v_s[0]) ::);
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+    stage_end();
 
-    // Main loop
-    for (int j = 1; j < max_num_tiles - 3; j += 2) {
-        // Cluster 0:
-        async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gkv, u_skv, kv_tile(j + 1));
-        v_k[0] = load<T::VEC_KV>(s_k[1], u_rk);
-        v_k[1] = load<T::VEC_KV>(s_k[1], u_rk + skv_slice(1_I));
-        s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
-        s_waitcnt_vmcnt(number<T::k_buffer_load_insts>{});
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        // Cluster 1:
-        __builtin_amdgcn_s_setprio(1);
-        compute_qk(v_s[1], v_q_slices, v_k, s_k[1]);
-        attn_exp2_slice<T, s_half_len, s_half_len>(v_s[0]);
-        l_row += attn_row_sum<T>(v_s[0]);
-        v_p = opus::cast<D_ATTN>(v_s[0]);
-        asm volatile("" : "+v"(v_p) ::);
-        sched_compute_qk<0>();
-        __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        // Cluster 2:
-        async_load<T::VEC_KV>(g_v, s_v[1].ptr, u_gkv, u_skv, kv_tile(j));
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v[0], u_rv + skv_slice(1_I));
-        s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
-        s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        // Cluster 3:
-        __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, v_v, v_o_slices, s_v[0]);
-        D_ACC row_max = attn_row_max<T>(v_s[1]);
-        bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
-        bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
-        row_max = all_below ? m_row : max(m_row, row_max);
-        attn_sub_row<T>(v_s[1], row_max);
-        attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
-        asm volatile("" : "+v"(v_s[1]) ::);
-        __builtin_amdgcn_sched_barrier(0);
-        if (!all_below) {
-            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-            l_row *= rescale_m;
-            m_row = row_max;
-            scale_output_tile<T>(v_o, rescale_m);
-        }
-        __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        // Cluster 4:
-        async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gkv, u_skv, kv_tile(j + 2));
-        v_k[0] = load<T::VEC_KV>(s_k[0], u_rk);
-        v_k[1] = load<T::VEC_KV>(s_k[0], u_rk + skv_slice(1_I));
-        s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
-        s_waitcnt_vmcnt(number<T::k_buffer_load_insts>{});
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        // Cluster 5:
-        __builtin_amdgcn_s_setprio(1);
-        compute_qk(v_s[0], v_q_slices, v_k, s_k[0]);
-        attn_exp2_slice<T, s_half_len, s_half_len>(v_s[1]);
-        l_row += attn_row_sum<T>(v_s[1]);
-        v_p = opus::cast<D_ATTN>(v_s[1]);
-        asm volatile("" : "+v"(v_p) ::);
-        sched_compute_qk<0>();
-        __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        // Cluster 6:
-        async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gkv, u_skv, kv_tile(j + 1));
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v[1], u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v[1], u_rv + skv_slice(1_I));
-        if constexpr (T::CAUSAL) {
-            const int tile_idx = j + 1;
-            const int kv_end_pos = (tile_idx + 1) * T::KV_TILE_SIZE;
-            if (q_start_pos < kv_end_pos) {
-                attn_mask_causal_tile<T>(v_s[0], q_start_pos, tile_idx, neg_inf_v, lane_id);
-            }
-        }
-        s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
-        s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        // Cluster 7:
-        __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, v_v, v_o_slices, s_v[1]);
-        row_max = attn_row_max<T>(v_s[0]);
-        below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
-        all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
-        row_max = all_below ? m_row : max(m_row, row_max);
-        attn_sub_row<T>(v_s[0], row_max);
-        attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
-        asm volatile("" : "+v"(v_s[0]) ::);
-        __builtin_amdgcn_sched_barrier(0);
-        if (!all_below) {
-            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-            l_row *= rescale_m;
-            m_row = row_max;
-            scale_output_tile<T>(v_o, rescale_m);
-        }
-        __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
+    // Main loop: one phase per iteration (two spill), S(t - 1) in v_s[0], S(t) in v_s[1]
+    for (int t = 1; t < max_num_tiles; ++t) {
+        run_phase(v_s[1], v_s[0], t & 1, (t & 1) ^ 1, t);
+        v_s[0] = v_s[1];
     }
 
-    // Epilogue
-    // Cluster 0:
-    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gkv, u_skv, kv_tile(max_num_tiles - 2));
-    v_k[0] = load<T::VEC_KV>(s_k[1], u_rk);
-    v_k[1] = load<T::VEC_KV>(s_k[1], u_rk + skv_slice(1_I));
-    s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
-    s_waitcnt_vmcnt(number<T::k_buffer_load_insts>{});
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 1:
+    // Epilogue: softmax tail and PV of tile T - 1
+    s_waitcnt_vmcnt(0_I);  // V(T - 1)
+    stage_end();
     __builtin_amdgcn_s_setprio(1);
-    compute_qk(v_s[1], v_q_slices, v_k, s_k[1]);
     attn_exp2_slice<T, s_half_len, s_half_len>(v_s[0]);
     l_row += attn_row_sum<T>(v_s[0]);
     v_p = opus::cast<D_ATTN>(v_s[0]);
     asm volatile("" : "+v"(v_p) ::);
-    sched_compute_qk<0>();
     __builtin_amdgcn_s_setprio(0);
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 2:
-    async_load<T::VEC_KV>(g_v, s_v[1].ptr, u_gkv, u_skv, kv_tile(max_num_tiles - 3));
-    v_v[0] = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
-    v_v[1] = tr_load<T::VEC_TR_V>(s_v[0], u_rv + skv_slice(1_I));
-    if constexpr (T::CAUSAL) {
-        const int tile_idx = max_num_tiles - 3;
-        const int kv_end_pos = (tile_idx + 1) * T::KV_TILE_SIZE;
-        if (q_start_pos < kv_end_pos) {
-            attn_mask_causal_tile<T>(v_s[1], q_start_pos, tile_idx, neg_inf_v, lane_id);
-        }
-    }
+    stage_end();
+    auto sv_last = s_v((max_num_tiles - 1) & 1);
+    v_v[0] = tr_load<T::VEC_TR_V>(sv_last, u_rv);
+    v_v[1] = tr_load<T::VEC_TR_V>(sv_last, u_rv + skv_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
-    s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 3:
-    __builtin_amdgcn_s_setprio(1);
-    compute_pv(v_p, v_v, v_o_slices, s_v[0]);
-    D_ACC row_max = max(m_row, attn_row_max<T>(v_s[1]));
-    rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-    m_row = row_max;
-    attn_sub_row<T>(v_s[1], row_max);
-    attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
-    asm volatile("" : "+v"(v_s[1]) ::);
-    __builtin_amdgcn_sched_barrier(0);
-    scale_output_tile<T>(v_o, rescale_m);
-    pin_output_tile(v_o);
-    __builtin_amdgcn_s_setprio(0);
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 4:
-    async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gkv, u_skv, kv_tile(max_num_tiles - 1));
-    v_k[0] = load<T::VEC_KV>(s_k[0], u_rk);
-    v_k[1] = load<T::VEC_KV>(s_k[0], u_rk + skv_slice(1_I));
-    s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
-    s_waitcnt_vmcnt(number<T::k_buffer_load_insts>{});
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 5:
-    __builtin_amdgcn_s_setprio(1);
-    compute_qk(v_s[0], v_q_slices, v_k, s_k[0]);
-    l_row *= rescale_m;
-    attn_exp2_slice<T, s_half_len, s_half_len>(v_s[1]);
-    l_row += attn_row_sum<T>(v_s[1]);
-    v_p = opus::cast<D_ATTN>(v_s[1]);
-    asm volatile("" : "+v"(v_p) ::);
-    sched_compute_qk<0>();
-    __builtin_amdgcn_s_setprio(0);
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 6:
-    async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gkv, u_skv, kv_tile(max_num_tiles - 2));
-    v_v[0] = tr_load<T::VEC_TR_V>(s_v[1], u_rv);
-    v_v[1] = tr_load<T::VEC_TR_V>(s_v[1], u_rv + skv_slice(1_I));
-    if constexpr (T::CAUSAL) {
-        const int tile_idx = max_num_tiles - 2;
-        const int kv_end_pos = (tile_idx + 1) * T::KV_TILE_SIZE;
-        if (q_start_pos < kv_end_pos) {
-            attn_mask_causal_tile<T>(v_s[0], q_start_pos, tile_idx, neg_inf_v, lane_id);
-        }
-    }
-    s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
-    s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 7:
-    __builtin_amdgcn_s_setprio(1);
-    compute_pv(v_p, v_v, v_o_slices, s_v[1]);
-    row_max = max(m_row, attn_row_max<T>(v_s[0]));
-    rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-    m_row = row_max;
-    attn_sub_row<T>(v_s[0], row_max);
-    attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
-    asm volatile("" : "+v"(v_s[0]) ::);
-    __builtin_amdgcn_sched_barrier(0);
-    scale_output_tile<T>(v_o, rescale_m);
-    pin_output_tile(v_o);
-    __builtin_amdgcn_s_setprio(0);
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 8:
-    v_k[0] = load<T::VEC_KV>(s_k[1], u_rk);
-    v_k[1] = load<T::VEC_KV>(s_k[1], u_rk + skv_slice(1_I));
-    s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
-    s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 9:
-    __builtin_amdgcn_s_setprio(1);
-    compute_qk(v_s[1], v_q_slices, v_k, s_k[1]);
-    l_row *= rescale_m;
-    attn_exp2_slice<T, s_half_len, s_half_len>(v_s[0]);
-    l_row += attn_row_sum<T>(v_s[0]);
-    v_p = opus::cast<D_ATTN>(v_s[0]);
-    asm volatile("" : "+v"(v_p) ::);
-    sched_compute_qk<0>();
-    __builtin_amdgcn_s_setprio(0);
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 10:
-    async_load<T::VEC_KV>(g_v, s_v[1].ptr, u_gkv, u_skv, kv_tile(max_num_tiles - 1));
-    v_v[0] = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
-    v_v[1] = tr_load<T::VEC_TR_V>(s_v[0], u_rv + skv_slice(1_I));
-    if constexpr (T::CAUSAL) {
-        const int tile_idx = max_num_tiles - 1;
-        const int kv_end_pos = (tile_idx + 1) * T::KV_TILE_SIZE;
-        if (q_start_pos < kv_end_pos) {
-            attn_mask_causal_tile<T>(v_s[1], q_start_pos, tile_idx, neg_inf_v, lane_id);
-        }
-    }
-    s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
-    s_waitcnt_vmcnt(0_I);
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 11:
-    __builtin_amdgcn_s_setprio(1);
-    compute_pv(v_p, v_v, v_o_slices, s_v[0]);
-    row_max = max(m_row, attn_row_max<T>(v_s[1]));
-    rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-    m_row = row_max;
-    attn_sub_row<T>(v_s[1], row_max);
-    attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
-    asm volatile("" : "+v"(v_s[1]) ::);
-    __builtin_amdgcn_sched_barrier(0);
-
-    attn_exp2_slice<T, s_half_len, s_half_len>(v_s[1]);
-    l_row *= rescale_m;
-    l_row += attn_row_sum<T>(v_s[1]);
-    v_p = opus::cast<D_ATTN>(v_s[1]);
-    asm volatile("" : "+v"(v_p) ::);
-    __builtin_amdgcn_sched_barrier(0);
-    scale_output_tile<T>(v_o, rescale_m);
-    pin_output_tile(v_o);
-    __builtin_amdgcn_s_setprio(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 12:
-    v_v[0] = tr_load<T::VEC_TR_V>(s_v[1], u_rv);
-    v_v[1] = tr_load<T::VEC_TR_V>(s_v[1], u_rv + skv_slice(1_I));
-    s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
-    __builtin_amdgcn_sched_barrier(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
-    // Cluster 13:
-    compute_pv(v_p, v_v, v_o_slices, s_v[1]);
-
-    // ──── Normalize O and store to gmem ────
-    D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
-    static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
+    stage_end();
+    compute_pv(v_p, v_v, v_o_slices, sv_last);
 
     if (!stagger) {
         __builtin_amdgcn_s_barrier();
     }
 
-    auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_q_n);
-    auto v_o_bf16 = opus::cast<D_ATTN>(v_o);
-    store<T::VEC_O>(g_o, v_o_bf16, u_o);
+    store_result();
+}
+
+template<class Traits>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d512_kernel(opus_gqa_varlen_kargs kargs) {
+    __shared__ char smem_buf[2 * Traits::smem_buffer_elems * sizeof(typename Traits::D_ATTN)];
+    gqa_d512::for_each_tile<Traits::D_TILE_SIZE, Traits::WG_Q_ROWS>(
+        kargs, [&](const gqa_d512::seq_ctx& sc) { gqa_d512_tile<Traits>(sc, smem_buf); });
 }
