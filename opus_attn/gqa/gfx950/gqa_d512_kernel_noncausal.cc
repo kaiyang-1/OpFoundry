@@ -2,7 +2,7 @@
 // Host pass: empty stub for __device_stub__ generation
 // Device pass: includes full kernel template
 #include <opus/hip_minimal.hpp>
-#include "gqa_defs.h"
+#include "gqa_traits.h"
 #ifndef __HIP_DEVICE_COMPILE__
 template<typename Traits> __global__ void gqa_d512_kernel(opus_gqa_kargs kargs) {}
 template __global__ void gqa_d512_kernel<opus_gqa_traits<16, 32, 512, 8, false>>(opus_gqa_kargs);

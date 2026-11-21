@@ -1,26 +1,9 @@
-// Shared types and constants between device kernel and host code
+// Configuration traits for the gfx950 (wave64 / MFMA) GQA forward kernels.
 #pragma once
 
-using bf16_t = __bf16;
+#include "common/gqa_kargs.h"
 
-// Kernel arguments for GQA attention
-struct opus_gqa_kargs {
-    const void* __restrict__ ptr_q;  // [B, N, H, D]
-    const void* __restrict__ ptr_k;  // [B, N, H_KV, D]
-    const void* __restrict__ ptr_v;  // [B, N, H_KV, D]
-    void* __restrict__ ptr_o;        // [B, N, H, D]
-    int B;
-    int N;
-    int H;
-    int H_KV;
-    int D;
-    int stride_q_b;
-    int stride_q_n;
-    int stride_q_h;
-    int stride_kv_b;
-    int stride_kv_n;
-    int stride_kv_h;
-};
+using bf16_t = __bf16;
 
 // Configuration traits for GQA kernel (tile sizes, data types, vector lengths, MFMA config).
 // D_TILE_SIZE selects between two kernel families:
@@ -43,6 +26,17 @@ struct opus_gqa_traits {
 
     static constexpr int WARP_SIZE = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+    static constexpr int WG_Q_ROWS = Q_TILE_SIZE * NUM_WARPS;
+
+    // What the host may run: one N for every batch (sq == sk), a multiple of SEQ_ALIGN of at least MIN_KV_TILES KV
+    // tiles; the scale is 1/sqrt(D); no LSE, no sink.
+    using kargs_type = opus_gqa_kargs;
+    static constexpr bool VARLEN = false;
+    static constexpr bool HAS_LSE = false;
+    static constexpr bool HAS_SINK = false;
+    static constexpr int SEQ_ALIGN = WG_Q_ROWS > KV_TILE_SIZE ? WG_Q_ROWS : KV_TILE_SIZE;
+    static_assert(SEQ_ALIGN % WG_Q_ROWS == 0 && SEQ_ALIGN % KV_TILE_SIZE == 0);
+    static constexpr int MIN_KV_TILES = 6;
 
     // Data types: Q/K/V/O share one bf16 type; accumulation fp32
     using D_ATTN = bf16_t;
